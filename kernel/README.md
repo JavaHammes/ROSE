@@ -1,10 +1,10 @@
 ## First goal:
 
 OpenSBI
-    - jumps to boot.S in S-mode
-    - boot.S establishes the stack
-    - boot.S calls kernel_main()
-    - kernel_main halts
+- jumps to boot.S in S-mode
+- boot.S establishes the stack
+- boot.S calls kernel_main()
+- kernel_main halts
 
 ## How to debug with gdb:
 
