@@ -1,4 +1,4 @@
-# Ross
+# ROSE: Risc-v Operating SystEm
 
 ## Current first scope:
 
