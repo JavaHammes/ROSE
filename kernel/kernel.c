@@ -5,7 +5,7 @@ void kernel_main(unsigned long hart_id, const void *dtb) {
         (void)dtb;
 
         while (1) {
-
+			asm volatile("wfi");
         }
 }
 
