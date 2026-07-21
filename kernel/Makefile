@@ -30,11 +30,14 @@ LDFLAGS := $(ARCH_FLAGS) \
            -Wl,--gc-sections \
            -Wl,-Map=kernel.map
 
-OBJECTS := boot.o kernel.o
+OBJECTS := boot.o kernel.o uart.o
 
 .PHONY: all run inspect clean
 
 all: kernel.elf
+
+uart.o: uart.c
+	$(CC) $(ASFLAGS) -c $< -o $@
 
 boot.o: boot.S
 	$(CC) $(ASFLAGS) -c $< -o $@
