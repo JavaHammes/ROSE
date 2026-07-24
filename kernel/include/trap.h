@@ -3,9 +3,7 @@
 
 #include <stdint.h>
 
-static enum {
-        TRAP_FRAME_SIZE = 288,
-};
+enum { TRAP_FRAME_SIZE = 288 };
 
 struct trap_frame {
         uint64_t ra;
@@ -55,6 +53,34 @@ struct trap_frame {
 
 _Static_assert(sizeof(struct trap_frame) == TRAP_FRAME_SIZE,
                "trap frame layout mismatch");
+
+/*
+ * Supervisor interrupt cause codes.
+ */
+enum supervisor_interrupt_code {
+        SCAUSE_SUPERVISOR_SOFTWARE = 1,
+        SCAUSE_SUPERVISOR_TIMER = 5,
+        SCAUSE_SUPERVISOR_EXTERNAL = 9,
+};
+
+/*
+ * Synchronous exception cause codes.
+ */
+enum exception_code {
+        SCAUSE_INSTRUCTION_ADDRESS_MISALIGNED = 0,
+        SCAUSE_INSTRUCTION_ACCESS_FAULT = 1,
+        SCAUSE_ILLEGAL_INSTRUCTION = 2,
+        SCAUSE_BREAKPOINT = 3,
+        SCAUSE_LOAD_ADDRESS_MISALIGNED = 4,
+        SCAUSE_LOAD_ACCESS_FAULT = 5,
+        SCAUSE_STORE_ADDRESS_MISALIGNED = 6,
+        SCAUSE_STORE_ACCESS_FAULT = 7,
+        SCAUSE_ECALL_FROM_USER = 8,
+        SCAUSE_ECALL_FROM_SUPERVISOR = 9,
+        SCAUSE_INSTRUCTION_PAGE_FAULT = 12,
+        SCAUSE_LOAD_PAGE_FAULT = 13,
+        SCAUSE_STORE_PAGE_FAULT = 15,
+};
 
 void trap_init(void);
 void interrupts_enable(void);

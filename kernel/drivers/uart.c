@@ -129,3 +129,26 @@ void uart_puts(const char *str) {
                 str++;
         }
 }
+
+/*
+ * Print one hexadecimal digit.
+ */
+void uart_put_hex_digit(uint8_t digit) {
+        static const char digits[] = "0123456789abcdef";
+
+        uart_putc(digits[digit & UINT8_C(0x0f)]);
+}
+
+/*
+ * Print a 64-bit unsigned integer in hexadecimal
+ */
+void uart_put_hex64(uint64_t value) {
+        uart_puts("0x");
+
+        for (int shift = 60; shift >= 0; shift -= 4) {
+                uint8_t digit =
+                    (uint8_t)((value >> (unsigned int)shift) & UINT64_C(0x0f));
+
+                uart_put_hex_digit(digit);
+        }
+}

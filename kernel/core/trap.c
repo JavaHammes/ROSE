@@ -1,5 +1,6 @@
 #include <stdint.h>
 
+#include "panic.h"
 #include "timer.h"
 #include "trap.h"
 #include "uart.h"
@@ -55,6 +56,52 @@
  */
 extern void trap_entry(void);
 
+static const char *exception_name(uint64_t code) {
+        switch (code) {
+        case SCAUSE_INSTRUCTION_ADDRESS_MISALIGNED:
+                return "Instruction address misaligned";
+
+        case SCAUSE_INSTRUCTION_ACCESS_FAULT:
+                return "Instruction access fault";
+
+        case SCAUSE_ILLEGAL_INSTRUCTION:
+                return "Illegal instruction";
+
+        case SCAUSE_BREAKPOINT:
+                return "Breakpoint";
+
+        case SCAUSE_LOAD_ADDRESS_MISALIGNED:
+                return "Load address misaligned";
+
+        case SCAUSE_LOAD_ACCESS_FAULT:
+                return "Load access fault";
+
+        case SCAUSE_STORE_ADDRESS_MISALIGNED:
+                return "Store/AMO address misaligned";
+
+        case SCAUSE_STORE_ACCESS_FAULT:
+                return "Store/AMO access fault";
+
+        case SCAUSE_ECALL_FROM_USER:
+                return "Environment call from U-mode";
+
+        case SCAUSE_ECALL_FROM_SUPERVISOR:
+                return "Environment call from S-mode";
+
+        case SCAUSE_INSTRUCTION_PAGE_FAULT:
+                return "Instruction page fault";
+
+        case SCAUSE_LOAD_PAGE_FAULT:
+                return "Load page fault";
+
+        case SCAUSE_STORE_PAGE_FAULT:
+                return "Store/AMO page fault";
+
+        default:
+                return "Unknown exception";
+        }
+}
+
 /*
  * Configure Supervisor-mode trap handling.
  * This function writes the address of trap_entry into the stvec CSR.
@@ -102,6 +149,56 @@ void interrupts_disable(void) {
 }
 
 /*
+ * Handle an asynchronous s. mode interrupt.
+ */
+static void handle_interrupt(struct trap_frame *frame, uint64_t code) {
+        switch (code) {
+        case SCAUSE_SUPERVISOR_TIMER:
+                uart_puts("Timer interrupt handled\n");
+                timer_schedule_next();
+                return;
+
+        case SCAUSE_SUPERVISOR_SOFTWARE:
+                /*
+                 * Not implemented yet.
+                 */
+                panic_trap("Unhandled supervisor software interrupt", frame);
+
+        case SCAUSE_SUPERVISOR_EXTERNAL:
+                /*
+                 * Not implemented yet.
+                 */
+                panic_trap("Unhandled supervisor external interrupt", frame);
+
+        default:
+                /*
+                 * The processor reported an interrupt cause that this kernel
+                 * does not recognize.
+                 */
+                panic_trap("Unknown supervisor interrupt", frame);
+        }
+}
+
+/*
+ * Handle a synchronous exception.
+ */
+static void handle_exception(struct trap_frame *frame, uint64_t code) {
+        /*
+         * Convert the numeric exception into a human-readable name.
+         */
+        const char *name = exception_name(code);
+
+        uart_puts("\nUnhandled exception: ");
+        uart_puts(name);
+        uart_puts("\n");
+
+        /*
+         * Exceptions are currently considered fatal.
+         */
+        panic_trap("Fatal synchronous exception", frame);
+}
+
+/*
  * High-level Supervisor-mode trap handler.
  *
  * trap_entry saves all general-purpose registers and relevant Supervisor CSRs
@@ -118,37 +215,12 @@ void interrupts_disable(void) {
  */
 void trap_handler(struct trap_frame *frame) {
         uint64_t scause = frame->scause;
+        uint64_t code = scause & SCAUSE_CODE_MASK;
 
-        /*
-         * If interrupt:
-         */
-        if ((scause & SCAUSE_INTERRUPT_BIT) != 0U) {
-                uint64_t interrupt_code = scause & SCAUSE_CODE_MASK;
-
-                switch (interrupt_code) {
-                case SCAUSE_SUPERVISOR_TIMER:
-                        uart_puts("Timer interrupt handled\n");
-
-                        /*
-                         * Schedule the next deadline before returning.
-                         */
-                        timer_schedule_next();
-                        return;
-                default:
-                        uart_puts("Unhandled interrupt\n");
-                        break;
-                }
-                /*
-                 * If exception:
-                 */
-        } else {
-                uart_puts("Unhandled exception\n");
+        if ((scause & SCAUSE_INTERRUPT_BIT) != UINT64_C(0)) {
+                handle_interrupt(frame, code);
+                return;
         }
 
-        /*
-         * Stop on unhandled traps.
-         */
-        for (;;) {
-                __asm__ volatile("wfi");
-        }
+        handle_exception(frame, code);
 }
