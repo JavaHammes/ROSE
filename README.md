@@ -1,8 +1,5 @@
 # ROSE: Risc-v Operating SystEm
 
-![alt text](/docs/rose.png "ROSE title image")
-
-
 - Architecture: RV64
 - Machine: QEMU virt (virtual RISC-V computer)
 - CPU count: 1 hart (HARdware Thread = 1 virtual CPU core)
@@ -10,7 +7,7 @@
 - Kernel mode: Supervisor mode
 - User mode: -
 - Virtual Memory: -
-- Interrupts: WIP
+- Interrupts: Timer interrupts
 - Device support: UART only
 
 ## Stack:

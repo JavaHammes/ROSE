@@ -3,6 +3,10 @@
 
 #include <stdint.h>
 
+static enum {
+        TRAP_FRAME_SIZE = 288,
+};
+
 struct trap_frame {
         uint64_t ra;
         uint64_t sp;
@@ -49,9 +53,12 @@ struct trap_frame {
         uint64_t padding;
 };
 
-_Static_assert(sizeof(struct trap_frame) == 288, "trap frame layout mismatch");
+_Static_assert(sizeof(struct trap_frame) == TRAP_FRAME_SIZE,
+               "trap frame layout mismatch");
 
 void trap_init(void);
+void interrupts_enable(void);
+void interrupts_disable(void);
 void trap_handler(struct trap_frame *frame);
 
 #endif

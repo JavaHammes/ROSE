@@ -1,0 +1,16 @@
+repos:
+  - repo: local
+    hooks:
+      - id: clang-format
+        name: clang-format
+        entry: clang-format -i
+        language: system
+        files: ^kernel/.*\.(c|h)$
+
+      - id: clang-tidy
+        name: clang-tidy
+        entry: make tidy
+        language: system
+        pass_filenames: false
+        files: ^kernel/.*\.(c|h)$
+
