@@ -1,5 +1,8 @@
 # ROSE: Risc-v Operating SystEm
 
+![alt text](/docs/rose.png "ROSE title image")
+
+
 - Architecture: RV64
 - Machine: QEMU virt (virtual RISC-V computer)
 - CPU count: 1 hart (HARdware Thread = 1 virtual CPU core)
