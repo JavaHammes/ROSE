@@ -1,7 +1,5 @@
 # ROSE: Risc-v Operating SystEm
 
-## Current first scope:
-
 - Architecture: RV64
 - Machine: QEMU virt (virtual RISC-V computer)
 - CPU count: 1 hart (HARdware Thread = 1 virtual CPU core)
@@ -9,16 +7,8 @@
 - Kernel mode: Supervisor mode
 - User mode: -
 - Virtual Memory: -
-- Interrupts: -
+- Interrupts: WIP
 - Device support: UART only
-
-## Memory layout:
-
-- .text: executable instructions
-- .rodata: read-only constants
-- .data: initialized writable variables
-- .bss: zero-initialized writable variables
-- stack: function-call and local-variable storage
 
 ## Stack:
 
