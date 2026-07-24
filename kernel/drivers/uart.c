@@ -51,7 +51,7 @@
  * Read register 0 -> receive a byte
  * Write register 0 -> transmit a byte
  */
-#define UART_THR 0
+enum { UART_THR = 0 };
 
 /*
  * Register index of the LSR "Line Status Register".
@@ -69,7 +69,7 @@
  * 		80C7-E4F280C1CAD2-en-US-1/GUID-F8EF8569-5F58-4F15-801E-
  * 		48A11141D672.html
  */
-#define UART_LSR 5
+enum { UART_LSR = 5 };
 
 /*
  * Bit mask for the Transmit Holding Register Empty flag.
@@ -79,10 +79,9 @@
  * When this bit is 1, the UART is ready to accept another byte for
  * transmission.
  */
-#define UART_LSR_THRE (1U << 5)
+enum { UART_LSR_THRE = (1U << 5) };
 
-static volatile unsigned char *const uart =
-	(volatile unsigned char *)UART_BASE;
+static volatile unsigned char *const uart = (volatile unsigned char *)UART_BASE;
 
 /*
  * Transmit one character through the UART. (Polling)
@@ -95,17 +94,17 @@ static volatile unsigned char *const uart =
  * 5. QEMU displays A in the terminal.
  */
 void uart_putc(char c) {
-	/*
-	 * Wait until the UART can accept another byte.
-	 * (When THRE is 1)
-	 */
-	while ((uart[UART_LSR] & UART_LSR_THRE) == 0) {
-	}
+        /*
+         * Wait until the UART can accept another byte.
+         * (When THRE is 1)
+         */
+        while ((uart[UART_LSR] & UART_LSR_THRE) == 0) {
+        }
 
-	/*
-	 * Write the character to the Transmit Holding Register.
-	 */
-	uart[UART_THR] = (unsigned char)c;
+        /*
+         * Write the character to the Transmit Holding Register.
+         */
+        uart[UART_THR] = (unsigned char)c;
 }
 
 /*
@@ -130,4 +129,3 @@ void uart_puts(const char *str) {
                 str++;
         }
 }
-

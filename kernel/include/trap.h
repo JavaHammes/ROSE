@@ -51,7 +51,7 @@ struct trap_frame {
 
 _Static_assert(sizeof(struct trap_frame) == 288, "trap frame layout mismatch");
 
-void trap_handler(struct trap_frame *frame);
 void trap_init(void);
+void trap_handler(struct trap_frame *frame);
 
 #endif
