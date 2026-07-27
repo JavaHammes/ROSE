@@ -1,5 +1,5 @@
-#include "interrupt.h"
 #include "kernel.h"
+#include "interrupt.h"
 #include "plic.h"
 #include "timer.h"
 #include "trap.h"
@@ -8,7 +8,6 @@
 void kernel_main(unsigned long hart_id, const void *dtb) {
         (void)hart_id;
         (void)dtb;
-
 
         trap_init();
 
@@ -21,7 +20,7 @@ void kernel_main(unsigned long hart_id, const void *dtb) {
         external_interrupts_enable();
         timer_interrupts_enable();
 
-        //uart_puts("Kernel initialized\n");
+        // uart_puts("Kernel initialized\n");
 
         while (1) {
                 __asm__ volatile("wfi");

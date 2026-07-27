@@ -140,13 +140,10 @@ static inline volatile uint32_t *plic_register(uintptr_t address) {
  */
 static uintptr_t plic_enable_address(uint32_t interrupt_id) {
         uintptr_t word_offset =
-                ((uintptr_t)interrupt_id / UINTPTR_C(32)) *
-                sizeof(uint32_t);
+            ((uintptr_t)interrupt_id / UINTPTR_C(32)) * sizeof(uint32_t);
 
-        return PLIC_BASE +
-               PLIC_ENABLE_BASE +
-               PLIC_S_CONTEXT * PLIC_ENABLE_STRIDE +
-               word_offset;
+        return PLIC_BASE + PLIC_ENABLE_BASE +
+               PLIC_S_CONTEXT * PLIC_ENABLE_STRIDE + word_offset;
 }
 
 /*
@@ -154,10 +151,8 @@ static uintptr_t plic_enable_address(uint32_t interrupt_id) {
  * context's control-register block.
  */
 static uintptr_t plic_context_address(uintptr_t register_offset) {
-        return PLIC_BASE +
-               PLIC_CONTEXT_BASE +
-               PLIC_S_CONTEXT * PLIC_CONTEXT_STRIDE +
-               register_offset;
+        return PLIC_BASE + PLIC_CONTEXT_BASE +
+               PLIC_S_CONTEXT * PLIC_CONTEXT_STRIDE + register_offset;
 }
 
 /*
@@ -168,10 +163,8 @@ static uintptr_t plic_context_address(uintptr_t register_offset) {
  * enabled for the selected context and exceeds the context's threshold.
  */
 void plic_set_priority(uint32_t interrupt_id, uint32_t priority) {
-        uintptr_t address =
-                PLIC_BASE +
-                PLIC_PRIORITY_BASE +
-                (uintptr_t)interrupt_id * sizeof(uint32_t);
+        uintptr_t address = PLIC_BASE + PLIC_PRIORITY_BASE +
+                            (uintptr_t)interrupt_id * sizeof(uint32_t);
 
         *plic_register(address) = priority;
 }
@@ -190,8 +183,7 @@ void plic_enable(uint32_t interrupt_id) {
          * interrupt_id % 32 selects the bit position inside the selected
          * 32-bit enable register.
          */
-        uint32_t bit =
-                UINT32_C(1) << (interrupt_id % UINT32_C(32));
+        uint32_t bit = UINT32_C(1) << (interrupt_id % UINT32_C(32));
 
         *plic_register(address) |= bit;
 }
@@ -204,8 +196,7 @@ void plic_enable(uint32_t interrupt_id) {
  */
 void plic_disable(uint32_t interrupt_id) {
         uintptr_t address = plic_enable_address(interrupt_id);
-        uint32_t bit =
-                UINT32_C(1) << (interrupt_id % UINT32_C(32));
+        uint32_t bit = UINT32_C(1) << (interrupt_id % UINT32_C(32));
 
         *plic_register(address) &= ~bit;
 }
@@ -221,8 +212,7 @@ void plic_disable(uint32_t interrupt_id) {
  * A return value of zero means that no interrupt is currently available.
  */
 uint32_t plic_claim(void) {
-        uintptr_t address =
-                plic_context_address(PLIC_CLAIM_COMPLETE_OFFSET);
+        uintptr_t address = plic_context_address(PLIC_CLAIM_COMPLETE_OFFSET);
 
         return *plic_register(address);
 }
@@ -238,8 +228,7 @@ uint32_t plic_claim(void) {
  * function is called.
  */
 void plic_complete(uint32_t interrupt_id) {
-        uintptr_t address =
-                plic_context_address(PLIC_CLAIM_COMPLETE_OFFSET);
+        uintptr_t address = plic_context_address(PLIC_CLAIM_COMPLETE_OFFSET);
 
         *plic_register(address) = interrupt_id;
 }
@@ -259,7 +248,7 @@ void plic_init(void) {
          * non-zero priority to be delivered to this context.
          */
         uintptr_t threshold_address =
-                plic_context_address(PLIC_THRESHOLD_OFFSET);
+            plic_context_address(PLIC_THRESHOLD_OFFSET);
 
         *plic_register(threshold_address) = UINT32_C(0);
 

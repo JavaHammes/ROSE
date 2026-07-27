@@ -6,9 +6,7 @@
 /*
  * QEMU virt PLIC interrupt source IDs.
  */
-enum {
-    PLIC_IRQ_UART0 = 10
-};
+enum { PLIC_IRQ_UART0 = 10 };
 
 void plic_init(void);
 void plic_enable(uint32_t interrupt_id);

@@ -62,12 +62,7 @@
  *
  *     read -> Line Status Register
  */
-enum {
-        UART_RBR = 0,
-        UART_THR = 0,
-        UART_IER = 1,
-        UART_LSR = 5
-};
+enum { UART_RBR = 0, UART_THR = 0, UART_IER = 1, UART_LSR = 5 };
 
 /*
  * Interrupt Enable Register bits.
@@ -75,9 +70,7 @@ enum {
  * Setting UART_IER_RX_AVAILABLE enables an interrupt whenever received data
  * becomes available in the UART receive buffer.
  */
-enum {
-        UART_IER_RX_AVAILABLE = (1U << 0)
-};
+enum { UART_IER_RX_AVAILABLE = (1U << 0) };
 
 /*
  * Line Status Register bits.
@@ -88,10 +81,7 @@ enum {
  * UART_LSR_THRE:
  *     The Transmit Holding Register is empty and can accept another byte.
  */
-enum {
-        UART_LSR_DATA_READY = (1U << 0),
-        UART_LSR_THRE = (1U << 5)
-};
+enum { UART_LSR_DATA_READY = (1U << 0), UART_LSR_THRE = (1U << 5) };
 
 static volatile unsigned char *const uart = (volatile unsigned char *)UART_BASE;
 
@@ -180,9 +170,7 @@ void uart_put_hex64(uint64_t value) {
  * - supervisor external interrupts enabled in sie.SEIE
  * - supervisor interrupts globally enabled in sstatus.SIE
  */
-void uart_interrupts_enable(void) {
-        uart[UART_IER] = UART_IER_RX_AVAILABLE;
-}
+void uart_interrupts_enable(void) { uart[UART_IER] = UART_IER_RX_AVAILABLE; }
 
 /*
  * Handle a UART receive interrupt.
@@ -202,19 +190,18 @@ void uart_interrupts_enable(void) {
  */
 void uart_handle_interrupt(void) {
         /*
-        * Drain every byte currently available in the receive FIFO.
-        *
-        * Reading UART_RBR removes one received byte from the UART.
-        * Once no bytes remain, UART_LSR_DATA_READY becomes zero and
-        * the receive interrupt condition is cleared.
-        */
+         * Drain every byte currently available in the receive FIFO.
+         *
+         * Reading UART_RBR removes one received byte from the UART.
+         * Once no bytes remain, UART_LSR_DATA_READY becomes zero and
+         * the receive interrupt condition is cleared.
+         */
         while ((uart[UART_LSR] & UART_LSR_DATA_READY) != 0U) {
-            char character = (char)uart[UART_RBR];
+                char character = (char)uart[UART_RBR];
 
-            /*
-             * Temporary behavior: echo the received character.
-             */
-            uart_putc(character);
-
+                /*
+                 * Temporary behavior: echo the received character.
+                 */
+                uart_putc(character);
         }
 }

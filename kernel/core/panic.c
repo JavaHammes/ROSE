@@ -1,5 +1,5 @@
-#include "interrupt.h"
 #include "panic.h"
+#include "interrupt.h"
 #include "trap.h"
 #include "uart.h"
 
