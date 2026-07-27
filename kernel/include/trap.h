@@ -54,6 +54,18 @@ struct trap_frame {
 _Static_assert(sizeof(struct trap_frame) == TRAP_FRAME_SIZE,
                "trap frame layout mismatch");
 
+enum interrupt_masks {
+    /*
+     * Bit 63 of scause indicates whether the trap was caused by an interrupt.
+     */
+    SCAUSE_INTERRUPT_BIT = (UINT64_C(1) << 63),
+
+    /*
+     * The remaining bits of scause contain the interrupt or exception code.
+     */
+    SCAUSE_CODE_MASK = (~SCAUSE_INTERRUPT_BIT),
+};
+
 /*
  * Supervisor interrupt cause codes.
  */
@@ -83,8 +95,6 @@ enum exception_code {
 };
 
 void trap_init(void);
-void interrupts_enable(void);
-void interrupts_disable(void);
 void trap_handler(struct trap_frame *frame);
 
 #endif

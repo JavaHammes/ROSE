@@ -1,3 +1,4 @@
+#include "interrupt.h"
 #include "panic.h"
 #include "trap.h"
 #include "uart.h"
@@ -30,7 +31,7 @@ static void print_register(const char *name, uint64_t value) {
  * specific trap frame.
  */
 _Noreturn void panic(const char *message) {
-        interrupts_disable();
+        global_interrupts_disable();
 
         uart_puts("\n*** KERNEL PANIC ***\n");
         uart_puts(message);
@@ -48,7 +49,7 @@ _Noreturn void panic(const char *message) {
  * sstatus: supervisor status at the time of the trap
  */
 _Noreturn void panic_trap(const char *message, const struct trap_frame *frame) {
-        interrupts_disable();
+        global_interrupts_disable();
 
         uart_puts("\n*** KERNEL PANIC ***\n");
         uart_puts(message);

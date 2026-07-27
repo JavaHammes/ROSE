@@ -44,42 +44,54 @@
  */
 
 /*
- * Register index of the THR "Transmit Holding Register".
+ * NS16550A register offsets.
  *
- * Writing one byte to this register askas the UART to transmit the byte.
+ * Some UART registers share the same offset. Their meaning depends on whether
+ * the CPU reads from or writes to the register.
  *
- * Read register 0 -> receive a byte
- * Write register 0 -> transmit a byte
+ * Offset 0:
+ *
+ *     read  -> Receiver Buffer Register
+ *     write -> Transmit Holding Register
+ *
+ * Offset 1:
+ *
+ *     read/write -> Interrupt Enable Register
+ *
+ * Offset 5:
+ *
+ *     read -> Line Status Register
  */
-enum { UART_THR = 0 };
+enum {
+        UART_RBR = 0,
+        UART_THR = 0,
+        UART_IER = 1,
+        UART_LSR = 5
+};
 
 /*
- * Register index of the LSR "Line Status Register".
+ * Interrupt Enable Register bits.
  *
- * Contains several status bits describing the current state of the UART
- * f. ex.:
- *
- * - received data is availabe
- * - an overrun error occuredd
- * - a parity error occured
- * - the transmitter can accept another byte
- * - the transmitter is completely idle
- *
- * See: https://onlinedocs.microchip.com/oxy/GUID-199548F4-607C-436B-
- * 		80C7-E4F280C1CAD2-en-US-1/GUID-F8EF8569-5F58-4F15-801E-
- * 		48A11141D672.html
+ * Setting UART_IER_RX_AVAILABLE enables an interrupt whenever received data
+ * becomes available in the UART receive buffer.
  */
-enum { UART_LSR = 5 };
+enum {
+        UART_IER_RX_AVAILABLE = (1U << 0)
+};
 
 /*
- * Bit mask for the Transmit Holding Register Empty flag.
+ * Line Status Register bits.
  *
- * Bit 5 of the LSR is called THRE "Transmit Holding Register Empty".
+ * UART_LSR_DATA_READY:
+ *     At least one received byte is available in the receive buffer.
  *
- * When this bit is 1, the UART is ready to accept another byte for
- * transmission.
+ * UART_LSR_THRE:
+ *     The Transmit Holding Register is empty and can accept another byte.
  */
-enum { UART_LSR_THRE = (1U << 5) };
+enum {
+        UART_LSR_DATA_READY = (1U << 0),
+        UART_LSR_THRE = (1U << 5)
+};
 
 static volatile unsigned char *const uart = (volatile unsigned char *)UART_BASE;
 
@@ -150,5 +162,59 @@ void uart_put_hex64(uint64_t value) {
                     (uint8_t)((value >> (unsigned int)shift) & UINT64_C(0x0f));
 
                 uart_put_hex_digit(digit);
+        }
+}
+
+/*
+ * Enable UART receive interrupts.
+ *
+ * This configures the UART itself to raise an interrupt when received data
+ * becomes available.
+ *
+ * The interrupt will only reach the CPU if the remaining interrupt path is
+ * also configured:
+ *
+ * - UART interrupt source enabled in the PLIC
+ * - PLIC priority greater than zero
+ * - PLIC threshold permits the interrupt
+ * - supervisor external interrupts enabled in sie.SEIE
+ * - supervisor interrupts globally enabled in sstatus.SIE
+ */
+void uart_interrupts_enable(void) {
+        uart[UART_IER] = UART_IER_RX_AVAILABLE;
+}
+
+/*
+ * Handle a UART receive interrupt.
+ *
+ * The handler drains every byte currently available in the receive buffer.
+ * Reading UART_RBR removes one byte from the UART.
+ *
+ * Once no bytes remain:
+ *
+ * - UART_LSR_DATA_READY becomes zero
+ * - the UART stops asserting the receive interrupt
+ * - the interrupt can safely be completed in the PLIC
+ *
+ * The current implementation echoes each received byte back to the terminal.
+ * This is useful for testing keyboard input.
+ *
+ */
+void uart_handle_interrupt(void) {
+        /*
+        * Drain every byte currently available in the receive FIFO.
+        *
+        * Reading UART_RBR removes one received byte from the UART.
+        * Once no bytes remain, UART_LSR_DATA_READY becomes zero and
+        * the receive interrupt condition is cleared.
+        */
+        while ((uart[UART_LSR] & UART_LSR_DATA_READY) != 0U) {
+            char character = (char)uart[UART_RBR];
+
+            /*
+             * Temporary behavior: echo the received character.
+             */
+            uart_putc(character);
+
         }
 }

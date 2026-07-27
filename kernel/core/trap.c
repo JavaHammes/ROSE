@@ -1,6 +1,7 @@
 #include <stdint.h>
 
 #include "panic.h"
+#include "plic.h"
 #include "timer.h"
 #include "trap.h"
 #include "uart.h"
@@ -14,42 +15,6 @@
  *
  * "r" means use general purpose register.
  */
-
-/*
- * sstatus.SSIE - Supervisor Interrupt Enable
- *
- * This is the global interrupt-enable bit for supervisor mode.
- *
- * When SIE = 0: No s. interrupts while cpu in s mode.
- * WHen SIE = 1: S interrupts are taken when corresponding inttertups source
- *     		 is also enabled in the sie CSR.
- */
-#define SSTATUS_SIE (1UL << 1)
-
-/*
- * STIE - Supervisor Timer Interrupts Enable
- *
- * An interrupt is only enabled when:
- *  1. its corresponding bit in sie is enabled
- *  2. the global sstatus.SIE bit is enabled
- */
-#define SIE_STIE (1UL << 5)
-
-/*
- * Bit 63 of scause indicates whether the trap was caused by an interrupt.
- */
-#define SCAUSE_INTERRUPT_BIT (UINT64_C(1) << 63)
-
-/*
- * The remaining bits of scause contain the interrupt or exception code.
- */
-#define SCAUSE_CODE_MASK (~SCAUSE_INTERRUPT_BIT)
-
-/*
- * Supervisor timer interrupt code.
- * scause[62:0] = 5
- */
-#define SCAUSE_SUPERVISOR_TIMER 5UL
 
 /*
  * Assembly trap-routine defined in arch/riscv64/trap.S
@@ -102,50 +67,30 @@ static const char *exception_name(uint64_t code) {
         }
 }
 
-/*
- * Configure Supervisor-mode trap handling.
- * This function writes the address of trap_entry into the stvec CSR.
- * We use direct mode because  it is simpler for now.
- */
-void trap_init(void) {
-        uintptr_t entry = (uintptr_t)trap_entry;
-        // uintptr_t stvec_value = entry | 1u; (would set to vectored mode)
+static void handle_external_interrupt(void) {
+        uint32_t interrupt_id = plic_claim();
 
-        /*
-         * Set the Supervisor trap-vector register.
-         */
-        __asm__ volatile("csrw stvec, %[entry]" : : [entry] "r"(entry));
+        if (interrupt_id == 0) {
+                /*
+                 * A notification can become stale before this hart claims
+                 * the interrupt, so claim returning zero is valid.
+                 */
+                return;
+        }
 
-        /*
-         * Enable the timer interrupt.
-         * sie = sie | interrupt_mask;
-         */
-        uintptr_t interrupt_mask = SIE_STIE;
-        __asm__ volatile("csrs sie, %0" : : "r"(interrupt_mask));
-}
+        switch (interrupt_id) {
+        case PLIC_IRQ_UART0:
+                uart_handle_interrupt();
+                break;
 
-/*
- * Globally enable interrupts while executing in S-mode.
- * sstatus = sstatus | SSTATUS_SIE;
- */
-void interrupts_enable(void) {
-        __asm__ volatile("csrs sstatus, %[status]"
-                         :
-                         : [status] "r"(SSTATUS_SIE));
-}
+        default:
+                /*
+                 * Unknown interrupt. For now we ignore it.
+                 */
+                break;
+        }
 
-/*
- * Globally disable Supervisor interrupts.
- *
- * csrrc clears the selected bits:
- *
- *     sstatus = sstatus & ~SSTATUS_SIE;
- */
-void interrupts_disable(void) {
-        __asm__ volatile("csrc sstatus, %[mask]"
-                         :
-                         : [mask] "r"(SSTATUS_SIE)
-                         : "memory");
+        plic_complete(interrupt_id);
 }
 
 /*
@@ -165,10 +110,8 @@ static void handle_interrupt(struct trap_frame *frame, uint64_t code) {
                 panic_trap("Unhandled supervisor software interrupt", frame);
 
         case SCAUSE_SUPERVISOR_EXTERNAL:
-                /*
-                 * Not implemented yet.
-                 */
-                panic_trap("Unhandled supervisor external interrupt", frame);
+                handle_external_interrupt();
+                return;
 
         default:
                 /*
@@ -223,4 +166,19 @@ void trap_handler(struct trap_frame *frame) {
         }
 
         handle_exception(frame, code);
+}
+
+/*
+ * Configure Supervisor-mode trap handling.
+ * This function writes the address of trap_entry into the stvec CSR.
+ * We use direct mode because it is simpler for now.
+ */
+void trap_init(void) {
+        uintptr_t entry = (uintptr_t)trap_entry;
+        // uintptr_t stvec_value = entry | 1u; (would set to vectored mode)
+
+        /*
+         * Set the Supervisor trap-vector register.
+         */
+        __asm__ volatile("csrw stvec, %[entry]" : : [entry] "r"(entry));
 }
