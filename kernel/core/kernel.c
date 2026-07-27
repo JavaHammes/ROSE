@@ -1,6 +1,6 @@
-#include "kernel.h"
 #include "interrupt.h"
 #include "plic.h"
+#include "terminal.h"
 #include "timer.h"
 #include "trap.h"
 #include "uart.h"
@@ -16,13 +16,21 @@ void kernel_main(unsigned long hart_id, const void *dtb) {
 
         timer_schedule_next();
 
-        global_interrupts_enable();
         external_interrupts_enable();
-        timer_interrupts_enable();
+        global_interrupts_enable();
 
-        // uart_puts("Kernel initialized\n");
+        terminal_init();
 
         while (1) {
+                terminal_poll();
+
+                /*
+                 * Sleep until the next interrupt.
+                 *
+                 * A UART interrupt will place characters in the receive
+                 * buffer. After returning from the trap handler, execution
+                 * resumes here and terminal_poll() processes them.
+                 */
                 __asm__ volatile("wfi");
         }
 }

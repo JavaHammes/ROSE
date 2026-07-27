@@ -140,7 +140,7 @@ static inline volatile uint32_t *plic_register(uintptr_t address) {
  */
 static uintptr_t plic_enable_address(uint32_t interrupt_id) {
         uintptr_t word_offset =
-            ((uintptr_t)interrupt_id / UINTPTR_C(32)) * sizeof(uint32_t);
+            ((uintptr_t)interrupt_id / 32U) * sizeof(uint32_t);
 
         return PLIC_BASE + PLIC_ENABLE_BASE +
                PLIC_S_CONTEXT * PLIC_ENABLE_STRIDE + word_offset;

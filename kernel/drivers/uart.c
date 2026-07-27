@@ -26,6 +26,9 @@
  * Source: https://twilco.github.io/riscv-from-scratch/2019/07/08/riscv-from-
  *         scratch-3.html
  */
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "uart.h"
 
 /*
@@ -84,6 +87,97 @@ enum { UART_IER_RX_AVAILABLE = (1U << 0) };
 enum { UART_LSR_DATA_READY = (1U << 0), UART_LSR_THRE = (1U << 5) };
 
 static volatile unsigned char *const uart = (volatile unsigned char *)UART_BASE;
+
+/*
+ * Software receive ring buffer.
+ *
+ * Characters can arrive from the UART at any time. The UART interrupt handler
+ * must therefore store each received character somewhere until normal kernel
+ * code is ready to process it.
+ *
+ * This array is used as a circular, or ring, buffer:
+ *
+ *     write index -> position where the interrupt handler stores the next byte
+ *     read index  -> position where uart_getc() reads the next byte
+ *
+ * When either index reaches the end of the array, it wraps back to zero.
+ *
+ * One array entry is intentionally left unused. This makes it possible to
+ * distinguish between:
+ *
+ *     read index == write index      -> buffer is empty
+ *     next write index == read index -> buffer is full
+ *
+ * This implementation stores at most UART_RX_BUFFER_SIZE - 1 characters.
+ */
+#define UART_RX_BUFFER_SIZE 128U
+
+static char uart_rx_buffer[UART_RX_BUFFER_SIZE];
+static volatile uint32_t uart_rx_read_index;
+static volatile uint32_t uart_rx_write_index;
+
+/*
+ * Return the next position in the circular buffer.
+ *
+ * The modulo operation wraps the index back to zero after the last array
+ * element:
+ *
+ *     0 -> 1 -> 2 -> ... -> 127 -> 0
+ */
+static uint32_t uart_rx_next_index(uint32_t index) {
+        return (index + UINT32_C(1)) % UART_RX_BUFFER_SIZE;
+}
+
+/*
+ * Insert one received character into the ring buffer.
+ *
+ * This function is called from the UART interrupt handler.
+ *
+ * Returns:
+ *
+ *     true  -> the character was stored successfully
+ *     false -> the buffer was full and the character was dropped
+ */
+static bool uart_rx_buffer_push(char character) {
+        uint32_t next_write_index = uart_rx_next_index(uart_rx_write_index);
+
+        /*
+         * If advancing the write index would reach the read index, the buffer
+         * is full.
+         */
+        if (next_write_index == uart_rx_read_index) {
+                return false;
+        }
+
+        uart_rx_buffer[uart_rx_write_index] = character;
+        uart_rx_write_index = next_write_index;
+
+        return true;
+}
+
+/*
+ * Read one character from the UART receive ring buffer.
+ *
+ * This function is called from normal kernel code, not from the interrupt
+ * handler.
+ *
+ * The received character is written to *character.
+ *
+ * Returns:
+ *
+ *     true  -> one character was available and returned
+ *     false -> the buffer was empty
+ */
+bool uart_getc(char *character) {
+        if (uart_rx_read_index == uart_rx_write_index) {
+                return false;
+        }
+
+        *character = uart_rx_buffer[uart_rx_read_index];
+        uart_rx_read_index = uart_rx_next_index(uart_rx_read_index);
+
+        return true;
+}
 
 /*
  * Transmit one character through the UART. (Polling)
@@ -200,8 +294,10 @@ void uart_handle_interrupt(void) {
                 char character = (char)uart[UART_RBR];
 
                 /*
-                 * Temporary behavior: echo the received character.
+                 * Drop the character if the software buffer is full.
+                 *
+                 * Later, we may want to use a larger buffer.
                  */
-                uart_putc(character);
+                (void)uart_rx_buffer_push(character);
         }
 }
