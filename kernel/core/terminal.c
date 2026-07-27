@@ -9,9 +9,7 @@
 static char terminal_line[TERMINAL_LINE_SIZE];
 static size_t terminal_line_length;
 
-static void terminal_print_prompt(void) {
-        uart_puts("rose> ");
-}
+static void terminal_print_prompt(void) { uart_puts("rose> "); }
 
 static void terminal_submit_line(void) {
         /*

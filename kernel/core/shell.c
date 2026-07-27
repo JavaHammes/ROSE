@@ -7,9 +7,14 @@
 #define SHELL_MAX_ARGUMENTS 8U
 
 /*
+ * Number of elements in a compile-time array.
+ */
+#define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
+
+/*
  * We currently can't import string.h
  */
-static int strcmp(const char *left, const char *right) {
+static int string_compare(const char *left, const char *right) {
         while (*left != '\0' && *left == *right) {
                 left++;
                 right++;
@@ -18,12 +23,44 @@ static int strcmp(const char *left, const char *right) {
         return (unsigned char)*left - (unsigned char)*right;
 }
 
-static void shell_command_help(void) {
+static void shell_command_help(int argc, char **argv);
+static void shell_command_echo(int argc, char **argv);
+static void shell_command_clear(int argc, char **argv);
+static void shell_command_info(int argc, char **argv);
+
+static const struct shell_command commands[] = {
+    {.name = "help",
+     .description = "Show available commands",
+     .handler = shell_command_help},
+    {.name = "echo",
+     .description = "Print arguments",
+     .handler = shell_command_echo},
+    {.name = "clear",
+     .description = "Clear the terminal",
+     .handler = shell_command_clear},
+    {.name = "info",
+     .description = "Show kernel information",
+     .handler = shell_command_info}};
+
+/*
+ * Print all registered shell commands.
+ *
+ * Because the help output is generated from the command table, it stays
+ * synchronized when commands are added or removed.
+ */
+static void shell_command_help(int argc, char **argv) {
+        (void)argc;
+        (void)argv;
+
         uart_puts("Available commands:\n");
-        uart_puts("  help        Show this help message\n");
-        uart_puts("  echo TEXT   Print TEXT\n");
-        uart_puts("  clear       Clear the terminal\n");
-        uart_puts("  info        Show kernel information\n");
+
+        for (size_t index = 0U; index < ARRAY_SIZE(commands); index++) {
+                uart_puts("  ");
+                uart_puts(commands[index].name);
+                uart_puts(" - ");
+                uart_puts(commands[index].description);
+                uart_putc('\n');
+        }
 }
 
 static void shell_command_echo(int argc, char **argv) {
@@ -38,7 +75,9 @@ static void shell_command_echo(int argc, char **argv) {
         uart_putc('\n');
 }
 
-static void shell_command_clear(void) {
+static void shell_command_clear(int argc, char **argv) {
+        (void)argc;
+        (void)argv;
         /*
          * ANSI escape sequence:
          *
@@ -48,17 +87,38 @@ static void shell_command_clear(void) {
         uart_puts("\x1b[2J\x1b[H");
 }
 
-static void shell_command_info(void) {
+static void shell_command_info(int argc, char **argv) {
+        (void)argc;
+        (void)argv;
+
         uart_puts("ROSE RISC-V kernel\n");
         uart_puts("Architecture: RV64\n");
         uart_puts("Privilege mode: Supervisor\n");
 }
 
-static int shell_parse_arguments(
-        char *line,
-        char **argv,
-        size_t argv_capacity
-) {
+/*
+ * Split a command line into null-terminated arguments.
+ *
+ * The function modifies line in place by replacing spaces with '\0'.
+ *
+ * Example:
+ *
+ *     Before:
+ *
+ *         "echo hello world\0"
+ *
+ *     After:
+ *
+ *         "echo\0hello\0world\0"
+ *
+ *     argv[0] points to "echo".
+ *     argv[1] points to "hello".
+ *     argv[2] points to "world".
+ *
+ * Returns the number of parsed arguments.
+ */
+static int shell_parse_arguments(char *line, char **argv,
+                                 size_t argv_capacity) {
         size_t argc = 0U;
         char *cursor = line;
 
@@ -106,34 +166,20 @@ static int shell_parse_arguments(
 void shell_execute(char *line) {
         char *argv[SHELL_MAX_ARGUMENTS];
 
-        int argc = shell_parse_arguments(
-                line,
-                argv,
-                SHELL_MAX_ARGUMENTS
-        );
+        int argc = shell_parse_arguments(line, argv, SHELL_MAX_ARGUMENTS);
 
         if (argc == 0) {
                 return;
         }
 
-        if (strcmp(argv[0], "help") == 0) {
-                shell_command_help();
-                return;
-        }
-
-        if (strcmp(argv[0], "echo") == 0) {
-                shell_command_echo(argc, argv);
-                return;
-        }
-
-        if (strcmp(argv[0], "clear") == 0) {
-                shell_command_clear();
-                return;
-        }
-
-        if (strcmp(argv[0], "info") == 0) {
-                shell_command_info();
-                return;
+        /*
+         * Search the command table for a matching command name.
+         */
+        for (size_t index = 0U; index < ARRAY_SIZE(commands); index++) {
+                if (string_compare(argv[0], commands[index].name) == 0) {
+                        commands[index].handler(argc, argv);
+                        return;
+                }
         }
 
         uart_puts("Unknown command: ");
