@@ -7,7 +7,7 @@
 - Kernel mode: Supervisor mode
 - User mode: -
 - Virtual Memory: -
-- Interrupts: Timer interrupts
+- Interrupts: Timer interrupts, External supervisor interrupts through PLIC
 - Device support: UART only
 
 ## Stack:
