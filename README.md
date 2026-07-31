@@ -22,10 +22,14 @@ scheduling, and automated emulator tests.
   reclamation.
 - Validated ELF64 RISC-V loader with `PT_LOAD` support, BSS zeroing, overlapping
   segment handling, W^X enforcement, and complete unload ownership tracking.
-- U-mode C runtime with `write`, `exit`, and `yield` system calls.
+- Read-only ramfs mounted through a small VFS, with independently linked user
+  executables available by absolute path under `/bin`.
+- U-mode C runtime with `write`, `exit`, and `yield` system calls. UART-backed
+  writes copy user data, block on a scheduler wait channel, and resume from TX
+  interrupts without polling in the syscall trap.
 - Eight-slot round-robin process scheduler with timer preemption, guarded user
   stacks, per-process kernel trap stacks, process creation, termination,
-  waiting, and reaping.
+  waiting, reaping, typed block/wake channels, and an interruptible idle path.
 - Interrupt-driven UART input, PLIC external interrupts, SBI timers, panic
   diagnostics, and SBI system shutdown.
 - Automated QEMU tests at two RAM sizes, including leak detection.
@@ -80,11 +84,11 @@ The terminal starts at `rose>`. Useful commands are:
 | `help` | List every command. |
 | `info` | Show the discovered platform and virtual-memory state. |
 | `meminfo` | Show usable, used, and free physical pages. |
-| `run` | Run the normal U-mode C program. |
-| `run fault` | Verify that U-mode cannot read supervisor kernel text. |
-| `run syscall` | Verify invalid pointers and unknown syscall handling. |
+| `run [PATH]` | Run an executable path (defaults to `/bin/hello`). |
+| `run /bin/fault` | Verify that U-mode cannot read supervisor kernel text. |
+| `run /bin/syscall-test` | Verify invalid pointers and unknown syscall handling. |
 | `runmulti` | Run two timer-preempted processes. |
-| `spawn [hello\|fault\|a\|b\|syscall]` | Create a ready process. |
+| `spawn [PATH]` | Create a ready process (defaults to `/bin/hello`). |
 | `wait` | Run all ready processes until they exit. |
 | `kill PID` | Terminate a ready process. |
 | `ps` | Show ready and exited process-table entries. |
@@ -126,17 +130,22 @@ another. `make disassemble` writes an annotated disassembly to
 2. Assembly establishes the boot stack, clears BSS, and calls `kernel_main`.
 3. The kernel parses the DTB, initializes physical memory, builds the kernel
    Sv39 address space, and enables interrupts and the terminal.
-4. A process receives a private Sv39 root, user stack, kernel trap stack, and
-   pages populated from the embedded ELF image.
-5. Traps switch from the untrusted user stack to the process kernel stack.
+4. The initial ramfs mounts distinct ELF files at `/bin/hello`, `/bin/fault`,
+   `/bin/process-a`, `/bin/process-b`, and `/bin/syscall-test`.
+5. A process resolves its executable through the VFS, then receives a private
+   Sv39 root, user stack, kernel trap stack, and pages populated from that ELF.
+6. Traps switch from the untrusted user stack to the process kernel stack.
    Syscalls, faults, yields, and timer ticks may update the saved trap frame.
-6. When no ready process remains, execution returns to the foreground shell;
-   exited processes retain only status metadata until `reap`.
+7. A UART write retains its `ecall`, blocks the process, and resumes through a
+   fresh trap after a transmit-empty interrupt. If every process is blocked,
+   the foreground scheduler waits in supervisor mode with `wfi`.
+8. When no ready or blocked process remains, execution returns to the foreground
+   shell; exited processes retain only status metadata until `reap`.
 
 ## Deliberate limitations
 
 ROSE currently targets one hart and one QEMU `virt` platform. User workloads
 run as a foreground batch while the kernel still maintains persistent ready
-and exited states between shell commands. There is one embedded user ELF, no
-filesystem or persistent storage, no blocking I/O or sleep queues, no ASIDs,
-and no networking.
+and exited states between shell commands. The ramfs is immutable and populated
+only at build time; there are no file descriptors, filesystem mutation,
+persistent storage, general-purpose kernel threads, ASIDs, or networking.

@@ -1,0 +1,69 @@
+/* Mount the build-time user executables as immutable files under /bin. */
+#include <stddef.h>
+#include <stdint.h>
+
+#include "panic.h"
+#include "ramfs.h"
+#include "vfs.h"
+
+extern uint8_t user_hello_elf_start[];
+extern uint8_t user_hello_elf_end[];
+extern uint8_t user_fault_elf_start[];
+extern uint8_t user_fault_elf_end[];
+extern uint8_t user_process_a_elf_start[];
+extern uint8_t user_process_a_elf_end[];
+extern uint8_t user_process_b_elf_start[];
+extern uint8_t user_process_b_elf_end[];
+extern uint8_t user_syscall_test_elf_start[];
+extern uint8_t user_syscall_test_elf_end[];
+
+enum { RAMFS_PROGRAM_COUNT = 5 };
+
+static struct vfs_node bin_nodes[RAMFS_PROGRAM_COUNT] = {
+    {.name = "hello", .type = VFS_NODE_REGULAR},
+    {.name = "fault", .type = VFS_NODE_REGULAR},
+    {.name = "process-a", .type = VFS_NODE_REGULAR},
+    {.name = "process-b", .type = VFS_NODE_REGULAR},
+    {.name = "syscall-test", .type = VFS_NODE_REGULAR},
+};
+
+static const struct vfs_node root_nodes[] = {
+    {.name = "bin",
+     .type = VFS_NODE_DIRECTORY,
+     .children = bin_nodes,
+     .child_count = RAMFS_PROGRAM_COUNT},
+};
+
+static const struct vfs_node ramfs_root = {
+    .name = "",
+    .type = VFS_NODE_DIRECTORY,
+    .children = root_nodes,
+    .child_count = sizeof(root_nodes) / sizeof(root_nodes[0]),
+};
+
+static void ramfs_set_file(size_t index, uint8_t *start, uint8_t *end) {
+        uintptr_t start_address = (uintptr_t)start;
+        uintptr_t end_address = (uintptr_t)end;
+
+        if (index >= RAMFS_PROGRAM_COUNT || end_address <= start_address) {
+                panic("Invalid embedded ramfs file");
+        }
+
+        bin_nodes[index].data = start;
+        bin_nodes[index].size = (size_t)(end_address - start_address);
+}
+
+void ramfs_init(void) {
+        ramfs_set_file(0U, user_hello_elf_start, user_hello_elf_end);
+        ramfs_set_file(1U, user_fault_elf_start, user_fault_elf_end);
+        ramfs_set_file(2U, user_process_a_elf_start,
+                       user_process_a_elf_end);
+        ramfs_set_file(3U, user_process_b_elf_start,
+                       user_process_b_elf_end);
+        ramfs_set_file(4U, user_syscall_test_elf_start,
+                       user_syscall_test_elf_end);
+
+        if (!vfs_mount_root(&ramfs_root)) {
+                panic("Failed to mount initial ramfs");
+        }
+}

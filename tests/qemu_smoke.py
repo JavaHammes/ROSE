@@ -153,22 +153,32 @@ def main() -> int:
         if baseline > 8:
             raise AssertionError(f"kernel page tables use {baseline} pages; expected at most 8")
 
-        require(session.command("run"), "Hello from U-mode C", "exited with status 0")
         require(
-            session.command("run fault"),
+            session.command("run"),
+            "Hello from U-mode C",
+            "exited with status 0",
+            "Scheduler blocks:",
+        )
+        require(
+            session.command("run /bin/fault"),
             "terminated by exception 13",
             "exited with status 1",
         )
         require(
-            session.command("run syscall"),
+            session.command("run /bin/syscall-test"),
             "Syscall validation passed",
             "exited with status 0",
+            "Scheduler blocks:",
+        )
+        require(
+            session.command("run /bin/missing"),
+            "Unable to load program: /bin/missing",
         )
 
         # Separate spawn from wait so READY persistence and ps are tested before
         # the foreground scheduler consumes the processes.
-        process_a = spawned_pid(session.command("spawn a"))
-        process_b = spawned_pid(session.command("spawn b"))
+        process_a = spawned_pid(session.command("spawn /bin/process-a"))
+        process_b = spawned_pid(session.command("spawn /bin/process-b"))
         process_table = session.command("ps")
         require(process_table, f"{process_a}    ready", f"{process_b}    ready")
 
@@ -179,12 +189,13 @@ def main() -> int:
             "Process B: running",
             "Scheduler switches:",
             "preemptions)",
+            "Scheduler blocks:",
         )
         preemptions = re.search(r"\((\d+) preemptions\)", scheduler)
         if preemptions is None or int(preemptions.group(1)) == 0:
             raise AssertionError(f"timer did not preempt the user processes:\n{scheduler}")
 
-        killed = spawned_pid(session.command("spawn hello"))
+        killed = spawned_pid(session.command("spawn /bin/hello"))
         require(session.command(f"kill {killed}"), f"Terminated process {killed}")
         require(
             session.command("wait"),

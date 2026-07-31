@@ -31,6 +31,7 @@
 #include <stdint.h>
 
 #include "platform.h"
+#include "scheduler.h"
 #include "uart.h"
 
 /*
@@ -75,7 +76,10 @@ enum { UART_RBR = 0, UART_THR = 0, UART_IER = 1, UART_LSR = 5 };
  * Setting UART_IER_RX_AVAILABLE enables an interrupt whenever received data
  * becomes available in the UART receive buffer.
  */
-enum { UART_IER_RX_AVAILABLE = (1U << 0) };
+enum {
+        UART_IER_RX_AVAILABLE = (1U << 0),
+        UART_IER_TX_EMPTY = (1U << 1),
+};
 
 /*
  * Line Status Register bits.
@@ -117,6 +121,8 @@ enum { UART_UINT64_DECIMAL_DIGITS = 20 };
 static char uart_rx_buffer[UART_RX_BUFFER_SIZE];
 static volatile uint32_t uart_rx_read_index;
 static volatile uint32_t uart_rx_write_index;
+static bool uart_tx_in_flight;
+static uint8_t uart_interrupt_enable = UART_IER_RX_AVAILABLE;
 
 /*
  * Return the next position in the circular buffer.
@@ -206,6 +212,27 @@ void uart_putc(char c) {
 }
 
 /*
+ * Submit one byte without waiting in supervisor mode.
+ *
+ * The caller blocks its process after a successful submission (and also when
+ * the device is not ready). THRE later raises an interrupt, which clears the
+ * in-flight state and wakes every process sleeping on the UART wait channel.
+ */
+bool uart_tx_submit(char character) {
+        uart_interrupt_enable |= UART_IER_TX_EMPTY;
+        UART_REGISTERS[UART_IER] = uart_interrupt_enable;
+
+        if (uart_tx_in_flight ||
+            (UART_REGISTERS[UART_LSR] & UART_LSR_THRE) == 0U) {
+                return false;
+        }
+
+        UART_REGISTERS[UART_THR] = (unsigned char)character;
+        uart_tx_in_flight = true;
+        return true;
+}
+
+/*
  * Write a null-terminated string to the UART.
  */
 void uart_puts(const char *str) {
@@ -276,7 +303,8 @@ void uart_put_uint64(uint64_t value) {
 }
 
 /*
- * Enable UART receive interrupts.
+ * Enable the UART interrupt path, initially for receive data. Transmit-empty
+ * interrupts are enabled only while an asynchronous user byte is outstanding.
  *
  * This configures the UART itself to raise an interrupt when received data
  * becomes available.
@@ -291,11 +319,12 @@ void uart_put_uint64(uint64_t value) {
  * - supervisor interrupts globally enabled in sstatus.SIE
  */
 void uart_interrupts_enable(void) {
-        UART_REGISTERS[UART_IER] = UART_IER_RX_AVAILABLE;
+        uart_interrupt_enable = UART_IER_RX_AVAILABLE;
+        UART_REGISTERS[UART_IER] = uart_interrupt_enable;
 }
 
 /*
- * Handle a UART receive interrupt.
+ * Handle UART receive and transmit-empty interrupt conditions.
  *
  * The handler drains every byte currently available in the receive buffer.
  * Reading UART_RBR removes one byte from the UART.
@@ -306,8 +335,8 @@ void uart_interrupts_enable(void) {
  * - the UART stops asserting the receive interrupt
  * - the interrupt can safely be completed in the PLIC
  *
- * The current implementation echoes each received byte back to the terminal.
- * This is useful for testing keyboard input.
+ * Received bytes are retained in the software ring until terminal_poll handles
+ * and echoes them outside interrupt context.
  *
  */
 void uart_handle_interrupt(void) {
@@ -327,5 +356,15 @@ void uart_handle_interrupt(void) {
                  * Later, we may want to use a larger buffer.
                  */
                 (void)uart_rx_buffer_push(character);
+        }
+
+        /* THRE is level-triggered. Disable it before waking writers so the
+         * external interrupt cannot remain asserted with no byte pending. */
+        if ((uart_interrupt_enable & UART_IER_TX_EMPTY) != 0U &&
+            (UART_REGISTERS[UART_LSR] & UART_LSR_THRE) != 0U) {
+                uart_interrupt_enable &= (uint8_t)~UART_IER_TX_EMPTY;
+                UART_REGISTERS[UART_IER] = uart_interrupt_enable;
+                uart_tx_in_flight = false;
+                (void)scheduler_wake_all(SCHEDULER_WAIT_UART_TX);
         }
 }

@@ -24,10 +24,7 @@ enum user_syscall_error {
         USER_ERROR_NOT_IMPLEMENTED = 38,
 };
 
-/*
- * Initial a0 values understood by the single embedded demonstration ELF. Each
- * value selects one behavior inside user_main.
- */
+/* Build-time selectors used to produce the distinct demonstration ELFs. */
 enum user_program {
         USER_PROGRAM_HELLO,
         USER_PROGRAM_FAULT,

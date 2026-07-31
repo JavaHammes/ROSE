@@ -1,9 +1,8 @@
 /*
  * Enter one U-mode program while preserving the supervisor call context.
  *
- * void user_mode_enter(uintptr_t entry, uintptr_t user_stack_top,
- *                      uintptr_t kernel_trap_stack_top,
- *                      uintptr_t initial_argument);
+ * void user_mode_enter(const struct trap_frame *context,
+ *                      uintptr_t kernel_trap_stack_top);
  */
 
 .section .text,"ax",@progbits
@@ -30,6 +29,41 @@
 .equ SSTATUS_SPIE, (1 << 5)
 .equ SSTATUS_SPP,  (1 << 8)
 
+/* Offsets shared with struct trap_frame in trap.h. */
+.equ TF_RA,        0
+.equ TF_SP,        8
+.equ TF_GP,       16
+.equ TF_TP,       24
+.equ TF_T0,       32
+.equ TF_T1,       40
+.equ TF_T2,       48
+.equ TF_S0,       56
+.equ TF_S1,       64
+.equ TF_A0,       72
+.equ TF_A1,       80
+.equ TF_A2,       88
+.equ TF_A3,       96
+.equ TF_A4,      104
+.equ TF_A5,      112
+.equ TF_A6,      120
+.equ TF_A7,      128
+.equ TF_S2,      136
+.equ TF_S3,      144
+.equ TF_S4,      152
+.equ TF_S5,      160
+.equ TF_S6,      168
+.equ TF_S7,      176
+.equ TF_S8,      184
+.equ TF_S9,      192
+.equ TF_S10,     200
+.equ TF_S11,     208
+.equ TF_T3,      216
+.equ TF_T4,      224
+.equ TF_T5,      232
+.equ TF_T6,      240
+.equ TF_SEPC,    248
+.equ TF_SSTATUS, 256
+
 .globl user_mode_enter
 .type user_mode_enter, @function
 user_mode_enter:
@@ -54,55 +88,61 @@ user_mode_enter:
     la t0, user_saved_kernel_context_sp
     sd sp, 0(t0)
 
+    /* Keep the context pointer and trusted stack in temporaries until their
+     * saved user values are restored at the very end. */
+    mv t6, a0
+    mv t5, a1
+
     /* Prevent an S-mode interrupt during the sscratch transition window. */
     csrci sstatus, SSTATUS_SIE
 
     /* Configure the next trap to switch to the trusted kernel stack. */
-    csrw sscratch, a2
+    csrw sscratch, t5
 
-    /* sret should enter U-mode with supervisor interrupts enabled. */
-    csrr t0, sstatus
-    li   t1, SSTATUS_SPP
+    /* Restore the process trap state, forcing a U-mode return with interrupts
+     * enabled there. */
+    ld   t0, TF_SSTATUS(t6)
+    li   t1, (SSTATUS_SIE | SSTATUS_SPP)
     not  t1, t1
     and  t0, t0, t1
     ori  t0, t0, SSTATUS_SPIE
     csrw sstatus, t0
-    csrw sepc, a0
+    ld   t0, TF_SEPC(t6)
+    csrw sepc, t0
 
-    mv sp, a1
-
-    /* Do not leak the supervisor register state into the user program. */
-    mv ra, zero
-    mv gp, zero
-    mv tp, zero
-    mv t0, zero
-    mv t1, zero
-    mv t2, zero
-    mv s0, zero
-    mv s1, zero
-    /* Pass the kernel-selected program value to the C entry point in a0. */
-    mv a0, a3
-    mv a1, zero
-    mv a2, zero
-    mv a3, zero
-    mv a4, zero
-    mv a5, zero
-    mv a6, zero
-    mv a7, zero
-    mv s2, zero
-    mv s3, zero
-    mv s4, zero
-    mv s5, zero
-    mv s6, zero
-    mv s7, zero
-    mv s8, zero
-    mv s9, zero
-    mv s10, zero
-    mv s11, zero
-    mv t3, zero
-    mv t4, zero
-    mv t5, zero
-    mv t6, zero
+    /* Restore the complete saved integer context. A blocked syscall relies on
+     * ra, a7, and sepc surviving a trip through the supervisor idle loop. */
+    ld ra, TF_RA(t6)
+    ld sp, TF_SP(t6)
+    ld gp, TF_GP(t6)
+    ld tp, TF_TP(t6)
+    ld t0, TF_T0(t6)
+    ld t1, TF_T1(t6)
+    ld t2, TF_T2(t6)
+    ld s0, TF_S0(t6)
+    ld s1, TF_S1(t6)
+    ld a0, TF_A0(t6)
+    ld a1, TF_A1(t6)
+    ld a2, TF_A2(t6)
+    ld a3, TF_A3(t6)
+    ld a4, TF_A4(t6)
+    ld a5, TF_A5(t6)
+    ld a6, TF_A6(t6)
+    ld a7, TF_A7(t6)
+    ld s2, TF_S2(t6)
+    ld s3, TF_S3(t6)
+    ld s4, TF_S4(t6)
+    ld s5, TF_S5(t6)
+    ld s6, TF_S6(t6)
+    ld s7, TF_S7(t6)
+    ld s8, TF_S8(t6)
+    ld s9, TF_S9(t6)
+    ld s10, TF_S10(t6)
+    ld s11, TF_S11(t6)
+    ld t3, TF_T3(t6)
+    ld t4, TF_T4(t6)
+    ld t5, TF_T5(t6)
+    ld t6, TF_T6(t6)
 
     sret
 

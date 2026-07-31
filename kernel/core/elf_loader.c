@@ -1,11 +1,10 @@
 /*
  * Minimal in-memory ELF64 loader for user programs.
  *
- * ROSE embeds a complete, independently linked user ELF inside the kernel.
- * Loading it still follows the same security rules that a future filesystem
- * loader will need: validate every offset before reading it, accept only the
- * expected architecture and executable type, enforce the configured user
- * address range, and never create a page which is writable and executable.
+ * ROSE resolves independently linked user ELFs through its VFS. Loading still
+ * treats every file as untrusted: validate every offset before reading it,
+ * accept only the expected architecture and executable type, enforce the
+ * configured user address range, and never create a writable+executable page.
  *
  * The loader owns every physical page recorded in elf_loaded_image. Page-table
  * mappings themselves do not own physical memory, so elf_unload_image removes

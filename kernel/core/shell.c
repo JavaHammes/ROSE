@@ -6,7 +6,6 @@
 #include "sbi.h"
 #include "shell.h"
 #include "uart.h"
-#include "user_abi.h"
 #include "user_process.h"
 #include "virtual_memory.h"
 
@@ -63,13 +62,13 @@ static const struct shell_command commands[] = {
      .description = "Shut down the system",
      .handler = shell_command_exit},
     {.name = "run",
-     .description = "Run the U-mode demo program",
+     .description = "Run a U-mode executable path",
      .handler = shell_command_run},
     {.name = "runmulti",
      .description = "Run two preemptively scheduled processes",
      .handler = shell_command_runmulti},
     {.name = "spawn",
-     .description = "Create a process without starting it",
+     .description = "Create a process from an executable path",
      .handler = shell_command_spawn},
     {.name = "wait",
      .description = "Run all ready processes until they exit",
@@ -186,31 +185,12 @@ static void shell_command_exit(int argc, char **argv) {
 }
 
 static void shell_command_run(int argc, char **argv) {
-        if (argc == 1) {
-                user_process_run();
+        if (argc > 2) {
+                uart_puts("Usage: run [PATH]\n");
                 return;
         }
 
-        if (argc == 2 && string_compare(argv[1], "fault") == 0) {
-                user_process_run_fault_test();
-                return;
-        }
-
-        if (argc == 2 && string_compare(argv[1], "syscall") == 0) {
-                uint64_t pid;
-
-                if (!user_process_spawn(USER_PROGRAM_SYSCALL_TEST, &pid)) {
-                        uart_puts("Unable to create process; run 'reap' and "
-                                  "retry\n");
-                        return;
-                }
-
-                (void)pid;
-                (void)user_process_run_ready();
-                return;
-        }
-
-        uart_puts("Usage: run [fault|syscall]\n");
+        user_process_run_path(argc == 1 ? "/bin/hello" : argv[1]);
 }
 
 static void shell_command_runmulti(int argc, char **argv) {
@@ -222,26 +202,6 @@ static void shell_command_runmulti(int argc, char **argv) {
         }
 
         user_process_run_multi();
-}
-
-/* Translate a human-readable demonstration name into the selector passed in
- * the new process's initial a0 register. */
-static bool shell_parse_program(const char *name, uint64_t *program) {
-        if (string_compare(name, "hello") == 0) {
-                *program = USER_PROGRAM_HELLO;
-        } else if (string_compare(name, "fault") == 0) {
-                *program = USER_PROGRAM_FAULT;
-        } else if (string_compare(name, "a") == 0) {
-                *program = USER_PROGRAM_MULTI_A;
-        } else if (string_compare(name, "b") == 0) {
-                *program = USER_PROGRAM_MULTI_B;
-        } else if (string_compare(name, "syscall") == 0) {
-                *program = USER_PROGRAM_SYSCALL_TEST;
-        } else {
-                return false;
-        }
-
-        return true;
 }
 
 /* Parse a decimal PID without libc and reject both invalid digits and uint64_t
@@ -274,18 +234,18 @@ static bool shell_parse_uint64(const char *text, uint64_t *value) {
 
 /* Create a READY process while leaving the shell active for more commands. */
 static void shell_command_spawn(int argc, char **argv) {
-        uint64_t program = USER_PROGRAM_HELLO;
-
-        if (argc > 2 ||
-            (argc == 2 && !shell_parse_program(argv[1], &program))) {
-                uart_puts("Usage: spawn [hello|fault|a|b|syscall]\n");
+        if (argc > 2) {
+                uart_puts("Usage: spawn [PATH]\n");
                 return;
         }
 
         uint64_t pid;
+        const char *path = argc == 1 ? "/bin/hello" : argv[1];
 
-        if (!user_process_spawn(program, &pid)) {
-                uart_puts("Unable to create process; run 'reap' and retry\n");
+        if (!user_process_spawn(path, &pid)) {
+                uart_puts("Unable to load program: ");
+                uart_puts(path);
+                uart_putc('\n');
                 return;
         }
 

@@ -2,6 +2,7 @@
 #include "page_allocator.h"
 #include "platform.h"
 #include "plic.h"
+#include "ramfs.h"
 #include "terminal.h"
 #include "timer.h"
 #include "trap.h"
@@ -22,6 +23,7 @@ void kernel_main(unsigned long hart_id, const void *dtb) {
         page_allocator_init();
         page_allocator_self_test();
         virtual_memory_init();
+        ramfs_init();
 
         /* Configure the device-to-PLIC path before globally enabling traps. */
         plic_init();

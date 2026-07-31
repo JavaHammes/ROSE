@@ -36,17 +36,28 @@ OBJECTS := \
 	$(C_SOURCES:%.c=$(BUILD_DIR)/%.o) \
 	$(S_SOURCES:%.S=$(BUILD_DIR)/%.o)
 
-USER_OBJECTS := \
-	$(USER_C_SOURCES:%.c=$(BUILD_DIR)/%.o) \
-	$(USER_S_SOURCES:%.S=$(BUILD_DIR)/%.o)
+USER_COMMON_OBJECTS := \
+	$(BUILD_DIR)/user/start.o \
+	$(BUILD_DIR)/user/syscall.o
 
-USER_ELF := $(BUILD_DIR)/user/program.elf
-USER_EMBEDDED_ELF := $(BUILD_DIR)/user/program.load.elf
-USER_MAP := $(BUILD_DIR)/user/program.map
+# Each ramfs path is a distinct ELF. All variants use the same small source,
+# with a build-time selector allowing dead-code elimination to retain only the
+# requested demonstration.
+USER_PROGRAMS := hello fault process_a process_b syscall_test
+USER_PROGRAM_hello := 0
+USER_PROGRAM_fault := 1
+USER_PROGRAM_process_a := 2
+USER_PROGRAM_process_b := 3
+USER_PROGRAM_syscall_test := 4
+USER_ELFS := $(foreach program,$(USER_PROGRAMS),$(BUILD_DIR)/user/$(program)/program.elf)
+USER_EMBEDDED_ELFS := $(USER_ELFS:.elf=.load.elf)
 USER_IMAGE_OBJECT := $(BUILD_DIR)/kernel/arch/riscv64/user_image.o
 
 # Compiler-generated dependency files keep incremental header rebuilds correct.
-DEPS := $(OBJECTS:.o=.d) $(USER_OBJECTS:.o=.d)
+DEPS := \
+	$(OBJECTS:.o=.d) \
+	$(USER_COMMON_OBJECTS:.o=.d) \
+	$(foreach program,$(USER_PROGRAMS),$(BUILD_DIR)/user/$(program)/main.d)
 
 ARCH_FLAGS := \
 	-march=rv64imab_zicsr \
@@ -97,8 +108,7 @@ USER_LDFLAGS := \
 	-no-pie \
 	-T $(USER_LINKER_SCRIPT) \
 	-Wl,--gc-sections \
-	-Wl,--build-id=none \
-	-Wl,-Map=$(USER_MAP)
+	-Wl,--build-id=none
 
 QEMU_FLAGS := \
 	-machine virt \
@@ -119,21 +129,34 @@ $(KERNEL): $(OBJECTS) $(LINKER_SCRIPT)
 	$(SIZE) $@
 
 
-$(USER_ELF): $(USER_OBJECTS) $(USER_LINKER_SCRIPT)
-	@mkdir -p $(dir $@)
-	$(CC) $(USER_LDFLAGS) $(USER_OBJECTS) -o $@
-	$(SIZE) $@
+define USER_PROGRAM_template
+$(BUILD_DIR)/user/$(1)/main.o: user/main.c
+	@mkdir -p $$(dir $$@)
+	$$(CC) $$(USER_INCLUDES) $$(USER_CFLAGS) \
+		-DROSE_PROGRAM=$$(USER_PROGRAM_$(1)) -c $$< -o $$@
+
+$(BUILD_DIR)/user/$(1)/program.elf: \
+		$(BUILD_DIR)/user/$(1)/main.o $$(USER_COMMON_OBJECTS) \
+		$$(USER_LINKER_SCRIPT)
+	@mkdir -p $$(dir $$@)
+	$$(CC) $$(USER_LDFLAGS) \
+		-Wl,-Map=$(BUILD_DIR)/user/$(1)/program.map \
+		$(BUILD_DIR)/user/$(1)/main.o $$(USER_COMMON_OBJECTS) -o $$@
+	$$(SIZE) $$@
+endef
+
+$(foreach program,$(USER_PROGRAMS),$(eval $(call USER_PROGRAM_template,$(program))))
 
 
-# Strip symbol/debug data before embedding, but keep the ELF and its program
-# headers intact so the kernel exercises a real loader rather than a flat blob.
-$(USER_EMBEDDED_ELF): $(USER_ELF)
+# Strip symbol/debug data before embedding, but keep each ELF and its program
+# headers intact so the kernel exercises a real loader rather than flat blobs.
+$(BUILD_DIR)/user/%/program.load.elf: $(BUILD_DIR)/user/%/program.elf
 	$(OBJCOPY) --strip-all $< $@
 
 
 # user_image.S uses .incbin, so this explicit prerequisite rebuilds its object
 # whenever the independently linked user executable changes.
-$(USER_IMAGE_OBJECT): $(USER_EMBEDDED_ELF)
+$(USER_IMAGE_OBJECT): $(USER_EMBEDDED_ELFS)
 
 
 $(BUILD_DIR)/user/%.o: user/%.c

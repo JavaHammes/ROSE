@@ -1,16 +1,20 @@
 /*
  * Freestanding U-mode demonstration program.
  *
- * The kernel loads this ELF into a fresh address space and passes a program
- * selector in a0. Several selectors share one image so the kernel can exercise
- * normal execution, protection faults, syscall validation, voluntary yields,
- * and timer preemption without requiring a filesystem yet.
+ * The build produces one small ELF for each /bin path in the initial ramfs.
+ * ROSE_PROGRAM is constant for a given image, so the compiler discards the
+ * other demonstrations while the sources continue sharing one runtime.
  */
 #include <stddef.h>
 #include <stdint.h>
 
 #include "rose/syscall.h"
 #include "user_abi.h"
+
+/* Static analysis checks this source once outside the per-program build. */
+#ifndef ROSE_PROGRAM
+#define ROSE_PROGRAM USER_PROGRAM_HELLO
+#endif
 
 /* Nonzero .data and zero-initialized .bss values verify both ELF load paths. */
 static volatile uint64_t user_cookie = UINT64_C(0x524f5345);
@@ -73,7 +77,7 @@ static int run_syscall_test(void) {
 
 /* Referenced by the assembly entry point, so this must retain external linkage.
  */
-int user_main(uint64_t program) { // NOLINT(misc-use-internal-linkage)
+int user_main(void) { // NOLINT(misc-use-internal-linkage)
         /* Every address space starts from the original ELF contents. A failure
          * here catches missing .data copies, missing BSS zeroing, or leaked
          * writable pages between processes. */
@@ -83,7 +87,7 @@ int user_main(uint64_t program) { // NOLINT(misc-use-internal-linkage)
 
         user_counter = 1U;
 
-        switch (program) {
+        switch (ROSE_PROGRAM) {
         case USER_PROGRAM_HELLO:
                 print("Hello from U-mode C\n");
                 return 0;

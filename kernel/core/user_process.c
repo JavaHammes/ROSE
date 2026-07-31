@@ -7,9 +7,9 @@
  * frame that assembly will restore.
  *
  * The shell can create several READY processes and later run them as one
- * foreground batch. Timer interrupts preempt U-mode, yield performs a voluntary
- * switch, and exit/fault chooses the next READY process. When the final process
- * exits, assembly resumes the suspended supervisor call to scheduler_run_ready.
+ * foreground batch. Timer interrupts preempt U-mode, yield switches voluntarily,
+ * and typed wait channels support BLOCKED processes. When no process can run,
+ * assembly resumes scheduler_run_ready so supervisor mode can idle or finish.
  */
 #include <stdbool.h>
 #include <stddef.h>
@@ -18,15 +18,18 @@
 #include "elf_loader.h"
 #include "page_allocator.h"
 #include "panic.h"
+#include "scheduler.h"
 #include "timer.h"
 #include "trap.h"
 #include "uart.h"
 #include "user_abi.h"
 #include "user_process.h"
+#include "vfs.h"
 #include "virtual_memory.h"
 
 enum {
         USER_WRITE_MAX = 1024,
+        USER_WRITE_TRANSMIT_MAX = USER_WRITE_MAX * 2,
         PROCESS_LIMIT = 8,
 };
 
@@ -36,6 +39,7 @@ enum process_state {
         PROCESS_UNUSED,
         PROCESS_READY,
         PROCESS_RUNNING,
+        PROCESS_BLOCKED,
         PROCESS_EXITED,
 };
 
@@ -53,14 +57,11 @@ enum process_state {
 #define USER_STACK_ADDRESS UINT64_C(0x00800000)
 #define USER_STACK_TOP (USER_STACK_ADDRESS + PAGE_SIZE)
 
-extern char user_program_elf_start[];
-extern char user_program_elf_end[];
 extern char text_start[];
 
 /* Assembly transitions which save and later restore the suspended shell call. */
-extern void user_mode_enter(uintptr_t entry, uintptr_t user_stack_top,
-                            uintptr_t kernel_trap_stack_top,
-                            uintptr_t initial_argument);
+extern void user_mode_enter(const struct trap_frame *context,
+                            uintptr_t kernel_trap_stack_top);
 extern void user_mode_resume(void);
 extern uintptr_t user_saved_kernel_context_sp;
 
@@ -76,14 +77,25 @@ struct process {
         void *kernel_trap_stack;
         uint64_t exit_status;
         bool exit_reported;
+
+        /* Blocking syscall continuation state. A process never returns to
+         * U-mode while pending_write is true. */
+        enum scheduler_wait_channel wait_channel;
+        bool pending_write;
+        size_t write_result_length;
+        size_t write_length;
+        size_t write_offset;
+        char write_buffer[USER_WRITE_TRANSMIT_MAX];
 };
 
 /* Fixed slots keep early process management independent of a kernel heap. */
 static struct process process_table[PROCESS_LIMIT];
 static struct process *active_process;
+static struct process *uart_write_owner;
 static uint64_t next_pid = 1U;
 static uint64_t scheduler_preemptions;
 static uint64_t scheduler_context_switches;
+static uint64_t scheduler_blocks;
 
 /* Freestanding replacement for clearing process records. */
 static void bytes_zero(void *destination, size_t size) {
@@ -189,7 +201,7 @@ static struct process *process_find_by_pid(uint64_t pid) {
 }
 
 /*
- * Construct a READY process from the embedded ELF image.
+ * Construct a READY process from an ELF resolved by absolute VFS path.
  *
  * All fields are initialized before resources are acquired so the common
  * teardown path can safely handle allocation or mapping failures at any step.
@@ -197,20 +209,17 @@ static struct process *process_find_by_pid(uint64_t pid) {
  * virtual_memory_create_address_space; only the ELF and stack mappings receive
  * VM_PAGE_USER.
  */
-static bool process_create(struct process *process, uint64_t program) {
-        uintptr_t image_start = (uintptr_t)user_program_elf_start;
-        uintptr_t image_end = (uintptr_t)user_program_elf_end;
-        size_t image_size = (size_t)(image_end - image_start);
+static bool process_create(struct process *process, const char *path) {
+        struct vfs_file executable;
 
-        if (image_end <= image_start) {
-                panic("Invalid embedded user ELF image");
+        if (!vfs_open(path, &executable) || executable.size == 0U) {
+                return false;
         }
 
         bytes_zero(process, sizeof(*process));
         process->pid = next_pid;
         process->state = PROCESS_READY;
         process->context.sp = USER_STACK_TOP;
-        process->context.a0 = program;
         /* SPIE causes sret to enable supervisor interrupts while U-mode runs. */
         process->context.sstatus = SSTATUS_SPIE;
         process->exit_status = UINT64_MAX;
@@ -236,7 +245,7 @@ static bool process_create(struct process *process, uint64_t program) {
         if (!page_table_map(root, USER_STACK_ADDRESS,
                             (uintptr_t)process->stack_page,
                             VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE) ||
-            !elf_load_image(root, user_program_elf_start, image_size,
+            !elf_load_image(root, executable.data, executable.size,
                             USER_ADDRESS_MIN, USER_STACK_GUARD_ADDRESS,
                             &process->loaded_image)) {
                 process_release_resources(process);
@@ -273,25 +282,14 @@ static bool process_create(struct process *process, uint64_t program) {
         return true;
 }
 
-/*
- * Implement write without directly dereferencing a user virtual address.
- * page_table_translate produces the corresponding identity-mapped physical
- * pointer only after permissions have been checked.
- */
-static uint64_t syscall_write(uintptr_t user_buffer, size_t length) {
+/* Validate a complete U-mode read range before copying any bytes from it. */
+static bool user_read_range_is_valid(uintptr_t user_buffer, size_t length) {
         if (active_process == NULL) {
-                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
-        }
-        if (length > USER_WRITE_MAX ||
-            (length != 0U && user_buffer > UINTPTR_MAX - (length - 1U))) {
-                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+                return false;
         }
 
         const struct page_table *root = active_process->address_space;
 
-        /* Validate the complete range before producing output, so an invalid
-         * later page cannot cause a partial write. Walk once per page rather
-         * than once per byte; each crossed page must independently grant U+R. */
         for (size_t offset = 0U; offset < length;) {
                 uintptr_t physical_address;
                 uint64_t flags;
@@ -300,7 +298,7 @@ static uint64_t syscall_write(uintptr_t user_buffer, size_t length) {
                                           &physical_address, &flags) ||
                     (flags & (VM_PAGE_USER | VM_PAGE_READ)) !=
                         (VM_PAGE_USER | VM_PAGE_READ)) {
-                        return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+                        return false;
                 }
 
                 size_t page_remaining =
@@ -313,8 +311,30 @@ static uint64_t syscall_write(uintptr_t user_buffer, size_t length) {
                 offset += chunk;
         }
 
-        /* The second pass is safe because this single-hart kernel cannot change
-         * the process address space while handling its syscall. */
+        return true;
+}
+
+/*
+ * Copy a validated user write into process-owned memory. This is essential for
+ * blocking: the driver and scheduler never retain a pointer into the transient
+ * trap frame, and another address space may run before this syscall completes.
+ */
+static uint64_t syscall_write_begin(uintptr_t user_buffer, size_t length) {
+        if (active_process == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        if (length > USER_WRITE_MAX ||
+            (length != 0U && user_buffer > UINTPTR_MAX - (length - 1U))) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+        if (!user_read_range_is_valid(user_buffer, length)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+
+        struct process *process = active_process;
+        const struct page_table *root = process->address_space;
+        size_t transmit_length = 0U;
+
         for (size_t offset = 0U; offset < length;) {
                 uintptr_t physical_address;
 
@@ -337,13 +357,20 @@ static uint64_t syscall_write(uintptr_t user_buffer, size_t length) {
                         char character = characters[index];
 
                         if (character == '\n') {
-                                uart_putc('\r');
+                                process->write_buffer[transmit_length] = '\r';
+                                transmit_length++;
                         }
-                        uart_putc(character);
+                        process->write_buffer[transmit_length] = character;
+                        transmit_length++;
                 }
 
                 offset += chunk;
         }
+
+        process->pending_write = transmit_length != 0U;
+        process->write_result_length = length;
+        process->write_length = transmit_length;
+        process->write_offset = 0U;
 
         return length;
 }
@@ -376,6 +403,98 @@ static void scheduler_switch_to(struct process *next,
         active_process->state = PROCESS_RUNNING;
         trap_frame_copy(frame, &active_process->context);
         page_table_activate(active_process->address_space);
+}
+
+/* Redirect this trap to the supervisor context suspended by user_mode_enter. */
+static void scheduler_return_to_kernel(struct trap_frame *frame) {
+        active_process = NULL;
+        frame->sepc = (uintptr_t)user_mode_resume;
+        frame->sp = user_saved_kernel_context_sp;
+        frame->sstatus |= SSTATUS_SPP;
+}
+
+void scheduler_block_current(struct trap_frame *frame,
+                             enum scheduler_wait_channel channel) {
+        if (frame == NULL) {
+                panic("Scheduler block requires a trap frame");
+        }
+        if (channel == SCHEDULER_WAIT_NONE || active_process == NULL ||
+            active_process->state != PROCESS_RUNNING ||
+            user_saved_kernel_context_sp == 0U) {
+                panic_trap("Invalid scheduler block", frame);
+        }
+
+        struct process *previous = active_process;
+
+        trap_frame_copy(&previous->context, frame);
+        previous->state = PROCESS_BLOCKED;
+        previous->wait_channel = channel;
+        scheduler_blocks++;
+
+        struct process *next = scheduler_find_next_ready();
+
+        if (next != NULL) {
+                scheduler_context_switches++;
+                scheduler_switch_to(next, frame);
+                return;
+        }
+
+        scheduler_return_to_kernel(frame);
+}
+
+size_t scheduler_wake_all(enum scheduler_wait_channel channel) {
+        if (channel == SCHEDULER_WAIT_NONE) {
+                return 0U;
+        }
+
+        size_t woken = 0U;
+
+        for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
+                struct process *process = &process_table[index];
+
+                if (process->state == PROCESS_BLOCKED &&
+                    process->wait_channel == channel) {
+                        process->state = PROCESS_READY;
+                        process->wait_channel = SCHEDULER_WAIT_NONE;
+                        woken++;
+                }
+        }
+
+        return woken;
+}
+
+/* Advance one resumable write. While it is blocked, sepc continues to point at
+ * ECALL; waking the process safely re-enters this continuation in a fresh trap. */
+static void process_continue_write(struct trap_frame *frame) {
+        struct process *process = active_process;
+
+        if (process == NULL || !process->pending_write) {
+                panic_trap("Invalid pending write", frame);
+        }
+        if (uart_write_owner == NULL) {
+                uart_write_owner = process;
+        }
+        if (uart_write_owner != process) {
+                scheduler_block_current(frame, SCHEDULER_WAIT_UART_TX);
+                return;
+        }
+        if (process->write_offset == process->write_length) {
+                process->pending_write = false;
+                uart_write_owner = NULL;
+                frame->a0 = process->write_result_length;
+                frame->sepc += 4U;
+                /* The final THRE interrupt may have woken contenders before
+                 * ownership was released. Wake them again now that one can
+                 * acquire the complete-write transaction. */
+                (void)scheduler_wake_all(SCHEDULER_WAIT_UART_TX);
+                return;
+        }
+
+        if (uart_tx_submit(process->write_buffer[process->write_offset])) {
+                process->write_offset++;
+        }
+
+        scheduler_block_current(frame, SCHEDULER_WAIT_UART_TX);
 }
 
 /*
@@ -431,12 +550,7 @@ static void user_process_finish(struct trap_frame *frame, uint64_t status) {
                 return;
         }
 
-        active_process = NULL;
-
-        /* Return through user_mode_resume in S-mode on the suspended stack. */
-        frame->sepc = (uintptr_t)user_mode_resume;
-        frame->sp = user_saved_kernel_context_sp;
-        frame->sstatus |= SSTATUS_SPP;
+        scheduler_return_to_kernel(frame);
 }
 
 /* Print a zombie's retained status exactly once. */
@@ -468,10 +582,20 @@ static void report_and_release_exited_processes(void) {
         }
 }
 
+static bool scheduler_has_blocked_processes(void) {
+        for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
+                if (process_table[index].state == PROCESS_BLOCKED) {
+                        return true;
+                }
+        }
+
+        return false;
+}
+
 /*
- * Enter the first READY process and remain suspended until no READY work is
- * left. user_mode_enter saves the supervisor ABI context and sret enters U-mode;
- * the final process exit eventually returns through user_mode_resume.
+ * Enter READY processes until no live work remains. user_mode_enter saves the
+ * supervisor ABI context and sret enters U-mode; exits and all-blocked states
+ * return through user_mode_resume so this loop can finish or wait for an IRQ.
  */
 static bool scheduler_run_ready(bool require_preemption) {
         if (active_process != NULL) {
@@ -489,23 +613,37 @@ static bool scheduler_run_ready(bool require_preemption) {
 
         scheduler_preemptions = 0U;
         scheduler_context_switches = 0U;
-        active_process = first;
-        active_process->state = PROCESS_RUNNING;
-        user_saved_kernel_context_sp = 0U;
+        scheduler_blocks = 0U;
 
-        /* Start a fresh quantum rather than inheriting the shell's deadline. */
-        timer_schedule_next();
-        page_table_activate(active_process->address_space);
-        user_mode_enter(
-            active_process->context.sepc, active_process->context.sp,
-            (uintptr_t)active_process->kernel_trap_stack + PAGE_SIZE,
-            active_process->context.a0);
+        /* A blocking process may return us here many times. Wait in S-mode
+         * when every process is asleep, then restore the complete saved frame
+         * of whichever process an interrupt makes READY. */
+        while (first != NULL || scheduler_has_blocked_processes()) {
+                if (first == NULL) {
+                        __asm__ volatile("wfi");
+                        first = scheduler_find_next_ready();
+                        continue;
+                }
 
-        if (active_process != NULL) {
-                panic("Scheduler returned while a process was still running");
+                active_process = first;
+                active_process->state = PROCESS_RUNNING;
+                user_saved_kernel_context_sp = 0U;
+
+                /* Start a fresh quantum rather than inheriting the idle loop's
+                 * timer deadline. */
+                timer_schedule_next();
+                page_table_activate(active_process->address_space);
+                user_mode_enter(
+                    &active_process->context,
+                    (uintptr_t)active_process->kernel_trap_stack + PAGE_SIZE);
+
+                if (active_process != NULL) {
+                        panic("Scheduler returned while a process was running");
+                }
+
+                page_table_activate(virtual_memory_kernel_page_table());
+                first = scheduler_find_next_ready();
         }
-
-        page_table_activate(virtual_memory_kernel_page_table());
 
         if (require_preemption && scheduler_preemptions == 0U) {
                 panic("Multitasking demo completed without timer preemption");
@@ -521,21 +659,23 @@ static bool scheduler_run_ready(bool require_preemption) {
                 uart_puts(" preemptions)\n");
         }
 
+        if (scheduler_blocks != 0U) {
+                uart_puts("Scheduler blocks: ");
+                uart_put_uint64(scheduler_blocks);
+                uart_putc('\n');
+        }
+
         return true;
 }
 
 /* Create a persistent READY entry without starting the scheduler. */
-bool user_process_spawn(uint64_t program, uint64_t *pid) {
-        if (program > USER_PROGRAM_SYSCALL_TEST) {
-                return false;
-        }
-
+bool user_process_spawn(const char *path, uint64_t *pid) {
         struct process *process = process_find_available_slot();
 
         if (process == NULL) {
                 return false;
         }
-        if (!process_create(process, program)) {
+        if (!process_create(process, path)) {
                 bytes_zero(process, sizeof(*process));
                 return false;
         }
@@ -593,7 +733,7 @@ size_t user_process_reap_exited(void) {
 void user_process_run(void) {
         uint64_t pid;
 
-        if (!user_process_spawn(USER_PROGRAM_HELLO, &pid)) {
+        if (!user_process_spawn("/bin/hello", &pid)) {
                 uart_puts("Unable to create process; run 'reap' and retry\n");
                 return;
         }
@@ -602,12 +742,14 @@ void user_process_run(void) {
         (void)scheduler_run_ready(false);
 }
 
-/* Spawn the deliberate supervisor-memory access used to test isolation. */
-void user_process_run_fault_test(void) {
+/* Spawn one executable by absolute VFS path and run it immediately. */
+void user_process_run_path(const char *path) {
         uint64_t pid;
 
-        if (!user_process_spawn(USER_PROGRAM_FAULT, &pid)) {
-                uart_puts("Unable to create process; run 'reap' and retry\n");
+        if (!user_process_spawn(path, &pid)) {
+                uart_puts("Unable to load program: ");
+                uart_puts(path);
+                uart_putc('\n');
                 return;
         }
 
@@ -617,9 +759,9 @@ void user_process_run_fault_test(void) {
 
 /* Build two independent processes and require at least one timer preemption. */
 void user_process_run_multi(void) {
-        uint64_t programs[] = {
-            USER_PROGRAM_MULTI_A,
-            USER_PROGRAM_MULTI_B,
+        const char *programs[] = {
+            "/bin/process-a",
+            "/bin/process-b",
         };
 
         uint64_t created_pids[2];
@@ -658,31 +800,42 @@ void user_process_handle_timer(struct trap_frame *frame) {
         scheduler_reschedule(frame, true);
 }
 
-/* Dispatch the small user ABI. ECALL itself is four bytes, so successful and
- * failed syscalls both resume at the following instruction. */
+/* Dispatch the small user ABI. Blocking write deliberately retains ECALL in
+ * sepc until its continuation has completed; other calls advance immediately. */
 void user_process_handle_syscall(struct trap_frame *frame) {
         if (!user_process_is_active()) {
                 panic_trap("U-mode syscall without an active process", frame);
         }
 
-        /* ECALL is always a four-byte instruction. */
-        frame->sepc += 4U;
-
         switch (frame->a7) {
-        case USER_SYSCALL_WRITE:
-                frame->a0 =
-                    syscall_write((uintptr_t)frame->a0, (size_t)frame->a1);
+        case USER_SYSCALL_WRITE: {
+                if (!active_process->pending_write) {
+                        uint64_t result = syscall_write_begin(
+                            (uintptr_t)frame->a0, (size_t)frame->a1);
+
+                        if (!active_process->pending_write) {
+                                frame->a0 = result;
+                                frame->sepc += 4U;
+                                return;
+                        }
+                }
+
+                process_continue_write(frame);
                 return;
+        }
 
         case USER_SYSCALL_EXIT:
+                frame->sepc += 4U;
                 user_process_finish(frame, frame->a0);
                 return;
 
         case USER_SYSCALL_YIELD:
+                frame->sepc += 4U;
                 scheduler_reschedule(frame, false);
                 return;
 
         default:
+                frame->sepc += 4U;
                 frame->a0 =
                     (uint64_t)-(int64_t)USER_ERROR_NOT_IMPLEMENTED;
                 return;
@@ -723,6 +876,8 @@ static const char *process_state_name(enum process_state state) {
                 return "ready";
         case PROCESS_RUNNING:
                 return "running";
+        case PROCESS_BLOCKED:
+                return "blocked";
         case PROCESS_EXITED:
                 return "exited";
         default:

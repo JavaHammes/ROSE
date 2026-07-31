@@ -9,11 +9,11 @@ struct trap_frame;
 
 /* Convenience foreground demonstrations exposed by the kernel shell. */
 void user_process_run(void);
-void user_process_run_fault_test(void);
+void user_process_run_path(const char *path);
 void user_process_run_multi(void);
 
 /* Persistent process-table lifecycle operations used by spawn/wait/kill/reap. */
-bool user_process_spawn(uint64_t program, uint64_t *pid);
+bool user_process_spawn(const char *path, uint64_t *pid);
 bool user_process_run_ready(void);
 bool user_process_kill(uint64_t pid);
 size_t user_process_reap_exited(void);

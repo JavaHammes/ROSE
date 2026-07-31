@@ -5,7 +5,7 @@
 .globl _start
 .type _start, @function
 _start:
-    /* a0 contains the program selector and is user_main's first argument. */
+    /* The selected path already names a distinct ELF, so no arguments exist. */
     call user_main
 
     /* Returning from main terminates the process with its return value. */
