@@ -1,10 +1,10 @@
 #include "timer.h"
+#include "platform.h"
 #include "sbi.h"
 #include "uart.h"
 #include <stdint.h>
 
-// Equals one second. Hardcoded for now.
-#define TIMER_INTERVAL UINT64_C(10000000)
+enum { TIMER_INTERRUPTS_PER_SECOND = 1000 };
 
 /*
  * Read the current value of the RISC-V time counter.
@@ -24,10 +24,20 @@ uint64_t read_time(void) {
  * periodic timer interrupts.
  */
 void timer_schedule_next(void) {
-        uint64_t deadline = read_time() + TIMER_INTERVAL;
+        /* Derive a one-millisecond quantum from the DTB timebase rather than
+         * assuming QEMU's usual 10 MHz counter. SBI expects an absolute
+         * deadline, not a relative interval. */
+        uint64_t interval =
+            platform_timebase_frequency() / TIMER_INTERRUPTS_PER_SECOND;
+
+        if (interval == 0U) {
+                interval = 1U;
+        }
+
+        uint64_t deadline = read_time() + interval;
         long error = sbi_set_timer(deadline);
 
         if (error != 0) {
-                uart_puts("Faield to schedule timer\n");
+                uart_puts("Failed to schedule timer\n");
         }
 }

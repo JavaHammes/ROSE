@@ -65,7 +65,7 @@ _entry:
 
     /* call C entry
      *                                     a0,              a1
-     * void kernel_main(unsinged long hart_id, const void *dtb);
+     * void kernel_main(unsigned long hart_id, const void *dtb);
      */
     call kernel_main
 

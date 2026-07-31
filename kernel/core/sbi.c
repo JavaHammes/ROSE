@@ -20,6 +20,19 @@
 #define SBI_FID_SET_TIMER 0UL
 
 /*
+ * SBI System Reset extension ("SRST") and its system_reset function.
+ */
+#define SBI_EXT_SYSTEM_RESET 0x53525354UL
+#define SBI_FID_SYSTEM_RESET 0UL
+
+/*
+ * A reset type of zero requests shutdown. A reset reason of zero means that
+ * no specific failure caused the shutdown.
+ */
+#define SBI_RESET_TYPE_SHUTDOWN 0UL
+#define SBI_RESET_REASON_NONE 0UL
+
+/*
  * Perform generic SBI call.
  *
  * An SBI call is made by placing arguments and identifiers in the arg
@@ -80,6 +93,20 @@ long sbi_set_timer(uint64_t deadline) {
         struct sbi_ret result =
             sbi_call(SBI_EXT_TIME, SBI_FID_SET_TIMER, (unsigned long)deadline,
                      0, 0, 0, 0, 0);
+
+        return result.error;
+}
+
+/*
+ * Ask the SBI firmware to shut down the machine.
+ *
+ * A successful request never returns. If the extension is unavailable or the
+ * request fails, return the SBI error code to the caller.
+ */
+long sbi_shutdown(void) {
+        struct sbi_ret result = sbi_call(
+            SBI_EXT_SYSTEM_RESET, SBI_FID_SYSTEM_RESET, SBI_RESET_TYPE_SHUTDOWN,
+            SBI_RESET_REASON_NONE, 0, 0, 0, 0);
 
         return result.error;
 }

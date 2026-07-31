@@ -3,7 +3,7 @@
 /*
  * Globally enable interrupts while executing in S-mode.
  *
- * csrs sets the selcted bits:
+ * csrs sets the selected bits.
  *
  */
 void global_interrupts_enable(void) {
@@ -15,7 +15,7 @@ void global_interrupts_enable(void) {
 /*
  * Globally disable Supervisor interrupts.
  *
- * csrrc clears the selected bits:
+ * csrc clears the selected bits:
  *
  *     sstatus = sstatus & ~SSTATUS_SIE;
  */

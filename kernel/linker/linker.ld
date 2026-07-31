@@ -68,7 +68,7 @@ ENTRY ( _entry )
  *  1. ALIGN(0x1000): makes sure that each major region starts on a page boundary.
  *     0x1000 = 4Kib which is the standard RISC-V page size.
  *     This becomes necessary later when we want to do virtual memory because each
- *     page can have seperate permissions.
+     *     page can have separate permissions.
  *  2. NOLOAD: Means that a section occupies memory at runtime but its bytes
  *     do not need to be loaded from the kernel.
  *  3. f. ex.: *(.text .text.*): means: take all input sections named .text or
@@ -95,6 +95,8 @@ ENTRY ( _entry )
      */
     .text ALIGN(0x1000) :
     {
+        PROVIDE(text_start = .);
+
         /*
          * Keep the entry section first even if the linker considers it
          * otherwise unused. If one enables section garbage collection in
@@ -104,6 +106,8 @@ ENTRY ( _entry )
         KEEP(*(.entry_os))
 
         *(.text .text.*)
+
+        PROVIDE(text_end = .);
     }
 
     /*
@@ -117,19 +121,40 @@ ENTRY ( _entry )
      */
     .rodata ALIGN(0x1000) :
     {
+        PROVIDE(rodata_start = .);
+
         *(.srodata .srodata.*)
         *(.rodata  .rodata.*)
+
+        PROVIDE(rodata_end = .);
+    }
+
+    /*
+     * Embedded user ELF consumed by the in-memory loader. Keeping it in its
+     * own kernel section makes the source image read-only and non-executable.
+     */
+    .user_image ALIGN(0x1000) :
+    {
+        PROVIDE(user_program_elf_start = .);
+
+        KEEP(*(.user_image))
+
+        PROVIDE(user_program_elf_end = .);
     }
 
     /*
      * Contains writable global and static variables with explicit nonzero
-     * inital values. Loaded from ELF.
+     * initial values. Loaded from ELF.
      * Permissions: read + write
      */
     .data ALIGN(0x1000) :
     {
+        PROVIDE(data_start = .);
+
         *(.sdata .sdata.*)
         *(.data  .data.*)
+
+        PROVIDE(data_end = .);
     }
 
     /*

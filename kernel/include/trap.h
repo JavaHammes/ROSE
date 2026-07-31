@@ -48,7 +48,8 @@ struct trap_frame {
         uint64_t scause;
         uint64_t stval;
 
-        uint64_t padding;
+        /* Filled by C before returning to U-mode for the next trap entry. */
+        uint64_t kernel_trap_stack_top;
 };
 
 _Static_assert(sizeof(struct trap_frame) == TRAP_FRAME_SIZE,
@@ -74,6 +75,14 @@ enum supervisor_interrupt_code {
         SCAUSE_SUPERVISOR_SOFTWARE = 1,
         SCAUSE_SUPERVISOR_TIMER = 5,
         SCAUSE_SUPERVISOR_EXTERNAL = 9,
+};
+
+/*
+ * sstatus.SPP records whether a trap interrupted U-mode or S-mode.
+ */
+enum supervisor_status_bits {
+        SSTATUS_SPIE = (UINT64_C(1) << 5),
+        SSTATUS_SPP = (UINT64_C(1) << 8),
 };
 
 /*

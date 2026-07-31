@@ -26,13 +26,15 @@
  *
  * Timer and software interrupts do not pass through the PLIC.
  *
- * The addresses and context IDs used here are specific to the single-hart
- * QEMU "virt" machine and should eventually be read from the device tree.
+ * The base address is discovered from the device tree. The register layout and
+ * supervisor context selection remain specific to the single-hart QEMU
+ * "virt" machine.
  */
 
 #include <stdint.h>
 
 #include "plic.h"
+#include "platform.h"
 
 /*
  * Base address of the Platform-Level Interrupt Controller on QEMU's
@@ -42,8 +44,6 @@
  * addresses inside this region communicates directly with the interrupt
  * controller.
  */
-#define PLIC_BASE 0x0c000000UL
-
 /*
  * Offset of the interrupt-priority register block.
  *
@@ -142,7 +142,7 @@ static uintptr_t plic_enable_address(uint32_t interrupt_id) {
         uintptr_t word_offset =
             ((uintptr_t)interrupt_id / 32U) * sizeof(uint32_t);
 
-        return PLIC_BASE + PLIC_ENABLE_BASE +
+        return platform_plic_base() + PLIC_ENABLE_BASE +
                PLIC_S_CONTEXT * PLIC_ENABLE_STRIDE + word_offset;
 }
 
@@ -151,7 +151,7 @@ static uintptr_t plic_enable_address(uint32_t interrupt_id) {
  * context's control-register block.
  */
 static uintptr_t plic_context_address(uintptr_t register_offset) {
-        return PLIC_BASE + PLIC_CONTEXT_BASE +
+        return platform_plic_base() + PLIC_CONTEXT_BASE +
                PLIC_S_CONTEXT * PLIC_CONTEXT_STRIDE + register_offset;
 }
 
@@ -163,7 +163,7 @@ static uintptr_t plic_context_address(uintptr_t register_offset) {
  * enabled for the selected context and exceeds the context's threshold.
  */
 void plic_set_priority(uint32_t interrupt_id, uint32_t priority) {
-        uintptr_t address = PLIC_BASE + PLIC_PRIORITY_BASE +
+        uintptr_t address = platform_plic_base() + PLIC_PRIORITY_BASE +
                             (uintptr_t)interrupt_id * sizeof(uint32_t);
 
         *plic_register(address) = priority;
@@ -258,10 +258,10 @@ void plic_init(void) {
          * Priority zero would disable the source, so priority one is the
          * smallest usable value.
          */
-        plic_set_priority(PLIC_IRQ_UART0, UINT32_C(1));
+        plic_set_priority(platform_uart_interrupt(), UINT32_C(1));
 
         /*
          * Enable UART0 for hart 0's supervisor-mode PLIC context.
          */
-        plic_enable(PLIC_IRQ_UART0);
+        plic_enable(platform_uart_interrupt());
 }

@@ -1,10 +1,12 @@
 #include <stdint.h>
 
 #include "panic.h"
+#include "platform.h"
 #include "plic.h"
 #include "timer.h"
 #include "trap.h"
 #include "uart.h"
+#include "user_process.h"
 
 /*
  * __asm__ volatile(
@@ -78,35 +80,24 @@ static void handle_external_interrupt(void) {
                 return;
         }
 
-        switch (interrupt_id) {
-        case PLIC_IRQ_UART0:
+        if (interrupt_id == platform_uart_interrupt()) {
                 uart_handle_interrupt();
-                break;
-
-        default:
-                /*
-                 * Unknown interrupt. For now we ignore it.
-                 */
-                break;
         }
 
         plic_complete(interrupt_id);
 }
 
 /*
- * Handle an asynchronous s. mode interrupt.
+ * Handle an asynchronous supervisor-mode interrupt.
  */
 static void handle_interrupt(struct trap_frame *frame, uint64_t code) {
         switch (code) {
         case SCAUSE_SUPERVISOR_TIMER:
-                uart_puts("Timer interrupt handled\n");
                 timer_schedule_next();
+                user_process_handle_timer(frame);
                 return;
 
         case SCAUSE_SUPERVISOR_SOFTWARE:
-                /*
-                 * Not implemented yet.
-                 */
                 panic_trap("Unhandled supervisor software interrupt", frame);
 
         case SCAUSE_SUPERVISOR_EXTERNAL:
@@ -126,6 +117,16 @@ static void handle_interrupt(struct trap_frame *frame, uint64_t code) {
  * Handle a synchronous exception.
  */
 static void handle_exception(struct trap_frame *frame, uint64_t code) {
+        if (code == SCAUSE_ECALL_FROM_USER) {
+                user_process_handle_syscall(frame);
+                return;
+        }
+
+        if ((frame->sstatus & SSTATUS_SPP) == 0U && user_process_is_active()) {
+                user_process_handle_fault(frame, code);
+                return;
+        }
+
         /*
          * Convert the numeric exception into a human-readable name.
          */
@@ -152,7 +153,7 @@ static void handle_exception(struct trap_frame *frame, uint64_t code) {
  *   - an interrupt
  *
  * The handler may modify the saved frame before returning. F. ex.:
- *   - advance frame-sepc after handling and ecall
+ *   - advance frame->sepc after handling an ecall
  *   - place a syscall result in frame->a0
  *   - change the saved context during task switching.
  */
@@ -162,10 +163,13 @@ void trap_handler(struct trap_frame *frame) {
 
         if ((scause & SCAUSE_INTERRUPT_BIT) != UINT64_C(0)) {
                 handle_interrupt(frame, code);
-                return;
+        } else {
+                handle_exception(frame, code);
         }
 
-        handle_exception(frame, code);
+        if ((frame->sstatus & SSTATUS_SPP) == 0U && user_process_is_active()) {
+                user_process_prepare_user_return(frame);
+        }
 }
 
 /*
@@ -181,4 +185,8 @@ void trap_init(void) {
          * Set the Supervisor trap-vector register.
          */
         __asm__ volatile("csrw stvec, %[entry]" : : [entry] "r"(entry));
+
+        /* Supervisor code uses zero to mark that no user stack switch is
+         * required on the next trap. */
+        __asm__ volatile("csrw sscratch, zero");
 }

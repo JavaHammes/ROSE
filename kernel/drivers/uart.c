@@ -27,15 +27,17 @@
  *         scratch-3.html
  */
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
+#include "platform.h"
 #include "uart.h"
 
 /*
  * Memory base address of the UART device in QEMU's RISC-V "virt" machine.
  * Can be found out by executing the command from above.
  */
-#define UART_BASE 0x10000000UL
+#define UART_REGISTERS ((volatile unsigned char *)platform_uart_base())
 
 /*
  * The NS16550A UART exposes serveral registers beginning at UART_BASE.
@@ -86,7 +88,7 @@ enum { UART_IER_RX_AVAILABLE = (1U << 0) };
  */
 enum { UART_LSR_DATA_READY = (1U << 0), UART_LSR_THRE = (1U << 5) };
 
-static volatile unsigned char *const uart = (volatile unsigned char *)UART_BASE;
+enum { UART_UINT64_DECIMAL_DIGITS = 20 };
 
 /*
  * Software receive ring buffer.
@@ -194,13 +196,13 @@ void uart_putc(char c) {
          * Wait until the UART can accept another byte.
          * (When THRE is 1)
          */
-        while ((uart[UART_LSR] & UART_LSR_THRE) == 0) {
+        while ((UART_REGISTERS[UART_LSR] & UART_LSR_THRE) == 0) {
         }
 
         /*
          * Write the character to the Transmit Holding Register.
          */
-        uart[UART_THR] = (unsigned char)c;
+        UART_REGISTERS[UART_THR] = (unsigned char)c;
 }
 
 /*
@@ -250,6 +252,30 @@ void uart_put_hex64(uint64_t value) {
 }
 
 /*
+ * Print a 64-bit unsigned integer in decimal.
+ */
+void uart_put_uint64(uint64_t value) {
+        char digits[UART_UINT64_DECIMAL_DIGITS];
+        size_t length = 0U;
+
+        if (value == 0U) {
+                uart_putc('0');
+                return;
+        }
+
+        while (value != 0U) {
+                digits[length] = (char)('0' + (value % UINT64_C(10)));
+                length++;
+                value /= UINT64_C(10);
+        }
+
+        while (length != 0U) {
+                length--;
+                uart_putc(digits[length]);
+        }
+}
+
+/*
  * Enable UART receive interrupts.
  *
  * This configures the UART itself to raise an interrupt when received data
@@ -264,7 +290,9 @@ void uart_put_hex64(uint64_t value) {
  * - supervisor external interrupts enabled in sie.SEIE
  * - supervisor interrupts globally enabled in sstatus.SIE
  */
-void uart_interrupts_enable(void) { uart[UART_IER] = UART_IER_RX_AVAILABLE; }
+void uart_interrupts_enable(void) {
+        UART_REGISTERS[UART_IER] = UART_IER_RX_AVAILABLE;
+}
 
 /*
  * Handle a UART receive interrupt.
@@ -290,8 +318,8 @@ void uart_handle_interrupt(void) {
          * Once no bytes remain, UART_LSR_DATA_READY becomes zero and
          * the receive interrupt condition is cleared.
          */
-        while ((uart[UART_LSR] & UART_LSR_DATA_READY) != 0U) {
-                char character = (char)uart[UART_RBR];
+        while ((UART_REGISTERS[UART_LSR] & UART_LSR_DATA_READY) != 0U) {
+                char character = (char)UART_REGISTERS[UART_RBR];
 
                 /*
                  * Drop the character if the software buffer is full.

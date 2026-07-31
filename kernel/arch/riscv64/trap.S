@@ -159,16 +159,15 @@
  *     scause
  *     stval
  *
+ *   1 kernel-owned return field:
+ *     kernel_trap_stack_top
+ *
  * Total stored values:
  *
- *     31 + 4 = 35 values
+ *     31 + 4 + 1 = 36 values
  *
- * Each RV64 register occupies 8 bytes:
- *
- *     35 * 8 = 280 bytes
- *
- * The allocated frame is rounded up to 288 bytes so that sp remains aligned
- * to a 16-byte boundary when trap_handler is called.
+ * Each value occupies 8 bytes, so the frame is exactly 288 bytes. This also
+ * keeps sp aligned to a 16-byte boundary when trap_handler is called.
  *
  * The RISC-V ABI requires the stack pointer to be 16-byte aligned at function
  * call boundaries.
@@ -218,7 +217,7 @@
  *     uint64_t scause;
  *     uint64_t stval;
  *
- *     uint64_t padding;
+ *     uint64_t kernel_trap_stack_top;
  * };
  */
 
@@ -271,17 +270,13 @@
 .equ TF_T5,      232
 .equ TF_T6,      240
 
-/* Supervisor trap state. */
+/* Supervisor trap state and the kernel-owned U-mode return stack. */
 .equ TF_SEPC,    248
 .equ TF_SSTATUS, 256
 .equ TF_SCAUSE,  264
 .equ TF_STVAL,   272
+.equ TF_KERNEL_TRAP_STACK_TOP, 280
 
-/*
- * Bytes 280-287 are unused padding.
- *
- * They keep the total allocation divisible by 16.
- */
 .equ TRAP_FRAME_SIZE, 288
 
 
@@ -307,6 +302,24 @@
  *   - sret resumes the interrupted context.
  */
 trap_entry:
+
+    /*
+     * sscratch is zero while ordinary supervisor code is running. Immediately
+     * before entering U-mode it instead contains the top of a trusted kernel
+     * trap stack.
+     *
+     * Swapping sp with sscratch therefore gives us two cases:
+     *
+     *   trap from U-mode: sp becomes the kernel trap-stack top
+     *   trap from S-mode: sp becomes zero
+     *
+     * In the supervisor case, swap again to recover the interrupted kernel sp.
+     */
+    csrrw sp, sscratch, sp
+    bnez  sp, .Ltrap_from_user
+    csrrw sp, sscratch, sp
+
+.Ltrap_from_supervisor:
 
     /*
      * Allocate space for the trap frame.
@@ -355,6 +368,27 @@ trap_entry:
      */
     addi t0, sp, TRAP_FRAME_SIZE
     sd t0, TF_SP(sp)
+
+    j .Lsave_remaining_registers
+
+.Ltrap_from_user:
+    /*
+     * sp is now the trusted kernel trap-stack top and sscratch contains the
+     * interrupted user stack pointer.
+     */
+    addi sp, sp, -TRAP_FRAME_SIZE
+    sd t0, TF_T0(sp)
+
+    csrr t0, sscratch
+    sd   t0, TF_SP(sp)
+
+    /*
+     * A fault inside the supervisor handler must be recognized as an S-mode
+     * trap, so clear sscratch once the user stack pointer is safely stored.
+     */
+    csrw sscratch, zero
+
+.Lsave_remaining_registers:
 
     /*
      * Save all remaining general-purpose registers.
@@ -539,6 +573,14 @@ trap_entry:
      csrw sstatus, t0
 
     /*
+     * Keep the saved previous-privilege bit in t6 until the final stack
+     * restoration. trap_handler may change SPP to return a finished process
+     * to a supervisor continuation.
+     */
+     ld t6, TF_SSTATUS(sp)
+     andi t6, t6, 0x100
+
+    /*
      * Restore all general-purpose registers except sp.
      *
      * sp must remain the trap-frame base until all other registers have been
@@ -549,7 +591,6 @@ trap_entry:
      ld gp, TF_GP(sp)
      ld tp, TF_TP(sp)
 
-     ld t0, TF_T0(sp)
      ld t1, TF_T1(sp)
      ld t2, TF_T2(sp)
 
@@ -579,22 +620,34 @@ trap_entry:
      ld t3, TF_T3(sp)
      ld t4, TF_T4(sp)
      ld t5, TF_T5(sp)
+    /*
+     * When returning to U-mode, leave the kernel trap-stack top in sscratch
+     * for the next trap. Supervisor code always runs with sscratch cleared.
+     */
+     bnez t6, .Lreturn_to_supervisor
+
+     /*
+      * The scheduler may have replaced this frame with another process's
+      * context. C supplies that process's trap-stack top in the final field.
+      */
+     ld t0, TF_KERNEL_TRAP_STACK_TOP(sp)
+     csrw sscratch, t0
+     j .Lrestore_final_registers
+
+.Lreturn_to_supervisor:
+     csrw sscratch, zero
+
+.Lrestore_final_registers:
      ld t6, TF_T6(sp)
+     ld t0, TF_T0(sp)
 
     /*
      * Release the trap frame.
      *
-     * Because the frame was allocated directly below the interrupted stack
-     * pointer, adding TRAP_FRAME_SIZE restores sp to exactly the value it had
-     * when the trap occurred.
-     *
-     * This also avoids needing to load TF_SP explicitly.
-     *
-     * Note that this is correct only if trap_handler does not replace the frame
-     * with a different task's frame. A future context-switch implementation may
-     * instead set sp to the selected task's trap frame before restoration.
+     * Load the interrupted stack pointer stored in the frame. A syscall exit
+     * may replace it with the suspended supervisor context stack.
      */
-     addi sp, sp, TRAP_FRAME_SIZE
+     ld sp, TF_SP(sp)
 
     /*
      * Return from the Supervisor trap.

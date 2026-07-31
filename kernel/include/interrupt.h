@@ -3,13 +3,13 @@
 
 enum {
         /*
-         * sstatus.SSIE - Supervisor Interrupt Enable
+         * sstatus.SIE - Supervisor Interrupt Enable
          *
          * This is the global interrupt-enable bit for supervisor mode.
          *
          * When SIE = 0: No s. interrupts while cpu in s mode.
-         * WHen SIE = 1: S interrupts are taken when corresponding inttertups
-         * source is also enabled in the sie CSR.
+         * When SIE = 1: supervisor interrupts are taken when the corresponding
+         * interrupt source is also enabled in the sie CSR.
          */
         SSTATUS_SIE = (1UL << 1),
 
