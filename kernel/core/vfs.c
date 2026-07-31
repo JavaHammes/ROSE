@@ -2,8 +2,8 @@
  * Minimal mount and pathname layer.
  *
  * Nodes and file bytes are owned by the mounted filesystem. The VFS performs
- * no allocation and returns immutable views, which is enough for executable
- * lookup while leaving the process loader independent of linker symbols.
+ * no allocation and returns immutable file views or nonblocking character
+ * operations. Descriptor offsets and scheduler waits remain process concerns.
  */
 #include <stdbool.h>
 #include <stddef.h>
@@ -96,12 +96,18 @@ const struct vfs_node *vfs_lookup(const char *path) {
 bool vfs_open(const char *path, struct vfs_file *file) {
         const struct vfs_node *node = vfs_lookup(path);
 
-        if (node == NULL || node->type != VFS_NODE_REGULAR || file == NULL ||
-            (node->size != 0U && node->data == NULL)) {
+        if (node == NULL || node->type == VFS_NODE_DIRECTORY || file == NULL ||
+            (node->type == VFS_NODE_REGULAR && node->size != 0U &&
+             node->data == NULL) ||
+            (node->type == VFS_NODE_CHARACTER_DEVICE &&
+             (node->device == VFS_DEVICE_NONE || node->operations == NULL))) {
                 return false;
         }
 
+        file->type = node->type;
         file->data = node->data;
         file->size = node->size;
+        file->device = node->device;
+        file->operations = node->operations;
         return true;
 }

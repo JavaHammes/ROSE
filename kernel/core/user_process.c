@@ -1,10 +1,10 @@
 /*
  * User-process lifecycle and the foreground round-robin scheduler.
  *
- * A process owns a private Sv39 root, ELF pages, one user stack page, and one
- * supervisor-only trap stack. The complete user register set lives in a
- * trap_frame, allowing the trap handler to switch processes by replacing the
- * frame that assembly will restore.
+ * A process owns a private Sv39 root, ELF pages, one user stack page, one
+ * supervisor-only trap stack, and a small descriptor table. The complete user
+ * register set lives in a trap_frame, allowing the trap handler to switch
+ * processes by replacing the frame that assembly will restore.
  *
  * The shell can create several READY processes and later run them as one
  * foreground batch. Timer interrupts preempt U-mode, yield switches voluntarily,
@@ -28,9 +28,17 @@
 #include "virtual_memory.h"
 
 enum {
-        USER_WRITE_MAX = 1024,
-        USER_WRITE_TRANSMIT_MAX = USER_WRITE_MAX * 2,
+        USER_IO_MAX = 1024,
+        USER_WRITE_TRANSMIT_MAX = USER_IO_MAX * 2,
+        USER_PATH_MAX = 64,
+        PROCESS_DESCRIPTOR_LIMIT = 8,
+        PROCESS_FIRST_OPEN_DESCRIPTOR = 3,
         PROCESS_LIMIT = 8,
+};
+
+enum descriptor_access {
+        DESCRIPTOR_READ = (1U << 0),
+        DESCRIPTOR_WRITE = (1U << 1),
 };
 
 enum process_state {
@@ -65,6 +73,13 @@ extern void user_mode_enter(const struct trap_frame *context,
 extern void user_mode_resume(void);
 extern uintptr_t user_saved_kernel_context_sp;
 
+struct process_descriptor {
+        bool open;
+        uint8_t access;
+        size_t offset;
+        struct vfs_file file;
+};
+
 struct process {
         /* Scheduler-visible identity and saved execution state. */
         uint64_t pid;
@@ -77,15 +92,22 @@ struct process {
         void *kernel_trap_stack;
         uint64_t exit_status;
         bool exit_reported;
+        struct process_descriptor descriptors[PROCESS_DESCRIPTOR_LIMIT];
 
         /* Blocking syscall continuation state. A process never returns to
-         * U-mode while pending_write is true. */
+         * U-mode while either pending flag is true. */
         enum scheduler_wait_channel wait_channel;
         bool pending_write;
+        size_t write_descriptor;
         size_t write_result_length;
         size_t write_length;
         size_t write_offset;
         char write_buffer[USER_WRITE_TRANSMIT_MAX];
+
+        bool pending_read;
+        size_t read_descriptor;
+        uintptr_t read_buffer;
+        size_t read_length;
 };
 
 /* Fixed slots keep early process management independent of a kernel heap. */
@@ -119,6 +141,40 @@ static void trap_frame_copy(struct trap_frame *destination,
         }
 }
 
+static bool process_descriptors_initialize(struct process *process) {
+        struct vfs_file console;
+
+        if (!vfs_open("/dev/console", &console) ||
+            console.type != VFS_NODE_CHARACTER_DEVICE ||
+            console.device != VFS_DEVICE_CONSOLE) {
+                return false;
+        }
+
+        process->descriptors[USER_STDIN_FILENO] =
+            (struct process_descriptor){
+                .open = true,
+                .access = DESCRIPTOR_READ,
+                .file = console,
+            };
+        process->descriptors[USER_STDOUT_FILENO] =
+            (struct process_descriptor){
+                .open = true,
+                .access = DESCRIPTOR_WRITE,
+                .file = console,
+            };
+        process->descriptors[USER_STDERR_FILENO] =
+            (struct process_descriptor){
+                .open = true,
+                .access = DESCRIPTOR_WRITE,
+                .file = console,
+            };
+        return true;
+}
+
+static void process_descriptors_close_all(struct process *process) {
+        bytes_zero(process->descriptors, sizeof(process->descriptors));
+}
+
 /* Assert an expected user mapping during process construction. */
 static void verify_user_mapping(const struct page_table *root,
                                 uintptr_t virtual_address,
@@ -139,10 +195,12 @@ static void verify_user_mapping(const struct page_table *root,
 
 /*
  * Release every physical resource owned by a process, but preserve PID, state,
- * and exit status for ps. The user stack is verified and unmapped explicitly;
- * ELF teardown performs the same ownership check for executable/data pages.
+ * and exit status for ps. Descriptors close first, the user stack is verified
+ * and unmapped explicitly, and ELF teardown checks executable/data ownership.
  */
 static void process_release_resources(struct process *process) {
+        process_descriptors_close_all(process);
+
         if (process->address_space != NULL) {
                 if (process->stack_page != NULL) {
                         uintptr_t stack_physical_address;
@@ -212,7 +270,8 @@ static struct process *process_find_by_pid(uint64_t pid) {
 static bool process_create(struct process *process, const char *path) {
         struct vfs_file executable;
 
-        if (!vfs_open(path, &executable) || executable.size == 0U) {
+        if (!vfs_open(path, &executable) ||
+            executable.type != VFS_NODE_REGULAR || executable.size == 0U) {
                 return false;
         }
 
@@ -223,6 +282,9 @@ static bool process_create(struct process *process, const char *path) {
         /* SPIE causes sret to enable supervisor interrupts while U-mode runs. */
         process->context.sstatus = SSTATUS_SPIE;
         process->exit_status = UINT64_MAX;
+        if (!process_descriptors_initialize(process)) {
+                panic("Initial console descriptors are unavailable");
+        }
         next_pid++;
         if (next_pid == 0U) {
                 next_pid = 1U;
@@ -282,9 +344,13 @@ static bool process_create(struct process *process, const char *path) {
         return true;
 }
 
-/* Validate a complete U-mode read range before copying any bytes from it. */
-static bool user_read_range_is_valid(uintptr_t user_buffer, size_t length) {
+/* Validate a complete user range with the requested leaf permissions. */
+static bool user_range_is_valid(uintptr_t user_buffer, size_t length,
+                                uint64_t required_flags) {
         if (active_process == NULL) {
+                return false;
+        }
+        if (length != 0U && user_buffer > UINTPTR_MAX - (length - 1U)) {
                 return false;
         }
 
@@ -296,8 +362,8 @@ static bool user_read_range_is_valid(uintptr_t user_buffer, size_t length) {
 
                 if (!page_table_translate(root, user_buffer + offset,
                                           &physical_address, &flags) ||
-                    (flags & (VM_PAGE_USER | VM_PAGE_READ)) !=
-                        (VM_PAGE_USER | VM_PAGE_READ)) {
+                    (flags & (VM_PAGE_USER | required_flags)) !=
+                        (VM_PAGE_USER | required_flags)) {
                         return false;
                 }
 
@@ -314,20 +380,85 @@ static bool user_read_range_is_valid(uintptr_t user_buffer, size_t length) {
         return true;
 }
 
+/* Copy into a range which was validated before any externally visible work. */
+static void user_copy_to(uintptr_t user_buffer, const uint8_t *source,
+                         size_t length) {
+        const struct page_table *root = active_process->address_space;
+
+        for (size_t offset = 0U; offset < length;) {
+                uintptr_t physical_address;
+
+                if (!page_table_translate(root, user_buffer + offset,
+                                          &physical_address, NULL)) {
+                        panic("Validated writable user mapping disappeared");
+                }
+
+                size_t page_remaining =
+                    PAGE_SIZE - ((user_buffer + offset) & (PAGE_SIZE - 1U));
+                size_t chunk = length - offset;
+
+                if (chunk > page_remaining) {
+                        chunk = page_remaining;
+                }
+
+                uint8_t *destination = (uint8_t *)physical_address;
+
+                for (size_t index = 0U; index < chunk; index++) {
+                        destination[index] = source[offset + index];
+                }
+                offset += chunk;
+        }
+}
+
+/* Copy a bounded null-terminated path without dereferencing a user pointer. */
+static uint64_t user_copy_path(uintptr_t user_path,
+                               char path[USER_PATH_MAX]) {
+        for (size_t index = 0U; index < USER_PATH_MAX; index++) {
+                uintptr_t address;
+
+                if (user_path > UINTPTR_MAX - index ||
+                    !user_range_is_valid(user_path + index, 1U,
+                                         VM_PAGE_READ) ||
+                    !page_table_translate(active_process->address_space,
+                                          user_path + index, &address, NULL)) {
+                        return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+                }
+
+                path[index] = *(const char *)address;
+                if (path[index] == '\0') {
+                        return 0U;
+                }
+        }
+
+        return (uint64_t)-(int64_t)USER_ERROR_NAME_TOO_LONG;
+}
+
 /*
  * Copy a validated user write into process-owned memory. This is essential for
  * blocking: the driver and scheduler never retain a pointer into the transient
  * trap frame, and another address space may run before this syscall completes.
  */
-static uint64_t syscall_write_begin(uintptr_t user_buffer, size_t length) {
+static uint64_t syscall_write_begin(uint64_t descriptor, uintptr_t user_buffer,
+                                    size_t length) {
         if (active_process == NULL) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
         }
-        if (length > USER_WRITE_MAX ||
-            (length != 0U && user_buffer > UINTPTR_MAX - (length - 1U))) {
+        if (descriptor >= PROCESS_DESCRIPTOR_LIMIT ||
+            !active_process->descriptors[(size_t)descriptor].open ||
+            (active_process->descriptors[(size_t)descriptor].access &
+             DESCRIPTOR_WRITE) == 0U ||
+            active_process->descriptors[(size_t)descriptor].file.type !=
+                VFS_NODE_CHARACTER_DEVICE ||
+            active_process->descriptors[(size_t)descriptor].file.operations ==
+                NULL ||
+            active_process->descriptors[(size_t)descriptor]
+                    .file.operations->write_byte == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        if (length > USER_IO_MAX) {
                 return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
         }
-        if (!user_read_range_is_valid(user_buffer, length)) {
+        if (!user_range_is_valid(user_buffer, length, VM_PAGE_READ)) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
         }
 
@@ -368,11 +499,112 @@ static uint64_t syscall_write_begin(uintptr_t user_buffer, size_t length) {
         }
 
         process->pending_write = transmit_length != 0U;
+        process->write_descriptor = (size_t)descriptor;
         process->write_result_length = length;
         process->write_length = transmit_length;
         process->write_offset = 0U;
 
         return length;
+}
+
+static uint64_t syscall_open(uintptr_t user_path) {
+        char path[USER_PATH_MAX];
+        uint64_t copy_result = user_copy_path(user_path, path);
+
+        if (copy_result != 0U) {
+                return copy_result;
+        }
+
+        struct vfs_file file;
+
+        if (!vfs_open(path, &file)) {
+                return (uint64_t)-(int64_t)USER_ERROR_NO_ENTRY;
+        }
+
+        size_t descriptor = PROCESS_FIRST_OPEN_DESCRIPTOR;
+
+        while (descriptor < PROCESS_DESCRIPTOR_LIMIT &&
+               active_process->descriptors[descriptor].open) {
+                descriptor++;
+        }
+        if (descriptor == PROCESS_DESCRIPTOR_LIMIT) {
+                return (uint64_t)-(int64_t)USER_ERROR_TOO_MANY_FILES;
+        }
+
+        uint8_t access = DESCRIPTOR_READ;
+
+        if (file.type == VFS_NODE_CHARACTER_DEVICE &&
+            file.device == VFS_DEVICE_CONSOLE) {
+                access |= DESCRIPTOR_WRITE;
+        }
+
+        active_process->descriptors[descriptor] =
+            (struct process_descriptor){
+                .open = true,
+                .access = access,
+                .file = file,
+            };
+        return descriptor;
+}
+
+static uint64_t syscall_close(uint64_t descriptor) {
+        if (descriptor >= PROCESS_DESCRIPTOR_LIMIT ||
+            !active_process->descriptors[(size_t)descriptor].open) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+
+        bytes_zero(&active_process->descriptors[(size_t)descriptor],
+                   sizeof(active_process->descriptors[(size_t)descriptor]));
+        return 0U;
+}
+
+static uint64_t syscall_read_begin(uint64_t descriptor,
+                                   uintptr_t user_buffer, size_t length) {
+        if (descriptor >= PROCESS_DESCRIPTOR_LIMIT ||
+            !active_process->descriptors[(size_t)descriptor].open ||
+            (active_process->descriptors[(size_t)descriptor].access &
+             DESCRIPTOR_READ) == 0U) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        if (length > USER_IO_MAX) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+        if (!user_range_is_valid(user_buffer, length, VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        if (length == 0U) {
+                return 0U;
+        }
+
+        struct process_descriptor *open_file =
+            &active_process->descriptors[(size_t)descriptor];
+
+        if (open_file->file.type == VFS_NODE_REGULAR) {
+                size_t available = open_file->file.size - open_file->offset;
+                size_t count = length;
+
+                if (count > available) {
+                        count = available;
+                }
+                if (count != 0U) {
+                        user_copy_to(
+                            user_buffer,
+                            &open_file->file.data[open_file->offset], count);
+                }
+                open_file->offset += count;
+                return count;
+        }
+        if (open_file->file.type != VFS_NODE_CHARACTER_DEVICE ||
+            open_file->file.operations == NULL ||
+            open_file->file.operations->read_byte == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+
+        active_process->pending_read = true;
+        active_process->read_descriptor = (size_t)descriptor;
+        active_process->read_buffer = user_buffer;
+        active_process->read_length = length;
+        return 0U;
 }
 
 /* Select the first READY slot after the current process, wrapping once. */
@@ -463,12 +695,32 @@ size_t scheduler_wake_all(enum scheduler_wait_channel channel) {
         return woken;
 }
 
+bool scheduler_wake_one(enum scheduler_wait_channel channel) {
+        if (channel == SCHEDULER_WAIT_NONE) {
+                return false;
+        }
+
+        for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
+                struct process *process = &process_table[index];
+
+                if (process->state == PROCESS_BLOCKED &&
+                    process->wait_channel == channel) {
+                        process->state = PROCESS_READY;
+                        process->wait_channel = SCHEDULER_WAIT_NONE;
+                        return true;
+                }
+        }
+
+        return false;
+}
+
 /* Advance one resumable write. While it is blocked, sepc continues to point at
  * ECALL; waking the process safely re-enters this continuation in a fresh trap. */
 static void process_continue_write(struct trap_frame *frame) {
         struct process *process = active_process;
 
-        if (process == NULL || !process->pending_write) {
+        if (process == NULL || !process->pending_write ||
+            process->write_descriptor >= PROCESS_DESCRIPTOR_LIMIT) {
                 panic_trap("Invalid pending write", frame);
         }
         if (uart_write_owner == NULL) {
@@ -490,11 +742,47 @@ static void process_continue_write(struct trap_frame *frame) {
                 return;
         }
 
-        if (uart_tx_submit(process->write_buffer[process->write_offset])) {
+        const struct vfs_file *file =
+            &process->descriptors[process->write_descriptor].file;
+
+        if (file->operations->write_byte(
+                process->write_buffer[process->write_offset])) {
                 process->write_offset++;
         }
 
         scheduler_block_current(frame, SCHEDULER_WAIT_UART_TX);
+}
+
+static void process_continue_read(struct trap_frame *frame) {
+        struct process *process = active_process;
+
+        if (process == NULL || !process->pending_read ||
+            process->read_descriptor >= PROCESS_DESCRIPTOR_LIMIT) {
+                panic_trap("Invalid pending read", frame);
+        }
+
+        size_t count = 0U;
+        char character;
+
+        const struct vfs_file *file =
+            &process->descriptors[process->read_descriptor].file;
+
+        while (count < process->read_length &&
+               file->operations->read_byte(&character)) {
+                uint8_t byte = (uint8_t)character;
+
+                user_copy_to(process->read_buffer + count, &byte, 1U);
+                count++;
+        }
+
+        if (count == 0U) {
+                scheduler_block_current(frame, SCHEDULER_WAIT_UART_RX);
+                return;
+        }
+
+        process->pending_read = false;
+        frame->a0 = count;
+        frame->sepc += 4U;
 }
 
 /*
@@ -811,7 +1099,8 @@ void user_process_handle_syscall(struct trap_frame *frame) {
         case USER_SYSCALL_WRITE: {
                 if (!active_process->pending_write) {
                         uint64_t result = syscall_write_begin(
-                            (uintptr_t)frame->a0, (size_t)frame->a1);
+                            frame->a0, (uintptr_t)frame->a1,
+                            (size_t)frame->a2);
 
                         if (!active_process->pending_write) {
                                 frame->a0 = result;
@@ -823,6 +1112,33 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 process_continue_write(frame);
                 return;
         }
+
+        case USER_SYSCALL_READ: {
+                if (!active_process->pending_read) {
+                        uint64_t result = syscall_read_begin(
+                            frame->a0, (uintptr_t)frame->a1,
+                            (size_t)frame->a2);
+
+                        if (!active_process->pending_read) {
+                                frame->a0 = result;
+                                frame->sepc += 4U;
+                                return;
+                        }
+                }
+
+                process_continue_read(frame);
+                return;
+        }
+
+        case USER_SYSCALL_OPEN:
+                frame->a0 = syscall_open((uintptr_t)frame->a0);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_CLOSE:
+                frame->a0 = syscall_close(frame->a0);
+                frame->sepc += 4U;
+                return;
 
         case USER_SYSCALL_EXIT:
                 frame->sepc += 4U;

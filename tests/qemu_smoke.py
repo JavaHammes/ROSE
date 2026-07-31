@@ -53,6 +53,20 @@ class QemuSession:
         self.read_until(b"rose> ", timeout)
         return self.output[start:].decode("utf-8", errors="replace").replace("\r", "")
 
+    def command_with_input(
+        self, text: str, wait_marker: bytes, input_bytes: bytes, timeout: float = 10.0
+    ) -> str:
+        """Start a blocking command, wait for readiness, then inject input."""
+        start = len(self.output)
+        assert self.process.stdin is not None
+        self.process.stdin.write((text + "\n").encode())
+        self.process.stdin.flush()
+        self.read_until(wait_marker, timeout)
+        self.process.stdin.write(input_bytes)
+        self.process.stdin.flush()
+        self.read_until(b"rose> ", timeout)
+        return self.output[start:].decode("utf-8", errors="replace").replace("\r", "")
+
     def shutdown(self) -> None:
         """Exercise the guest exit command and require a successful QEMU exit."""
         assert self.process.stdin is not None
@@ -174,6 +188,36 @@ def main() -> int:
             session.command("run /bin/missing"),
             "Unable to load program: /bin/missing",
         )
+
+        motd = "Welcome to ROSE. Files now have descriptors and independent offsets."
+        require(session.command("run /bin/cat"), motd, "exited with status 0")
+
+        console = session.command_with_input(
+            "run /bin/console-read", b"Console reader waiting\r\n", b"Z"
+        )
+        require(
+            console,
+            "Console reader waiting",
+            "Console read: Z",
+            "exited with status 0",
+            "Scheduler blocks:",
+        )
+
+        # Direct runs leave zombies by design. Reap them before filling the
+        # fixed process table with concurrency tests.
+        require(session.command("reap"), "Reaped 5 process(es)")
+
+        first_cat = spawned_pid(session.command("spawn /bin/cat"))
+        second_cat = spawned_pid(session.command("spawn /bin/cat"))
+        cat_pair = session.command("wait")
+        if cat_pair.count(motd) != 2:
+            raise AssertionError(f"independent file offsets failed:\n{cat_pair}")
+        require(
+            cat_pair,
+            f"Process {first_cat} exited with status 0",
+            f"Process {second_cat} exited with status 0",
+        )
+        require(session.command("reap"), "Reaped 2 process(es)")
 
         # Separate spawn from wait so READY persistence and ps are tested before
         # the foreground scheduler consumes the processes.

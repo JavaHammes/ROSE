@@ -1,9 +1,10 @@
-/* Mount the build-time user executables as immutable files under /bin. */
+/* Mount build-time executables, immutable data, and /dev/console. */
 #include <stddef.h>
 #include <stdint.h>
 
 #include "panic.h"
 #include "ramfs.h"
+#include "uart.h"
 #include "vfs.h"
 
 extern uint8_t user_hello_elf_start[];
@@ -16,8 +17,20 @@ extern uint8_t user_process_b_elf_start[];
 extern uint8_t user_process_b_elf_end[];
 extern uint8_t user_syscall_test_elf_start[];
 extern uint8_t user_syscall_test_elf_end[];
+extern uint8_t user_cat_elf_start[];
+extern uint8_t user_cat_elf_end[];
+extern uint8_t user_console_read_elf_start[];
+extern uint8_t user_console_read_elf_end[];
 
-enum { RAMFS_PROGRAM_COUNT = 5 };
+enum { RAMFS_PROGRAM_COUNT = 7 };
+
+static const uint8_t motd_data[] =
+    "Welcome to ROSE. Files now have descriptors and independent offsets.\n";
+
+static const struct vfs_character_device_operations console_operations = {
+    .read_byte = uart_getc,
+    .write_byte = uart_tx_submit,
+};
 
 static struct vfs_node bin_nodes[RAMFS_PROGRAM_COUNT] = {
     {.name = "hello", .type = VFS_NODE_REGULAR},
@@ -25,6 +38,22 @@ static struct vfs_node bin_nodes[RAMFS_PROGRAM_COUNT] = {
     {.name = "process-a", .type = VFS_NODE_REGULAR},
     {.name = "process-b", .type = VFS_NODE_REGULAR},
     {.name = "syscall-test", .type = VFS_NODE_REGULAR},
+    {.name = "cat", .type = VFS_NODE_REGULAR},
+    {.name = "console-read", .type = VFS_NODE_REGULAR},
+};
+
+static const struct vfs_node etc_nodes[] = {
+    {.name = "motd",
+     .type = VFS_NODE_REGULAR,
+     .data = motd_data,
+     .size = sizeof(motd_data) - 1U},
+};
+
+static const struct vfs_node dev_nodes[] = {
+    {.name = "console",
+     .type = VFS_NODE_CHARACTER_DEVICE,
+     .device = VFS_DEVICE_CONSOLE,
+     .operations = &console_operations},
 };
 
 static const struct vfs_node root_nodes[] = {
@@ -32,6 +61,14 @@ static const struct vfs_node root_nodes[] = {
      .type = VFS_NODE_DIRECTORY,
      .children = bin_nodes,
      .child_count = RAMFS_PROGRAM_COUNT},
+    {.name = "etc",
+     .type = VFS_NODE_DIRECTORY,
+     .children = etc_nodes,
+     .child_count = sizeof(etc_nodes) / sizeof(etc_nodes[0])},
+    {.name = "dev",
+     .type = VFS_NODE_DIRECTORY,
+     .children = dev_nodes,
+     .child_count = sizeof(dev_nodes) / sizeof(dev_nodes[0])},
 };
 
 static const struct vfs_node ramfs_root = {
@@ -62,6 +99,9 @@ void ramfs_init(void) {
                        user_process_b_elf_end);
         ramfs_set_file(4U, user_syscall_test_elf_start,
                        user_syscall_test_elf_end);
+        ramfs_set_file(5U, user_cat_elf_start, user_cat_elf_end);
+        ramfs_set_file(6U, user_console_read_elf_start,
+                       user_console_read_elf_end);
 
         if (!vfs_mount_root(&ramfs_root)) {
                 panic("Failed to mount initial ramfs");

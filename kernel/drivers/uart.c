@@ -355,7 +355,9 @@ void uart_handle_interrupt(void) {
                  *
                  * Later, we may want to use a larger buffer.
                  */
-                (void)uart_rx_buffer_push(character);
+                if (uart_rx_buffer_push(character)) {
+                        (void)scheduler_wake_one(SCHEDULER_WAIT_UART_RX);
+                }
         }
 
         /* THRE is level-triggered. Disable it before waking writers so the

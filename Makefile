@@ -43,12 +43,14 @@ USER_COMMON_OBJECTS := \
 # Each ramfs path is a distinct ELF. All variants use the same small source,
 # with a build-time selector allowing dead-code elimination to retain only the
 # requested demonstration.
-USER_PROGRAMS := hello fault process_a process_b syscall_test
+USER_PROGRAMS := hello fault process_a process_b syscall_test cat console_read
 USER_PROGRAM_hello := 0
 USER_PROGRAM_fault := 1
 USER_PROGRAM_process_a := 2
 USER_PROGRAM_process_b := 3
 USER_PROGRAM_syscall_test := 4
+USER_PROGRAM_cat := 5
+USER_PROGRAM_console_read := 6
 USER_ELFS := $(foreach program,$(USER_PROGRAMS),$(BUILD_DIR)/user/$(program)/program.elf)
 USER_EMBEDDED_ELFS := $(USER_ELFS:.elf=.load.elf)
 USER_IMAGE_OBJECT := $(BUILD_DIR)/kernel/arch/riscv64/user_image.o

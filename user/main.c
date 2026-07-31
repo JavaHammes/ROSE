@@ -5,6 +5,7 @@
  * ROSE_PROGRAM is constant for a given image, so the compiler discards the
  * other demonstrations while the sources continue sharing one runtime.
  */
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -32,7 +33,7 @@ static size_t string_length(const char *text) {
 }
 
 static void print(const char *text) {
-        (void)rose_write(text, string_length(text));
+        (void)rose_write(USER_STDOUT_FILENO, text, string_length(text));
 }
 
 static void preemption_delay(void) {
@@ -62,16 +63,98 @@ static int run_syscall_test(void) {
         const void *kernel_address =
             (const void *)(uintptr_t)UINT64_C(0x80200000);
 
-        if (rose_write(kernel_address, 1U) != -USER_ERROR_BAD_ADDRESS) {
+        if (rose_write(USER_STDOUT_FILENO, kernel_address, 1U) !=
+            -USER_ERROR_BAD_ADDRESS) {
                 return 4;
         }
+        if (rose_write(99, "x", 1U) != -USER_ERROR_BAD_FILE_DESCRIPTOR) {
+                return 6;
+        }
+        if (rose_open("/missing") != -USER_ERROR_NO_ENTRY ||
+            rose_close(99) != -USER_ERROR_BAD_FILE_DESCRIPTOR) {
+                return 7;
+        }
+
+        long descriptors[5];
+
+        for (size_t index = 0U; index < 5U; index++) {
+                descriptors[index] = rose_open("/etc/motd");
+                if (descriptors[index] != (long)(index + 3U)) {
+                        return 14;
+                }
+        }
+        if (rose_open("/etc/motd") != -USER_ERROR_TOO_MANY_FILES) {
+                return 15;
+        }
+        for (size_t index = 0U; index < 5U; index++) {
+                if (rose_close((int)descriptors[index]) != 0) {
+                        return 16;
+                }
+        }
+
+        long descriptor = rose_open("/etc/motd");
+        char byte;
+
+        if (descriptor != 3 ||
+            rose_read(USER_STDOUT_FILENO, &byte, 1U) !=
+                -USER_ERROR_BAD_FILE_DESCRIPTOR ||
+            rose_read((int)descriptor, (void *)kernel_address, 1U) !=
+                -USER_ERROR_BAD_ADDRESS ||
+            rose_close((int)descriptor) != 0) {
+                return 17;
+        }
         /* The raw wrapper lets this test issue a deliberately unknown number. */
-        if (rose_syscall(UINT64_C(0xffff), 0U, 0U) !=
+        if (rose_syscall(UINT64_C(0xffff), 0U, 0U, 0U) !=
             -USER_ERROR_NOT_IMPLEMENTED) {
                 return 5;
         }
 
         print("Syscall validation passed\n");
+        return 0;
+}
+
+static int run_cat(void) {
+        long descriptor = rose_open("/etc/motd");
+
+        if (descriptor < 0) {
+                return 8;
+        }
+
+        char buffer[24];
+
+        while (true) {
+                long count = rose_read((int)descriptor, buffer, sizeof(buffer));
+
+                if (count < 0) {
+                        (void)rose_close((int)descriptor);
+                        return 9;
+                }
+                if (count == 0) {
+                        break;
+                }
+                if (rose_write(USER_STDOUT_FILENO, buffer, (size_t)count) !=
+                    count) {
+                        (void)rose_close((int)descriptor);
+                        return 10;
+                }
+        }
+
+        return rose_close((int)descriptor) == 0 ? 0 : 11;
+}
+
+static int run_console_read(void) {
+        char character;
+
+        print("Console reader waiting\n");
+        if (rose_read(USER_STDIN_FILENO, &character, 1U) != 1) {
+                return 12;
+        }
+
+        print("Console read: ");
+        if (rose_write(USER_STDOUT_FILENO, &character, 1U) != 1) {
+                return 13;
+        }
+        print("\n");
         return 0;
 }
 
@@ -111,6 +194,12 @@ int user_main(void) { // NOLINT(misc-use-internal-linkage)
 
         case USER_PROGRAM_SYSCALL_TEST:
                 return run_syscall_test();
+
+        case USER_PROGRAM_CAT:
+                return run_cat();
+
+        case USER_PROGRAM_CONSOLE_READ:
+                return run_console_read();
 
         default:
                 return 2;
