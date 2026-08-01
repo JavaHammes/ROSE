@@ -251,6 +251,46 @@ rose_kill:
     ret
 .size rose_kill, . - rose_kill
 
+.section .text.rose_setpgid,"ax",@progbits
+.align 2
+.globl rose_setpgid
+.type rose_setpgid, @function
+rose_setpgid:
+    li a7, USER_SYSCALL_SET_PROCESS_GROUP
+    ecall
+    ret
+.size rose_setpgid, . - rose_setpgid
+
+.section .text.rose_getpgrp,"ax",@progbits
+.align 2
+.globl rose_getpgrp
+.type rose_getpgrp, @function
+rose_getpgrp:
+    li a7, USER_SYSCALL_GET_PROCESS_GROUP
+    ecall
+    ret
+.size rose_getpgrp, . - rose_getpgrp
+
+.section .text.rose_tcsetpgrp,"ax",@progbits
+.align 2
+.globl rose_tcsetpgrp
+.type rose_tcsetpgrp, @function
+rose_tcsetpgrp:
+    li a7, USER_SYSCALL_TERMINAL_SET_FOREGROUND_GROUP
+    ecall
+    ret
+.size rose_tcsetpgrp, . - rose_tcsetpgrp
+
+.section .text.rose_tcgetpgrp,"ax",@progbits
+.align 2
+.globl rose_tcgetpgrp
+.type rose_tcgetpgrp, @function
+rose_tcgetpgrp:
+    li a7, USER_SYSCALL_TERMINAL_GET_FOREGROUND_GROUP
+    ecall
+    ret
+.size rose_tcgetpgrp, . - rose_tcgetpgrp
+
 .section .text.rose_signal_trampoline,"ax",@progbits
 .align 2
 .type rose_signal_trampoline, @function

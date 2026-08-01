@@ -31,6 +31,10 @@
 #define USER_SYSCALL_SIGNAL_ACTION 25
 #define USER_SYSCALL_KILL 26
 #define USER_SYSCALL_SIGNAL_RETURN 27
+#define USER_SYSCALL_SET_PROCESS_GROUP 28
+#define USER_SYSCALL_GET_PROCESS_GROUP 29
+#define USER_SYSCALL_TERMINAL_SET_FOREGROUND_GROUP 30
+#define USER_SYSCALL_TERMINAL_GET_FOREGROUND_GROUP 31
 
 #else
 
@@ -63,6 +67,10 @@ enum user_syscall_number {
         USER_SYSCALL_SIGNAL_ACTION = 25,
         USER_SYSCALL_KILL = 26,
         USER_SYSCALL_SIGNAL_RETURN = 27,
+        USER_SYSCALL_SET_PROCESS_GROUP = 28,
+        USER_SYSCALL_GET_PROCESS_GROUP = 29,
+        USER_SYSCALL_TERMINAL_SET_FOREGROUND_GROUP = 30,
+        USER_SYSCALL_TERMINAL_GET_FOREGROUND_GROUP = 31,
 };
 
 /* Stable negative error values returned in a0 by failed system calls. */
@@ -114,6 +122,8 @@ enum user_seek_whence {
 
 enum user_wait_options {
         USER_WAIT_NO_HANG = (1U << 0),
+        USER_WAIT_UNTRACED = (1U << 1),
+        USER_WAIT_CONTINUED = (1U << 2),
 };
 
 #define USER_WAIT_STATUS_EXITED(status) (((uint32_t)(status) & 0x7fU) == 0U)
@@ -124,6 +134,11 @@ enum user_wait_options {
          (((uint32_t)(status) & 0x7fU) != 0x7fU))
 #define USER_WAIT_STATUS_TERMINATION_SIGNAL(status) \
         ((uint32_t)(status) & 0x7fU)
+#define USER_WAIT_STATUS_STOPPED(status) \
+        (((uint32_t)(status) & 0xffU) == 0x7fU)
+#define USER_WAIT_STATUS_STOP_SIGNAL(status) \
+        (((uint32_t)(status) >> 8U) & 0xffU)
+#define USER_WAIT_STATUS_CONTINUED(status) ((uint32_t)(status) == 0xffffU)
 
 /* Initial process-directed signals. Values follow the conventional Unix ABI
  * so wait statuses and programs can use familiar numbers. */
@@ -132,6 +147,10 @@ enum user_signal_number {
         USER_SIGNAL_KILL = 9,
         USER_SIGNAL_USER_1 = 10,
         USER_SIGNAL_TERMINATE = 15,
+        USER_SIGNAL_CONTINUE = 18,
+        USER_SIGNAL_STOP = 19,
+        USER_SIGNAL_TERMINAL_STOP = 20,
+        USER_SIGNAL_BACKGROUND_READ = 21,
         USER_SIGNAL_MAX = 31,
 };
 

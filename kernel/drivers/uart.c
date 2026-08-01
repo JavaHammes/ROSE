@@ -33,6 +33,7 @@
 #include "platform.h"
 #include "scheduler.h"
 #include "uart.h"
+#include "user_process.h"
 
 /*
  * Memory base address of the UART device in QEMU's RISC-V "virt" machine.
@@ -349,6 +350,10 @@ void uart_handle_interrupt(void) {
          */
         while ((UART_REGISTERS[UART_LSR] & UART_LSR_DATA_READY) != 0U) {
                 char character = (char)UART_REGISTERS[UART_RBR];
+
+                if (user_process_handle_console_control(character)) {
+                        continue;
+                }
 
                 /*
                  * Drop the character if the software buffer is full.

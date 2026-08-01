@@ -3,7 +3,7 @@
  *
  * The kernel exposes the console as standard descriptors and has no knowledge
  * of command syntax. This process owns line editing, tokenization, built-ins,
- * PATH lookup, and the spawn/wait lifecycle for foreground programs.
+ * PATH lookup, process-group construction, and foreground/background jobs.
  */
 #include <stdbool.h>
 #include <stddef.h>
@@ -19,6 +19,7 @@ enum {
         SHELL_ENVIRONMENT_LIMIT = 16,
         SHELL_ENVIRONMENT_ENTRY_SIZE = 64,
         SHELL_PATH_SIZE = 64,
+        SHELL_JOB_LIMIT = 4,
 };
 
 struct shell_command {
@@ -31,7 +32,18 @@ struct shell_command {
 struct shell_pipeline {
         struct shell_command commands[SHELL_PIPELINE_LIMIT];
         size_t command_count;
+        bool background;
         char storage[SHELL_LINE_SIZE];
+};
+
+struct shell_job {
+        bool used;
+        uint64_t process_group;
+        long children[SHELL_PIPELINE_LIMIT];
+        bool finished[SHELL_PIPELINE_LIMIT];
+        bool stopped[SHELL_PIPELINE_LIMIT];
+        int statuses[SHELL_PIPELINE_LIMIT];
+        size_t child_count;
 };
 
 struct shell_saved_descriptors {
@@ -43,6 +55,8 @@ static char shell_environment_storage[SHELL_ENVIRONMENT_LIMIT]
                                      [SHELL_ENVIRONMENT_ENTRY_SIZE];
 static char *shell_environment[SHELL_ENVIRONMENT_LIMIT + 1U];
 static size_t shell_environment_count;
+static struct shell_job shell_jobs[SHELL_JOB_LIMIT];
+static uint64_t shell_process_group;
 
 static size_t string_length(const char *text) {
         size_t length = 0U;
@@ -274,7 +288,8 @@ static bool shell_read_line(char line[SHELL_LINE_SIZE]) {
 }
 
 static bool shell_is_operator(char character) {
-        return character == '|' || character == '<' || character == '>';
+        return character == '|' || character == '<' || character == '>' ||
+               character == '&';
 }
 
 /* Tokenize words while quotes and escapes are still visible, then build a
@@ -288,6 +303,7 @@ static bool shell_parse_pipeline(const char *line,
                 pipeline->commands[index].output_path = NULL;
         }
         pipeline->command_count = 0U;
+        pipeline->background = false;
 
         const char *source = line;
         char *destination = pipeline->storage;
@@ -307,6 +323,19 @@ static bool shell_parse_pipeline(const char *line,
                 if (shell_is_operator(*source)) {
                         char operator = *source++;
                         saw_token = true;
+
+                        if (operator == '&') {
+                                while (*source == ' ' || *source == '\t') {
+                                        source++;
+                                }
+                                if (*source != '\0' ||
+                                    pending_redirection != '\0' ||
+                                    command->argument_count == 0) {
+                                        return false;
+                                }
+                                pipeline->background = true;
+                                break;
+                        }
 
                         if (operator == '|') {
                                 if (pending_redirection != '\0' ||
@@ -421,6 +450,21 @@ static void print_exit_status(int status) {
         }
 }
 
+static void print_unsigned(uint64_t value) {
+        static const char digits[] = "0123456789";
+        char text[20];
+        size_t length = 0U;
+
+        do {
+                text[length++] = digits[value % 10U];
+                value /= 10U;
+        } while (value != 0U);
+
+        while (length != 0U) {
+                print_character(text[--length]);
+        }
+}
+
 static long spawn_path(const char *path, char **arguments) {
         return rose_spawn(path, arguments, shell_environment);
 }
@@ -482,6 +526,152 @@ static long spawn_command(char **arguments) {
         return -USER_ERROR_NO_ENTRY;
 }
 
+static void shell_job_initialize(struct shell_job *job,
+                                 uint64_t process_group,
+                                 const long *children,
+                                 size_t child_count) {
+        job->used = true;
+        job->process_group = process_group;
+        job->child_count = child_count;
+        for (size_t index = 0U; index < SHELL_PIPELINE_LIMIT; index++) {
+                job->children[index] = index < child_count ? children[index]
+                                                           : 0;
+                job->finished[index] = false;
+                job->stopped[index] = false;
+                job->statuses[index] = 0;
+        }
+}
+
+static bool shell_job_is_complete(const struct shell_job *job) {
+        for (size_t index = 0U; index < job->child_count; index++) {
+                if (!job->finished[index]) {
+                        return false;
+                }
+        }
+        return true;
+}
+
+static bool shell_job_is_stopped(const struct shell_job *job) {
+        bool has_live_child = false;
+
+        for (size_t index = 0U; index < job->child_count; index++) {
+                if (job->finished[index]) {
+                        continue;
+                }
+                has_live_child = true;
+                if (!job->stopped[index]) {
+                        return false;
+                }
+        }
+        return has_live_child;
+}
+
+static void shell_job_record_status(struct shell_job *job, size_t index,
+                                    int status) {
+        job->statuses[index] = status;
+        if (USER_WAIT_STATUS_STOPPED(status)) {
+                job->stopped[index] = true;
+        } else if (USER_WAIT_STATUS_CONTINUED(status)) {
+                job->stopped[index] = false;
+        } else {
+                job->finished[index] = true;
+                job->stopped[index] = false;
+        }
+}
+
+static void shell_job_poll(struct shell_job *job) {
+        uint32_t options = USER_WAIT_NO_HANG | USER_WAIT_UNTRACED |
+                           USER_WAIT_CONTINUED;
+
+        for (size_t index = 0U; index < job->child_count; index++) {
+                while (!job->finished[index]) {
+                        int status = 0;
+                        long waited = rose_waitpid(job->children[index],
+                                                   &status, options);
+                        if (waited == 0) {
+                                break;
+                        }
+                        if (waited < 0) {
+                                job->finished[index] = true;
+                                job->stopped[index] = false;
+                                break;
+                        }
+                        shell_job_record_status(job, index, status);
+                }
+        }
+}
+
+/* Wait until every live member has either exited or reported a stop. */
+static void shell_job_wait(struct shell_job *job) {
+        while (!shell_job_is_complete(job) && !shell_job_is_stopped(job)) {
+                bool waited_for_child = false;
+
+                for (size_t index = 0U; index < job->child_count; index++) {
+                        if (job->finished[index] || job->stopped[index]) {
+                                continue;
+                        }
+
+                        int status = 0;
+                        long waited = rose_waitpid(job->children[index],
+                                                   &status,
+                                                   USER_WAIT_UNTRACED);
+                        if (waited == job->children[index]) {
+                                shell_job_record_status(job, index, status);
+                        } else {
+                                job->finished[index] = true;
+                                job->stopped[index] = false;
+                        }
+                        waited_for_child = true;
+                }
+
+                if (!waited_for_child) {
+                        break;
+                }
+        }
+}
+
+static size_t shell_job_store(const struct shell_job *job) {
+        for (size_t index = 0U; index < SHELL_JOB_LIMIT; index++) {
+                if (!shell_jobs[index].used) {
+                        struct shell_job *destination = &shell_jobs[index];
+                        destination->used = job->used;
+                        destination->process_group = job->process_group;
+                        destination->child_count = job->child_count;
+                        for (size_t child = 0U;
+                             child < SHELL_PIPELINE_LIMIT; child++) {
+                                destination->children[child] =
+                                    job->children[child];
+                                destination->finished[child] =
+                                    job->finished[child];
+                                destination->stopped[child] =
+                                    job->stopped[child];
+                                destination->statuses[child] =
+                                    job->statuses[child];
+                        }
+                        return index + 1U;
+                }
+        }
+        return 0U;
+}
+
+static void shell_print_job(size_t identifier, const char *state,
+                            uint64_t process_group) {
+        print("[");
+        print_unsigned(identifier);
+        print("] ");
+        print(state);
+        print(" ");
+        print_unsigned(process_group);
+        print("\n");
+}
+
+static void shell_restore_foreground(void) {
+        if (rose_tcsetpgrp(USER_STDIN_FILENO,
+                          (int64_t)shell_process_group) < 0) {
+                print("sh: unable to reclaim the console\n");
+        }
+}
+
 static int run_foreground(char **arguments, bool report_status) {
         long child = spawn_command(arguments);
 
@@ -492,26 +682,147 @@ static int run_foreground(char **arguments, bool report_status) {
                 return 127;
         }
 
-        int status = 0;
-        long waited = rose_waitpid(child, &status, 0U);
-        if (waited != child) {
-                print("sh: wait failed\n");
+        if (rose_setpgid(child, child) < 0 ||
+            rose_tcsetpgrp(USER_STDIN_FILENO, child) < 0) {
+                (void)rose_kill(child, USER_SIGNAL_KILL);
+                (void)rose_waitpid(child, NULL, 0U);
+                print("sh: unable to foreground command\n");
                 return 1;
         }
 
+        long children[] = {child};
+        struct shell_job job;
+        shell_job_initialize(&job, (uint64_t)child, children, 1U);
+        shell_job_wait(&job);
+        shell_restore_foreground();
+
+        if (shell_job_is_stopped(&job)) {
+                size_t identifier = shell_job_store(&job);
+                if (identifier != 0U) {
+                        shell_print_job(identifier, "Stopped",
+                                        job.process_group);
+                } else {
+                        (void)rose_kill(-(int64_t)job.process_group,
+                                        USER_SIGNAL_KILL);
+                        job.stopped[0] = false;
+                        shell_job_wait(&job);
+                }
+                return 128 + USER_SIGNAL_TERMINAL_STOP;
+        }
+
+        int status = job.statuses[0];
+
         if (report_status) {
                 print("Process exited with status ");
-                print_exit_status(status);
+                if (USER_WAIT_STATUS_EXITED(status)) {
+                        print_exit_status(status);
+                } else {
+                        print_unsigned(128U +
+                            USER_WAIT_STATUS_TERMINATION_SIGNAL(status));
+                }
                 print("\n");
         }
 
-        return (int)USER_WAIT_STATUS_EXIT_CODE(status);
+        return USER_WAIT_STATUS_EXITED(status)
+                   ? (int)USER_WAIT_STATUS_EXIT_CODE(status)
+                   : 128 +
+                         (int)USER_WAIT_STATUS_TERMINATION_SIGNAL(status);
 }
 
 static void shell_help(void) {
-        print("Built-ins: cd pwd echo env setenv unsetenv clear help exit\n");
+        print("Built-ins: cd pwd echo env setenv unsetenv jobs fg clear help exit\n");
         print("Commands: ls cat echo pwd env mkdir rm\n");
-        print("Syntax: command [ARG...] [< FILE] [> FILE] [| command...]\n");
+        print("Syntax: command [ARG...] [< FILE] [> FILE] [| command...] [&]\n");
+}
+
+static void shell_list_jobs(void) {
+        bool found = false;
+
+        for (size_t index = 0U; index < SHELL_JOB_LIMIT; index++) {
+                struct shell_job *job = &shell_jobs[index];
+                if (!job->used) {
+                        continue;
+                }
+                found = true;
+                shell_job_poll(job);
+                if (shell_job_is_complete(job)) {
+                        shell_print_job(index + 1U, "Done",
+                                        job->process_group);
+                        job->used = false;
+                } else if (shell_job_is_stopped(job)) {
+                        shell_print_job(index + 1U, "Stopped",
+                                        job->process_group);
+                } else {
+                        shell_print_job(index + 1U, "Running",
+                                        job->process_group);
+                }
+        }
+        if (!found) {
+                print("No jobs\n");
+        }
+}
+
+static size_t shell_parse_job_identifier(const char *text) {
+        if (*text == '%') {
+                text++;
+        }
+        if (*text < '0' || *text > '9') {
+                return 0U;
+        }
+
+        size_t value = 0U;
+        while (*text >= '0' && *text <= '9') {
+                value = value * 10U + (size_t)(*text - '0');
+                text++;
+        }
+        return *text == '\0' ? value : 0U;
+}
+
+static void shell_foreground_job(int count, char **arguments) {
+        if (count != 2) {
+                print("Usage: fg JOB\n");
+                return;
+        }
+
+        size_t identifier = shell_parse_job_identifier(arguments[1]);
+        if (identifier == 0U || identifier > SHELL_JOB_LIMIT ||
+            !shell_jobs[identifier - 1U].used) {
+                print("fg: no such job\n");
+                return;
+        }
+
+        struct shell_job *job = &shell_jobs[identifier - 1U];
+        shell_job_poll(job);
+        if (shell_job_is_complete(job)) {
+                shell_print_job(identifier, "Done", job->process_group);
+                job->used = false;
+                return;
+        }
+        if (rose_tcsetpgrp(USER_STDIN_FILENO,
+                          (int64_t)job->process_group) < 0) {
+                print("fg: unable to foreground job\n");
+                return;
+        }
+
+        for (size_t index = 0U; index < job->child_count; index++) {
+                if (!job->finished[index]) {
+                        job->stopped[index] = false;
+                }
+        }
+        if (rose_kill(-(int64_t)job->process_group,
+                      USER_SIGNAL_CONTINUE) < 0) {
+                shell_restore_foreground();
+                print("fg: unable to continue job\n");
+                return;
+        }
+
+        shell_job_wait(job);
+        shell_restore_foreground();
+        if (shell_job_is_complete(job)) {
+                job->used = false;
+        } else if (shell_job_is_stopped(job)) {
+                shell_print_job(identifier, "Stopped", job->process_group);
+        }
 }
 
 static bool shell_is_builtin(const char *name) {
@@ -519,7 +830,8 @@ static bool shell_is_builtin(const char *name) {
                strings_equal(name, "echo") || strings_equal(name, "clear") ||
                strings_equal(name, "pwd") || strings_equal(name, "cd") ||
                strings_equal(name, "env") || strings_equal(name, "setenv") ||
-               strings_equal(name, "unsetenv") || strings_equal(name, "run");
+               strings_equal(name, "unsetenv") || strings_equal(name, "jobs") ||
+               strings_equal(name, "fg") || strings_equal(name, "run");
 }
 
 static bool shell_execute_builtin(int count, char **arguments,
@@ -597,6 +909,18 @@ static bool shell_execute_builtin(int count, char **arguments,
                 } else {
                         environment_unset(arguments[1]);
                 }
+                return true;
+        }
+        if (strings_equal(arguments[0], "jobs")) {
+                if (count != 1) {
+                        print("Usage: jobs\n");
+                } else {
+                        shell_list_jobs();
+                }
+                return true;
+        }
+        if (strings_equal(arguments[0], "fg")) {
+                shell_foreground_job(count, arguments);
                 return true;
         }
 
@@ -703,6 +1027,7 @@ static int shell_run_pipeline(struct shell_pipeline *pipeline) {
 
         long children[SHELL_PIPELINE_LIMIT];
         size_t child_count = 0U;
+        uint64_t process_group = 0U;
         int previous_read = -1;
         int result_status = 0;
 
@@ -773,6 +1098,20 @@ static int shell_run_pipeline(struct shell_pipeline *pipeline) {
                         break;
                 }
 
+                if (process_group == 0U) {
+                        process_group = (uint64_t)child;
+                }
+                if (rose_setpgid(child, (int64_t)process_group) < 0) {
+                        (void)rose_kill(child, USER_SIGNAL_KILL);
+                        (void)rose_waitpid(child, NULL, 0U);
+                        print("sh: unable to create process group\n");
+                        if (next_read >= 0) {
+                                (void)rose_close(next_read);
+                        }
+                        result_status = 1;
+                        break;
+                }
+
                 children[child_count++] = child;
                 previous_read = next_read;
         }
@@ -785,15 +1124,59 @@ static int shell_run_pipeline(struct shell_pipeline *pipeline) {
         }
         shell_release_standard_descriptors(&saved);
 
-        for (size_t index = 0U; index < child_count; index++) {
-                int status = 0;
-                if (rose_waitpid(children[index], &status, 0U) !=
-                    children[index]) {
-                        result_status = 1;
-                } else if (index + 1U == child_count && result_status == 0) {
-                        result_status =
-                            (int)USER_WAIT_STATUS_EXIT_CODE(status);
+        if (child_count == 0U) {
+                return result_status;
+        }
+
+        struct shell_job job;
+        shell_job_initialize(&job, process_group, children, child_count);
+        if (pipeline->background) {
+                size_t identifier = shell_job_store(&job);
+                if (identifier == 0U) {
+                        print("sh: job table is full\n");
+                        (void)rose_kill(-(int64_t)process_group,
+                                        USER_SIGNAL_KILL);
+                        shell_job_wait(&job);
+                        return 1;
                 }
+                shell_print_job(identifier, "Running", process_group);
+                return result_status;
+        }
+
+        if (rose_tcsetpgrp(USER_STDIN_FILENO,
+                          (int64_t)process_group) < 0) {
+                print("sh: unable to foreground pipeline\n");
+                (void)rose_kill(-(int64_t)process_group,
+                                USER_SIGNAL_KILL);
+        }
+        shell_job_wait(&job);
+        shell_restore_foreground();
+
+        if (shell_job_is_stopped(&job)) {
+                size_t identifier = shell_job_store(&job);
+                if (identifier != 0U) {
+                        shell_print_job(identifier, "Stopped",
+                                        process_group);
+                } else {
+                        print("sh: job table is full\n");
+                        (void)rose_kill(-(int64_t)process_group,
+                                        USER_SIGNAL_KILL);
+                        for (size_t index = 0U; index < job.child_count;
+                             index++) {
+                                job.stopped[index] = false;
+                        }
+                        shell_job_wait(&job);
+                }
+                return 128 + USER_SIGNAL_TERMINAL_STOP;
+        }
+
+        if (result_status == 0) {
+                int status = job.statuses[child_count - 1U];
+                result_status = USER_WAIT_STATUS_EXITED(status)
+                                    ? (int)USER_WAIT_STATUS_EXIT_CODE(status)
+                                    : 128 +
+                                          (int)USER_WAIT_STATUS_TERMINATION_SIGNAL(
+                                              status);
         }
         return result_status;
 }
@@ -806,6 +1189,10 @@ static bool shell_execute(struct shell_pipeline *pipeline) {
         struct shell_command *command = &pipeline->commands[0];
         if (pipeline->command_count == 1U &&
             shell_is_builtin(command->arguments[0])) {
+                if (pipeline->background) {
+                        print("sh: built-ins cannot run in the background\n");
+                        return true;
+                }
                 struct shell_saved_descriptors saved;
                 if (!shell_save_standard_descriptors(&saved)) {
                         print("sh: unable to save standard descriptors\n");
@@ -844,8 +1231,56 @@ static bool shell_execute(struct shell_pipeline *pipeline) {
         return true;
 }
 
+static void shell_initialize_job_control(void) {
+        long pid = rose_getpid();
+        if (pid <= 0 || rose_setpgid(0, 0) < 0) {
+                print("sh: unable to create shell process group\n");
+                return;
+        }
+        long process_group = rose_getpgrp();
+        if (process_group <= 0) {
+                print("sh: unable to read shell process group\n");
+                return;
+        }
+        shell_process_group = (uint64_t)process_group;
+        if (rose_tcsetpgrp(USER_STDIN_FILENO,
+                          (int64_t)shell_process_group) < 0) {
+                print("sh: unable to claim the console\n");
+        }
+
+        const struct user_signal_action ignored = {
+            .handler = USER_SIGNAL_IGNORE,
+            .flags = 0U,
+        };
+        (void)rose_sigaction(USER_SIGNAL_INTERRUPT, &ignored, NULL);
+        (void)rose_sigaction(USER_SIGNAL_TERMINAL_STOP, &ignored, NULL);
+        (void)rose_sigaction(USER_SIGNAL_BACKGROUND_READ, &ignored, NULL);
+}
+
+static void shell_terminate_jobs(void) {
+        for (size_t index = 0U; index < SHELL_JOB_LIMIT; index++) {
+                struct shell_job *job = &shell_jobs[index];
+                if (!job->used) {
+                        continue;
+                }
+
+                shell_job_poll(job);
+                if (!shell_job_is_complete(job)) {
+                        for (size_t child = 0U; child < job->child_count;
+                             child++) {
+                                job->stopped[child] = false;
+                        }
+                        (void)rose_kill(-(int64_t)job->process_group,
+                                        USER_SIGNAL_KILL);
+                        shell_job_wait(job);
+                }
+                job->used = false;
+        }
+}
+
 int rose_shell_main(char **environment) { // NOLINT(misc-use-internal-linkage)
         environment_initialize(environment);
+        shell_initialize_job_control();
         print("ROSE userspace shell\n");
 
         while (true) {
@@ -854,6 +1289,7 @@ int rose_shell_main(char **environment) { // NOLINT(misc-use-internal-linkage)
 
                 if (!shell_read_line(line)) {
                         print("Shutting down...\n");
+                        shell_terminate_jobs();
                         return 0;
                 }
 
@@ -862,6 +1298,7 @@ int rose_shell_main(char **environment) { // NOLINT(misc-use-internal-linkage)
                         continue;
                 }
                 if (!shell_execute(&pipeline)) {
+                        shell_terminate_jobs();
                         return 0;
                 }
         }

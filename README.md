@@ -42,7 +42,8 @@ scheduling, and automated emulator tests.
 - U-mode C runtime with descriptor I/O, `open`, `close`, `stat`, `fstat`,
   `lseek`, `dup`, `dup2`, directory iteration, `mkdir`, `unlink`, `chdir`,
   `getcwd`, `pipe`, descriptor flags, `fork`, `spawn`, `execve`, `getpid`,
-  `waitpid`, `sigaction`, `kill`, `brk`, `exit`, and `yield`
+  `waitpid`, `sigaction`, `kill`, process-group and console foreground-group
+  control, `brk`, `exit`, and `yield`
   system calls. Relative paths resolve from a canonical per-process working
   directory. `brk` provides a private, zero-filled, growable userspace heap
   between the ELF image and stack guard; shrinking or process teardown returns
@@ -53,8 +54,8 @@ scheduling, and automated emulator tests.
   and preserves shared open-file descriptions and descriptor flags. `spawn`
   creates a child with copied arguments,
   environment, working directory, and inheritable descriptors; `waitpid`
-  supports a specific child or any child, signal termination status, and
-  optional nonblocking polling.
+  supports PID and process-group selectors, exit/signal/stop/continue status,
+  and optional nonblocking polling.
   Programs start with conventional `argc`, `argv`, and `envp` values copied to
   their private stack.
   UART reads and writes block on scheduler wait channels and resume from device
@@ -62,14 +63,18 @@ scheduling, and automated emulator tests.
 - Process-directed signals with default termination, ignore, and caught
   dispositions. Caught handlers return through a runtime trampoline and a
   kernel-held register frame, preventing `sigreturn` from forging privileged
-  state. `SIGKILL` remains uncatchable, delivery wakes blocked targets,
-  dispositions are inherited by `fork`, and caught handlers reset on `execve`.
+  state. `SIGKILL` and `SIGSTOP` remain uncatchable, delivery wakes blocked
+  targets, process-group delivery supports terminal jobs, and stop/continue
+  transitions are retained for `waitpid`. Dispositions are inherited by
+  `fork`, and caught handlers reset on `execve`. The UART maps Ctrl-C and Ctrl-Z
+  to the foreground process group; background console reads stop with
+  `SIGTTIN`.
 - Interactive `/bin/sh` process with console line editing, quoted and escaped
   argument parsing, mutable environment variables, `PATH` lookup, working
-  directory built-ins, `<` and truncating `>` redirection, and foreground
-  pipelines of up to six commands. Practical `/bin` utilities include `ls`,
-  `cat`, `echo`, `pwd`, `env`, `mkdir`, and `rm`. Command syntax and dispatch do
-  not run in supervisor mode.
+  directory built-ins, `<` and truncating `>` redirection, foreground and `&`
+  background pipelines of up to six commands, and `jobs`/`fg` job management.
+  Practical `/bin` utilities include `ls`, `cat`, `echo`, `pwd`, `env`,
+  `mkdir`, and `rm`. Command syntax and dispatch do not run in supervisor mode.
 - Eight-slot round-robin process scheduler with timer preemption, guarded user
   stacks, per-process kernel trap stacks, process creation, termination,
   parent/child ownership, orphan adoption by PID 0, waiting, reaping, typed
@@ -180,8 +185,9 @@ shared descriptor offsets across aliases and processes, close-on-exec
 inheritance, userspace heap growth and shrinkage, eager `fork` address-space
 isolation, caught/ignored/default signal delivery, signal wakeup of blocked
 processes, fork inheritance and exec reset of dispositions, blocking UART and
-pipe I/O, child creation and waiting, memory reclamation, fallback-ramfs shell
-boot, and clean shutdown.
+pipe I/O, process-group signal delivery, stop/continue wait events, Ctrl-C and
+Ctrl-Z foreground handling, background commands, `jobs`/`fg`, child creation
+and waiting, memory reclamation, fallback-ramfs shell boot, and clean shutdown.
 
 For source-level debugging, use `make debug` in one terminal and `make gdb` in
 another. `make disassemble` writes an annotated disassembly to
@@ -203,26 +209,27 @@ another. `make disassemble` writes an annotated disassembly to
 6. Traps switch from the untrusted user stack to the process kernel stack.
    Syscalls, faults, yields, and timer ticks may update the saved trap frame.
 7. `/bin/sh` reads and edits console input, parses commands and redirections,
-   handles built-ins, or connects `PATH`-resolved children into a pipeline and
-   waits for them. Blocking console I/O, pipe I/O, and `waitpid` retain their
-   `ecall` and resume through a fresh trap after their wait channel is woken. If
-   every process is blocked, the kernel scheduler waits in supervisor mode with
-   `wfi`.
+   handles built-ins, or connects `PATH`-resolved children into a process-group
+   pipeline. It gives foreground jobs the console, retains stopped/background
+   jobs, and reclaims the console before prompting. Blocking console I/O, pipe
+   I/O, and `waitpid` retain their `ecall` and resume through a fresh trap after
+   their wait channel is woken. If every runnable process is blocked or
+   stopped, the kernel scheduler waits in supervisor mode with `wfi`.
 8. Exiting `/bin/sh` wakes `/sbin/init`, which reaps the shell and exits. The
    kernel then verifies that all user-owned pages were reclaimed and requests
    SBI system shutdown. The fallback shell returns to the kernel directly.
 
 ## Deliberate limitations
 
-ROSE currently targets one hart and one QEMU `virt` platform. The shell runs
-one foreground pipeline at a time and has no append redirection, descriptor
-number syntax, expansion, job control, or scripting language. The ext2
+ROSE currently targets one hart and one QEMU `virt` platform. The shell has no
+append redirection, descriptor number syntax, expansion, `bg` command, session
+management, or scripting language. The ext2
 implementation is synchronous,
 write-through, limited to one block group and twelve direct blocks per inode
 (12 KiB files), and does not yet provide journaling or crash recovery. The
 VirtIO queue is polled synchronously; it is not yet connected to a scheduler
 completion channel. `fork` currently copies pages eagerly rather than using
-copy-on-write. Signals do not yet have masks, alternate stacks, process-group
-delivery, stop/continue behavior, or realtime queues. There are no
+copy-on-write. Signals do not yet have masks, alternate stacks, sessions,
+or realtime queues. There are no
 general-purpose kernel threads, ASIDs, networking, users, or permissions
 enforcement.

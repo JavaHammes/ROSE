@@ -55,6 +55,7 @@ enum process_state {
         PROCESS_READY,
         PROCESS_RUNNING,
         PROCESS_BLOCKED,
+        PROCESS_STOPPED,
         PROCESS_EXITED,
 };
 
@@ -123,6 +124,7 @@ struct process {
         /* Scheduler-visible identity and saved execution state. */
         uint64_t pid;
         uint64_t parent_pid;
+        uint64_t process_group;
         enum process_state state;
         struct trap_frame context;
         /* Resources below remain owned until process_release_resources. */
@@ -134,6 +136,9 @@ struct process {
         uintptr_t heap_break;
         uint64_t exit_status;
         uint32_t termination_signal;
+        uint32_t stop_signal;
+        bool stop_event;
+        bool continued_event;
         bool exit_reported;
         char current_directory[USER_PATH_MAX];
         struct process_descriptor descriptors[PROCESS_DESCRIPTOR_LIMIT];
@@ -182,6 +187,7 @@ static struct process_open_file open_file_table[PROCESS_OPEN_FILE_LIMIT];
 static struct process *active_process;
 static struct process *uart_write_owner;
 static uint64_t next_pid = 1U;
+static uint64_t terminal_foreground_process_group;
 static uint64_t scheduler_preemptions;
 static uint64_t scheduler_context_switches;
 static uint64_t scheduler_blocks;
@@ -764,6 +770,9 @@ static uint64_t process_create(struct process *process, const char *path,
         bytes_zero(process, sizeof(*process));
         process->pid = next_pid;
         process->parent_pid = parent_pid;
+        process->process_group = descriptor_source == NULL
+                                     ? process->pid
+                                     : descriptor_source->process_group;
         process->state = PROCESS_READY;
         /* SPIE causes sret to enable supervisor interrupts while U-mode runs. */
         process->context.sstatus = SSTATUS_SPIE;
@@ -780,6 +789,9 @@ static uint64_t process_create(struct process *process, const char *path,
         next_pid++;
         if (next_pid == 0U) {
                 next_pid = 1U;
+        }
+        if (terminal_foreground_process_group == 0U) {
+                terminal_foreground_process_group = process->process_group;
         }
 
         process->address_space = virtual_memory_create_address_space();
@@ -928,6 +940,7 @@ static uint64_t syscall_fork(const struct trap_frame *frame) {
 
         bytes_zero(child, sizeof(*child));
         child->parent_pid = parent->pid;
+        child->process_group = parent->process_group;
         child->exit_status = UINT64_MAX;
         child->heap_start = parent->heap_start;
         child->heap_break = parent->heap_start;
@@ -1099,6 +1112,72 @@ static struct process *process_find_pid(uint64_t pid) {
         return NULL;
 }
 
+static bool process_group_exists(uint64_t process_group) {
+        if (process_group == 0U) {
+                return false;
+        }
+
+        for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
+                const struct process *process = &process_table[index];
+
+                /* A zombie retains its PID and process-group identity until
+                 * waitpid reaps it; later pipeline members may still join. */
+                if (process->state != PROCESS_UNUSED &&
+                    process->process_group == process_group) {
+                        return true;
+                }
+        }
+
+        return false;
+}
+
+static bool process_signal_stops_by_default(uint32_t signal) {
+        return signal == USER_SIGNAL_STOP ||
+               signal == USER_SIGNAL_TERMINAL_STOP ||
+               signal == USER_SIGNAL_BACKGROUND_READ;
+}
+
+/* Queueing SIGCONT changes scheduler state immediately; its disposition is
+ * still delivered later. SIGKILL likewise makes a stopped process runnable so
+ * the normal trusted return boundary can terminate it. */
+static void process_queue_signal(struct process *target, uint32_t signal) {
+        if (signal == USER_SIGNAL_CONTINUE) {
+                target->pending_signals &=
+                    ~(signal_bit(USER_SIGNAL_STOP) |
+                      signal_bit(USER_SIGNAL_TERMINAL_STOP) |
+                      signal_bit(USER_SIGNAL_BACKGROUND_READ));
+                if (target->state == PROCESS_STOPPED) {
+                        target->state = PROCESS_READY;
+                        target->continued_event = true;
+                        (void)scheduler_wake_all(SCHEDULER_WAIT_CHILD);
+                }
+        } else if (process_signal_stops_by_default(signal)) {
+                target->pending_signals &=
+                    ~signal_bit(USER_SIGNAL_CONTINUE);
+        }
+
+        target->pending_signals |= signal_bit(signal);
+        if (target->state == PROCESS_BLOCKED ||
+            (target->state == PROCESS_STOPPED &&
+             signal == USER_SIGNAL_KILL)) {
+                target->state = PROCESS_READY;
+                target->wait_channel = SCHEDULER_WAIT_NONE;
+        }
+}
+
+static bool process_has_deliverable_signal(const struct process *process) {
+        if (process->pending_signals == 0U) {
+                return false;
+        }
+        if (!process->signal_active) {
+                return true;
+        }
+
+        return (process->pending_signals &
+                (signal_bit(USER_SIGNAL_KILL) |
+                 signal_bit(USER_SIGNAL_STOP))) != 0U;
+}
+
 static uint64_t syscall_signal_action(
     int64_t signal, uintptr_t user_action, uintptr_t user_old_action,
     uintptr_t user_restorer) {
@@ -1116,7 +1195,8 @@ static uint64_t syscall_signal_action(
                 user_copy_from((uint8_t *)&new_action, user_action,
                                sizeof(new_action));
 
-                if (signal == USER_SIGNAL_KILL || new_action.flags != 0U) {
+                if (signal == USER_SIGNAL_KILL ||
+                    signal == USER_SIGNAL_STOP || new_action.flags != 0U) {
                         return (uint64_t)-(int64_t)
                             USER_ERROR_INVALID_ARGUMENT;
                 }
@@ -1162,25 +1242,132 @@ static uint64_t syscall_signal_action(
 }
 
 static uint64_t syscall_kill(int64_t pid, int64_t signal) {
-        if (pid <= 0 || signal < 0 || signal > USER_SIGNAL_MAX) {
+        if (signal < 0 || signal > USER_SIGNAL_MAX || pid == INT64_MIN) {
                 return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
         }
 
-        struct process *target = process_find_pid((uint64_t)pid);
+        bool matched = false;
+        uint64_t selected_group = pid == 0
+                                      ? active_process->process_group
+                                      : pid < -1 ? (uint64_t)-pid : 0U;
+
+        for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
+                struct process *target = &process_table[index];
+                bool selected = false;
+
+                if (target->state == PROCESS_UNUSED ||
+                    target->state == PROCESS_EXITED) {
+                        continue;
+                }
+                if (pid > 0) {
+                        selected = target->pid == (uint64_t)pid;
+                } else if (pid == -1) {
+                        selected = true;
+                } else {
+                        selected = target->process_group == selected_group;
+                }
+                if (!selected) {
+                        continue;
+                }
+
+                matched = true;
+                if (signal != 0) {
+                        process_queue_signal(target, (uint32_t)signal);
+                }
+        }
+
+        return matched ? 0U
+                       : (uint64_t)-(int64_t)USER_ERROR_NO_PROCESS;
+}
+
+static uint64_t syscall_set_process_group(int64_t pid,
+                                          int64_t process_group) {
+        if (pid < 0 || process_group < 0) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+
+        struct process *target = pid == 0
+                                     ? active_process
+                                     : process_find_pid((uint64_t)pid);
         if (target == NULL) {
                 return (uint64_t)-(int64_t)USER_ERROR_NO_PROCESS;
         }
-        if (signal == 0) {
-                return 0U;
+        if (target != active_process &&
+            target->parent_pid != active_process->pid) {
+                return (uint64_t)-(int64_t)USER_ERROR_PERMISSION;
         }
 
-        target->pending_signals |= signal_bit((uint32_t)signal);
-        if (target->state == PROCESS_BLOCKED) {
-                target->state = PROCESS_READY;
-                target->wait_channel = SCHEDULER_WAIT_NONE;
+        uint64_t requested_group = process_group == 0
+                                       ? target->pid
+                                       : (uint64_t)process_group;
+        if (requested_group != target->pid &&
+            !process_group_exists(requested_group)) {
+                return (uint64_t)-(int64_t)USER_ERROR_PERMISSION;
         }
 
+        target->process_group = requested_group;
         return 0U;
+}
+
+static bool process_descriptor_is_console(uint64_t descriptor) {
+        if (descriptor >= PROCESS_DESCRIPTOR_LIMIT) {
+                return false;
+        }
+
+        const struct process_open_file *open_file =
+            active_process->descriptors[(size_t)descriptor].open_file;
+        return open_file != NULL &&
+               open_file->file.type == VFS_NODE_CHARACTER_DEVICE &&
+               open_file->file.device == VFS_DEVICE_CONSOLE;
+}
+
+static uint64_t syscall_terminal_set_foreground_group(
+    uint64_t descriptor, int64_t process_group) {
+        if (!process_descriptor_is_console(descriptor)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        if (process_group <= 0 ||
+            !process_group_exists((uint64_t)process_group)) {
+                return (uint64_t)-(int64_t)USER_ERROR_NO_PROCESS;
+        }
+        terminal_foreground_process_group = (uint64_t)process_group;
+        return 0U;
+}
+
+static uint64_t syscall_terminal_get_foreground_group(uint64_t descriptor) {
+        if (!process_descriptor_is_console(descriptor)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+
+        return terminal_foreground_process_group;
+}
+
+bool user_process_handle_console_control(char character) {
+        uint32_t signal;
+
+        if (character == '\x03') {
+                signal = USER_SIGNAL_INTERRUPT;
+        } else if (character == '\x1a') {
+                signal = USER_SIGNAL_TERMINAL_STOP;
+        } else {
+                return false;
+        }
+
+        bool matched = false;
+        for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
+                struct process *target = &process_table[index];
+
+                if (target->state == PROCESS_UNUSED ||
+                    target->state == PROCESS_EXITED ||
+                    target->process_group !=
+                        terminal_foreground_process_group) {
+                        continue;
+                }
+                process_queue_signal(target, signal);
+                matched = true;
+        }
+
+        return matched;
 }
 
 /* The interrupted frame never enters userspace, so sigreturn cannot forge
@@ -1633,16 +1820,31 @@ static bool process_is_waitable_child(const struct process *process,
                 return false;
         }
 
-        return requested_pid == -1 ||
-               process->pid == (uint64_t)requested_pid;
+        if (requested_pid > 0) {
+                return process->pid == (uint64_t)requested_pid;
+        }
+        if (requested_pid == -1) {
+                return true;
+        }
+        if (requested_pid == 0) {
+                return process->process_group ==
+                       active_process->process_group;
+        }
+
+        return requested_pid != INT64_MIN &&
+               process->process_group == (uint64_t)-requested_pid;
 }
 
 /* Leave sepc at ECALL while blocking. A child exit wakes the parent, which
  * re-enters this function and atomically consumes the retained zombie status. */
 static void syscall_waitpid(struct trap_frame *frame, int64_t requested_pid,
                             uintptr_t user_status, uint32_t options) {
-        if ((options & ~(uint32_t)USER_WAIT_NO_HANG) != 0U ||
-            requested_pid == 0 || requested_pid < -1) {
+        const uint32_t supported_options =
+            (uint32_t)USER_WAIT_NO_HANG |
+            (uint32_t)USER_WAIT_UNTRACED |
+            (uint32_t)USER_WAIT_CONTINUED;
+        if ((options & ~supported_options) != 0U ||
+            requested_pid == INT64_MIN) {
                 frame->a0 =
                     (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
                 frame->sepc += 4U;
@@ -1658,7 +1860,14 @@ static void syscall_waitpid(struct trap_frame *frame, int64_t requested_pid,
                 }
                 found_child = true;
 
-                if (child->state != PROCESS_EXITED) {
+                bool exited = child->state == PROCESS_EXITED;
+                bool stopped = child->stop_event &&
+                               (options &
+                                (uint32_t)USER_WAIT_UNTRACED) != 0U;
+                bool continued = child->continued_event &&
+                                 (options &
+                                  (uint32_t)USER_WAIT_CONTINUED) != 0U;
+                if (!exited && !stopped && !continued) {
                         continue;
                 }
                 if (user_status != 0U &&
@@ -1671,19 +1880,38 @@ static void syscall_waitpid(struct trap_frame *frame, int64_t requested_pid,
                 }
 
                 uint64_t child_pid = child->pid;
-                int wait_status = child->termination_signal != 0U
-                                      ? (int)(child->termination_signal & 0x7fU)
-                                      : (int)((child->exit_status &
-                                               UINT64_C(0xff))
-                                              << 8U);
+                int wait_status;
+                if (exited) {
+                        wait_status = child->termination_signal != 0U
+                                          ? (int)(child->termination_signal &
+                                                  0x7fU)
+                                          : (int)((child->exit_status &
+                                                   UINT64_C(0xff))
+                                                  << 8U);
+                } else if (stopped) {
+                        wait_status =
+                            (int)((child->stop_signal & 0xffU) << 8U) |
+                            0x7f;
+                } else {
+                        wait_status = 0xffff;
+                }
 
                 if (user_status != 0U) {
                         user_copy_to(user_status,
                                      (const uint8_t *)&wait_status,
                                      sizeof(wait_status));
                 }
-                process_release_resources(child);
-                bytes_zero(child, sizeof(*child));
+                if (exited) {
+                        process_release_resources(child);
+                        bytes_zero(child, sizeof(*child));
+                } else if (stopped) {
+                        child->stop_event = false;
+                        if (child->state != PROCESS_STOPPED) {
+                                child->stop_signal = 0U;
+                        }
+                } else {
+                        child->continued_event = false;
+                }
                 frame->a0 = child_pid;
                 frame->sepc += 4U;
                 return;
@@ -1913,6 +2141,11 @@ static uint64_t syscall_read_begin(uint64_t descriptor,
         active_process->read_descriptor = (size_t)descriptor;
         active_process->read_buffer = user_buffer;
         active_process->read_length = length;
+        if (open_file->file.device == VFS_DEVICE_CONSOLE &&
+            active_process->process_group !=
+                terminal_foreground_process_group) {
+                (void)syscall_kill(0, USER_SIGNAL_BACKGROUND_READ);
+        }
         return 0U;
 }
 
@@ -2617,6 +2850,39 @@ static void user_process_finish(struct trap_frame *frame, uint64_t status) {
         scheduler_return_to_kernel(frame);
 }
 
+/* Preserve the complete interrupted frame without releasing resources. A
+ * parent waiting with WUNTRACED observes the retained stop event, and SIGCONT
+ * later moves this same process back to READY. */
+static void process_stop_current(struct trap_frame *frame, uint32_t signal) {
+        if (active_process == NULL ||
+            active_process->state != PROCESS_RUNNING ||
+            user_saved_kernel_context_sp == 0U) {
+                panic_trap("Invalid user process stop state", frame);
+        }
+
+        struct process *stopped = active_process;
+        if (uart_write_owner == stopped) {
+                uart_write_owner = NULL;
+                (void)scheduler_wake_all(SCHEDULER_WAIT_UART_TX);
+        }
+        trap_frame_copy(&stopped->context, frame);
+        stopped->state = PROCESS_STOPPED;
+        stopped->wait_channel = SCHEDULER_WAIT_NONE;
+        stopped->stop_signal = signal;
+        stopped->stop_event = true;
+        stopped->continued_event = false;
+        (void)scheduler_wake_all(SCHEDULER_WAIT_CHILD);
+
+        struct process *next = scheduler_find_next_ready();
+        if (next != NULL) {
+                scheduler_context_switches++;
+                scheduler_switch_to(next, frame);
+                return;
+        }
+
+        scheduler_return_to_kernel(frame);
+}
+
 static uint32_t process_next_pending_signal(const struct process *process) {
         if ((process->pending_signals &
              signal_bit(USER_SIGNAL_KILL)) != 0U) {
@@ -2642,7 +2908,8 @@ static void process_deliver_pending_signals(struct trap_frame *frame) {
 
                 if (signal == 0U ||
                     (process->signal_active &&
-                     signal != USER_SIGNAL_KILL)) {
+                     signal != USER_SIGNAL_KILL &&
+                     signal != USER_SIGNAL_STOP)) {
                         return;
                 }
 
@@ -2651,7 +2918,18 @@ static void process_deliver_pending_signals(struct trap_frame *frame) {
                     &process->signal_dispositions[signal];
 
                 if (disposition->handler == USER_SIGNAL_IGNORE &&
-                    signal != USER_SIGNAL_KILL) {
+                    signal != USER_SIGNAL_KILL &&
+                    signal != USER_SIGNAL_STOP) {
+                        continue;
+                }
+                if (signal == USER_SIGNAL_CONTINUE &&
+                    disposition->handler == USER_SIGNAL_DEFAULT) {
+                        continue;
+                }
+                if (process_signal_stops_by_default(signal) &&
+                    (disposition->handler == USER_SIGNAL_DEFAULT ||
+                     signal == USER_SIGNAL_STOP)) {
+                        process_stop_current(frame, signal);
                         continue;
                 }
                 if (disposition->handler == USER_SIGNAL_DEFAULT ||
@@ -2707,9 +2985,10 @@ static void report_and_release_exited_processes(void) {
         }
 }
 
-static bool scheduler_has_blocked_processes(void) {
+static bool scheduler_has_waiting_processes(void) {
         for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
-                if (process_table[index].state == PROCESS_BLOCKED) {
+                if (process_table[index].state == PROCESS_BLOCKED ||
+                    process_table[index].state == PROCESS_STOPPED) {
                         return true;
                 }
         }
@@ -2779,7 +3058,7 @@ static bool scheduler_run_ready(void) {
                                 scheduler_interrupts_restore(previous_status);
                                 continue;
                         }
-                        if (!scheduler_has_blocked_processes()) {
+                        if (!scheduler_has_waiting_processes()) {
                                 scheduler_interrupts_restore(previous_status);
                                 break;
                         }
@@ -2908,6 +3187,11 @@ void user_process_handle_syscall(struct trap_frame *frame) {
         if (!user_process_is_active()) {
                 panic_trap("U-mode syscall without an active process", frame);
         }
+        /* A blocked syscall resumes at its original ECALL. Deliver the signal
+         * which woke it before its continuation can put it back to sleep. */
+        if (process_has_deliverable_signal(active_process)) {
+                return;
+        }
 
         switch (frame->a7) {
         case USER_SYSCALL_WRITE: {
@@ -2936,6 +3220,9 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                         if (!active_process->pending_read) {
                                 frame->a0 = result;
                                 frame->sepc += 4U;
+                                return;
+                        }
+                        if (process_has_deliverable_signal(active_process)) {
                                 return;
                         }
                 }
@@ -3079,6 +3366,29 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 }
                 return;
         }
+
+        case USER_SYSCALL_SET_PROCESS_GROUP:
+                frame->a0 = syscall_set_process_group(
+                    (int64_t)frame->a0, (int64_t)frame->a1);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_GET_PROCESS_GROUP:
+                frame->a0 = active_process->process_group;
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_TERMINAL_SET_FOREGROUND_GROUP:
+                frame->a0 = syscall_terminal_set_foreground_group(
+                    frame->a0, (int64_t)frame->a1);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_TERMINAL_GET_FOREGROUND_GROUP:
+                frame->a0 =
+                    syscall_terminal_get_foreground_group(frame->a0);
+                frame->sepc += 4U;
+                return;
 
         case USER_SYSCALL_BRK:
                 frame->a0 = syscall_brk((uintptr_t)frame->a0);

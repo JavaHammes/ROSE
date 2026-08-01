@@ -29,4 +29,7 @@ void user_process_handle_syscall(struct trap_frame *frame);
 void user_process_handle_fault(struct trap_frame *frame, uint64_t cause);
 void user_process_prepare_user_return(struct trap_frame *frame);
 
+/* Consume terminal control characters and signal the foreground group. */
+bool user_process_handle_console_control(char character);
+
 #endif

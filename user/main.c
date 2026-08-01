@@ -337,6 +337,8 @@ static int run_syscall_test(void) {
                 -USER_ERROR_INVALID_ARGUMENT ||
             rose_sigaction(USER_SIGNAL_KILL, &signal_action, NULL) !=
                 -USER_ERROR_INVALID_ARGUMENT ||
+            rose_sigaction(USER_SIGNAL_STOP, &signal_action, NULL) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
             rose_sigaction(USER_SIGNAL_USER_1,
                            (const struct user_signal_action *)kernel_address,
                            NULL) != -USER_ERROR_BAD_ADDRESS ||
@@ -347,7 +349,7 @@ static int run_syscall_test(void) {
                            &old_signal_action) != 0 ||
             old_signal_action.handler != USER_SIGNAL_DEFAULT ||
             old_signal_action.flags != 0U ||
-            rose_kill(-1, 0) != -USER_ERROR_INVALID_ARGUMENT ||
+            rose_kill(-1, 0) != 0 ||
             rose_kill(INT64_MAX, 0) != -USER_ERROR_NO_PROCESS ||
             rose_kill(parent_pid, USER_SIGNAL_MAX + 1) !=
                 -USER_ERROR_INVALID_ARGUMENT ||
@@ -452,7 +454,7 @@ static int run_syscall_test(void) {
         char *child_environment[] = {NULL};
 
         if (rose_waitpid(parent_pid, NULL, 0U) != -USER_ERROR_NO_CHILD ||
-            rose_waitpid(-1, NULL, 2U) !=
+            rose_waitpid(-1, NULL, UINT32_C(0x80000000)) !=
                 -USER_ERROR_INVALID_ARGUMENT ||
             rose_spawn("/missing", child_arguments, child_environment) !=
                 -USER_ERROR_NO_ENTRY) {
@@ -482,6 +484,64 @@ static int run_syscall_test(void) {
                 return 32;
         }
 
+        /* Process groups provide group-directed signals and wait selectors.
+         * Stop and continue retain distinct wait events without turning the
+         * child into a zombie. */
+        long process_group = rose_getpgrp();
+        if (process_group <= 0 ||
+            rose_tcgetpgrp(USER_STDIN_FILENO) != process_group ||
+            rose_tcgetpgrp(99) != -USER_ERROR_BAD_FILE_DESCRIPTOR ||
+            rose_tcsetpgrp(USER_STDIN_FILENO, process_group) != 0 ||
+            rose_setpgid(0, 0) != 0 || rose_kill(0, 0) != 0 ||
+            rose_setpgid(0, INT64_MAX) != -USER_ERROR_PERMISSION) {
+                return 70;
+        }
+
+        long stopped_child = rose_fork();
+        if (stopped_child < 0) {
+                return 71;
+        }
+        if (stopped_child == 0) {
+                while (true) {
+                        rose_yield();
+                }
+        }
+        if (rose_setpgid(stopped_child, stopped_child) != 0 ||
+            rose_waitpid(0, NULL, USER_WAIT_NO_HANG) !=
+                -USER_ERROR_NO_CHILD ||
+            rose_kill(-stopped_child, 0) != 0 ||
+            rose_kill(-stopped_child, USER_SIGNAL_STOP) != 0) {
+                (void)rose_kill(stopped_child, USER_SIGNAL_KILL);
+                return 72;
+        }
+
+        int stopped_status = 0;
+        if (rose_waitpid(stopped_child, &stopped_status,
+                         USER_WAIT_UNTRACED) != stopped_child ||
+            !USER_WAIT_STATUS_STOPPED(stopped_status) ||
+            USER_WAIT_STATUS_STOP_SIGNAL(stopped_status) !=
+                USER_SIGNAL_STOP ||
+            rose_waitpid(stopped_child, NULL,
+                         USER_WAIT_NO_HANG | USER_WAIT_UNTRACED) != 0) {
+                (void)rose_kill(stopped_child, USER_SIGNAL_KILL);
+                return 73;
+        }
+        if (rose_kill(-stopped_child, USER_SIGNAL_CONTINUE) != 0 ||
+            rose_waitpid(stopped_child, &stopped_status,
+                         USER_WAIT_CONTINUED) != stopped_child ||
+            !USER_WAIT_STATUS_CONTINUED(stopped_status) ||
+            rose_kill(-stopped_child, USER_SIGNAL_TERMINATE) != 0) {
+                (void)rose_kill(stopped_child, USER_SIGNAL_KILL);
+                return 74;
+        }
+        if (rose_waitpid(stopped_child, &stopped_status, 0U) !=
+                stopped_child ||
+            !USER_WAIT_STATUS_SIGNALED(stopped_status) ||
+            USER_WAIT_STATUS_TERMINATION_SIGNAL(stopped_status) !=
+                USER_SIGNAL_TERMINATE) {
+                return 75;
+        }
+
         descriptor = rose_open("/etc/motd", USER_OPEN_READ);
         char *descriptor_arguments[] = {"/bin/descriptor-test", NULL};
         if (descriptor != 3 ||
@@ -508,6 +568,7 @@ static int run_syscall_test(void) {
         print("Process hierarchy passed\n");
         print("Fork semantics passed\n");
         print("Signal delivery passed\n");
+        print("Job control passed\n");
         print("Descriptor inheritance passed\n");
         print("Userspace heap passed\n");
         print("Syscall validation passed\n");

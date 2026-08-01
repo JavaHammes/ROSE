@@ -194,6 +194,7 @@ def main() -> int:
             "Descriptor inheritance passed",
             "Fork semantics passed",
             "Signal delivery passed",
+            "Job control passed",
             "Process hierarchy passed",
             "Userspace heap passed",
             "Syscall validation passed",
@@ -258,6 +259,35 @@ def main() -> int:
             "Console read: Z",
         )
 
+        interrupted = session.command_with_input(
+            "console-read", b"Console reader waiting\r\n", b"\x03"
+        )
+        require(interrupted, "Console reader waiting", "rose> ")
+
+        stopped = session.command_with_input(
+            "console-read", b"Console reader waiting\r\n", b"\x1a"
+        )
+        require(stopped, "[1] Stopped")
+        require(session.command("jobs"), "[1] Stopped")
+        resumed = session.command_with_input("fg 1", b"fg 1\r\n", b"Y")
+        require(resumed, "Console read: Y")
+        require(session.command("jobs"), "No jobs")
+
+        background = session.command("hello &")
+        require(background, "[1] Running")
+        if "Hello from U-mode C" not in background:
+            session.read_until(b"Hello from U-mode C", 5.0)
+        require(session.command("jobs"), "[1] Done")
+
+        background_reader = session.command("console-read &")
+        require(background_reader, "[1] Running")
+        if "Console reader waiting" not in background_reader:
+            session.read_until(b"Console reader waiting", 5.0)
+        time.sleep(0.05)
+        require(session.command("jobs"), "[1] Stopped")
+        resumed_reader = session.command_with_input("fg 1", b"fg 1\r\n", b"B")
+        require(resumed_reader, "Console read: B")
+
         require(
             session.command("pipe-test"),
             "Pipe communication passed",
@@ -295,6 +325,7 @@ def main() -> int:
             "Descriptor inheritance passed",
             "Fork semantics passed",
             "Signal delivery passed",
+            "Job control passed",
             "Syscall validation passed",
         )
         fallback.shutdown()

@@ -40,6 +40,12 @@ long rose_sigaction(int signal, const struct user_signal_action *action,
                     struct user_signal_action *old_action);
 long rose_kill(int64_t pid, int signal);
 
+/* Process groups and the foreground group attached to the console. */
+long rose_setpgid(int64_t pid, int64_t process_group);
+long rose_getpgrp(void);
+long rose_tcsetpgrp(int descriptor, int64_t process_group);
+long rose_tcgetpgrp(int descriptor);
+
 /* Query or move the process break. Address zero queries without changing it;
  * success returns the resulting break and failure returns a negative error. */
 long rose_brk(uintptr_t address);
