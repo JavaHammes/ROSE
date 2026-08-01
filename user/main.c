@@ -193,6 +193,71 @@ static int run_arguments_environment_test(int argc, char **argv,
         return 0;
 }
 
+static int run_execve_test(void) {
+        char *arguments[] = {"/bin/execve-target", "replacement", NULL};
+        char *environment[] = {"EXECVE_TEST=passed", NULL};
+        char *too_many_arguments[17];
+        const void *kernel_address =
+            (const void *)(uintptr_t)UINT64_C(0x80200000);
+        long descriptor = rose_open("/etc/motd", USER_OPEN_READ);
+        char first_character;
+
+        if (descriptor != 3 ||
+            rose_read((int)descriptor, &first_character, 1U) != 1 ||
+            first_character != 'W') {
+                return 25;
+        }
+
+        for (size_t index = 0U; index < 17U; index++) {
+                too_many_arguments[index] = "x";
+        }
+
+        /* Every failure must return to this unchanged image. */
+        if (rose_execve((const char *)kernel_address, arguments,
+                        environment) != -USER_ERROR_BAD_ADDRESS ||
+            rose_execve("/missing", arguments, environment) !=
+                -USER_ERROR_NO_ENTRY ||
+            rose_execve("/etc/motd", arguments, environment) !=
+                -USER_ERROR_EXEC_FORMAT ||
+            rose_execve("/bin/execve-target",
+                        (char *const *)kernel_address,
+                        environment) != -USER_ERROR_BAD_ADDRESS ||
+            rose_execve("/bin/execve-target", arguments,
+                        (char *const *)kernel_address) !=
+                -USER_ERROR_BAD_ADDRESS ||
+            rose_execve("/bin/execve-target", too_many_arguments,
+                        environment) !=
+                -USER_ERROR_ARGUMENT_LIST_TOO_LONG) {
+                return 26;
+        }
+
+        /* Success cannot return; the target verifies the copied vectors and
+         * the descriptor and offset inherited from this image. */
+        long result =
+            rose_execve("/bin/execve-target", arguments, environment);
+        return result < 0 ? 27 : 28;
+}
+
+static int run_execve_target(int argc, char **argv, char **environment) {
+        const char *test_value =
+            find_environment_value(environment, "EXECVE_TEST");
+        char second_character;
+
+        if (argc != 2 || argv == NULL ||
+            !strings_equal(argv[0], "/bin/execve-target") ||
+            !strings_equal(argv[1], "replacement") || argv[2] != NULL ||
+            environment == NULL || environment[0] == NULL ||
+            environment[1] != NULL || test_value == NULL ||
+            !strings_equal(test_value, "passed") ||
+            rose_read(3, &second_character, 1U) != 1 ||
+            second_character != 'e') {
+                return 29;
+        }
+
+        print("Execve replacement passed\n");
+        return 0;
+}
+
 static int run_filesystem_test(void) {
         struct user_file_status status;
         if (rose_stat("/etc/motd", &status) != 0 ||
@@ -322,6 +387,12 @@ int user_main(int argc, char **argv,
 
         case USER_PROGRAM_ARGUMENTS_ENVIRONMENT:
                 return run_arguments_environment_test(argc, argv, environment);
+
+        case USER_PROGRAM_EXECVE:
+                return run_execve_test();
+
+        case USER_PROGRAM_EXECVE_TARGET:
+                return run_execve_target(argc, argv, environment);
 
         default:
                 return 2;

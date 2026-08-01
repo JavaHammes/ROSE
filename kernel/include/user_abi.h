@@ -15,6 +15,7 @@
 #define USER_SYSCALL_READ_DIRECTORY 9
 #define USER_SYSCALL_MKDIR 10
 #define USER_SYSCALL_UNLINK 11
+#define USER_SYSCALL_EXECVE 12
 
 #else
 
@@ -31,13 +32,17 @@ enum user_syscall_number {
         USER_SYSCALL_READ_DIRECTORY = 9,
         USER_SYSCALL_MKDIR = 10,
         USER_SYSCALL_UNLINK = 11,
+        USER_SYSCALL_EXECVE = 12,
 };
 
 /* Stable negative error values returned in a0 by failed system calls. */
 enum user_syscall_error {
         USER_ERROR_NO_ENTRY = 2,
         USER_ERROR_IO = 5,
+        USER_ERROR_ARGUMENT_LIST_TOO_LONG = 7,
+        USER_ERROR_EXEC_FORMAT = 8,
         USER_ERROR_BAD_FILE_DESCRIPTOR = 9,
+        USER_ERROR_OUT_OF_MEMORY = 12,
         USER_ERROR_PERMISSION = 13,
         USER_ERROR_BAD_ADDRESS = 14,
         USER_ERROR_EXISTS = 17,
@@ -106,6 +111,8 @@ enum user_program {
         USER_PROGRAM_INIT,
         USER_PROGRAM_FS_TEST,
         USER_PROGRAM_ARGUMENTS_ENVIRONMENT,
+        USER_PROGRAM_EXECVE,
+        USER_PROGRAM_EXECVE_TARGET,
 };
 
 #endif

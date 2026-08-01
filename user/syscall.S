@@ -85,6 +85,15 @@ rose_unlink:
     ret
 .size rose_unlink, . - rose_unlink
 
+.globl rose_execve
+.type rose_execve, @function
+rose_execve:
+    /* a0-a2 contain path, argv, and envp. Success starts the new image. */
+    li a7, USER_SYSCALL_EXECVE
+    ecall
+    ret
+.size rose_execve, . - rose_execve
+
 .globl rose_exit
 .type rose_exit, @function
 rose_exit:

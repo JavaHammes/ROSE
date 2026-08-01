@@ -17,6 +17,10 @@ long rose_read_directory(int descriptor, struct user_directory_entry *entry);
 long rose_mkdir(const char *path);
 long rose_unlink(const char *path);
 
+/* Replace the calling process image. Success does not return. */
+long rose_execve(const char *path, char *const arguments[],
+                 char *const environment[]);
+
 /* Terminate the calling process or voluntarily give another process a turn. */
 _Noreturn void rose_exit(uint64_t status);
 void rose_yield(void);

@@ -122,6 +122,16 @@ struct process {
         size_t read_length;
 };
 
+/* A replacement image is constructed here while execve's original image is
+ * still active. The single-hart kernel permits one shared transaction record
+ * and avoids placing ELF ownership metadata on the one-page trap stack. */
+struct process_replacement {
+        struct page_table *address_space;
+        struct elf_loaded_image loaded_image;
+        void *stack_page;
+        struct trap_frame context;
+};
+
 /* Fixed slots keep early process management independent of a kernel heap. */
 static struct process process_table[PROCESS_LIMIT];
 static struct process *active_process;
@@ -131,6 +141,10 @@ static uint64_t scheduler_preemptions;
 static uint64_t scheduler_context_switches;
 static uint64_t scheduler_blocks;
 static uint8_t executable_buffer[PROCESS_EXECUTABLE_MAX];
+static struct process_replacement exec_replacement;
+static char exec_string_buffer[PAGE_SIZE];
+static const char *exec_arguments[PROCESS_ARGUMENT_LIMIT];
+static const char *exec_environment[PROCESS_ENVIRONMENT_LIMIT];
 
 /* Freestanding replacement for clearing process records. */
 static void bytes_zero(void *destination, size_t size) {
@@ -207,6 +221,37 @@ static void verify_user_mapping(const struct page_table *root,
         }
 }
 
+/* Release one user image without touching the process identity, descriptors,
+ * or supervisor trap stack. This is shared by exit and execve rollback. */
+static void process_release_image(
+    struct page_table **address_space, struct elf_loaded_image *loaded_image,
+    void **stack_page) {
+        if (*address_space != NULL) {
+                if (*stack_page != NULL) {
+                        uintptr_t stack_physical_address;
+
+                        if (page_table_translate(*address_space,
+                                                 USER_STACK_ADDRESS,
+                                                 &stack_physical_address,
+                                                 NULL) &&
+                            (stack_physical_address !=
+                                 (uintptr_t)*stack_page ||
+                             !page_table_unmap(*address_space,
+                                               USER_STACK_ADDRESS))) {
+                                panic("User stack ownership mismatch");
+                        }
+                }
+
+                elf_unload_image(*address_space, loaded_image);
+                page_table_destroy(*address_space);
+                *address_space = NULL;
+        }
+        if (*stack_page != NULL) {
+                page_free(*stack_page);
+                *stack_page = NULL;
+        }
+}
+
 /*
  * Release every physical resource owned by a process, but preserve PID, state,
  * and exit status for ps. Descriptors close first, the user stack is verified
@@ -214,32 +259,9 @@ static void verify_user_mapping(const struct page_table *root,
  */
 static void process_release_resources(struct process *process) {
         process_descriptors_close_all(process);
+        process_release_image(&process->address_space, &process->loaded_image,
+                              &process->stack_page);
 
-        if (process->address_space != NULL) {
-                if (process->stack_page != NULL) {
-                        uintptr_t stack_physical_address;
-
-                        if (page_table_translate(process->address_space,
-                                                 USER_STACK_ADDRESS,
-                                                 &stack_physical_address,
-                                                 NULL) &&
-                            (stack_physical_address !=
-                                 (uintptr_t)process->stack_page ||
-                             !page_table_unmap(process->address_space,
-                                               USER_STACK_ADDRESS))) {
-                                panic("User stack ownership mismatch");
-                        }
-                }
-
-                elf_unload_image(process->address_space,
-                                 &process->loaded_image);
-                page_table_destroy(process->address_space);
-                process->address_space = NULL;
-        }
-        if (process->stack_page != NULL) {
-                page_free(process->stack_page);
-                process->stack_page = NULL;
-        }
         if (process->kernel_trap_stack != NULL) {
                 page_free(process->kernel_trap_stack);
                 process->kernel_trap_stack = NULL;
@@ -312,7 +334,7 @@ static bool stack_copy_string(void *stack_page, uintptr_t *cursor,
  * the usual single argv[0] entry from the executable path.
  */
 static bool process_build_initial_stack(
-    struct process *process, const char *path,
+    void *stack_page, struct trap_frame *context, const char *path,
     const struct user_process_startup *startup) {
         const char *default_arguments[] = {path};
         size_t argument_count = 1U;
@@ -340,7 +362,7 @@ static bool process_build_initial_stack(
 
         for (size_t index = argument_count; index != 0U; index--) {
                 if (arguments[index - 1U] == NULL ||
-                    !stack_copy_string(process->stack_page, &cursor,
+                    !stack_copy_string(stack_page, &cursor,
                                        arguments[index - 1U],
                                        &argument_addresses[index - 1U])) {
                         return false;
@@ -349,7 +371,7 @@ static bool process_build_initial_stack(
 
         for (size_t index = environment_count; index != 0U; index--) {
                 if (environment[index - 1U] == NULL ||
-                    !stack_copy_string(process->stack_page, &cursor,
+                    !stack_copy_string(stack_page, &cursor,
                                        environment[index - 1U],
                                        &environment_addresses[index - 1U])) {
                         return false;
@@ -371,7 +393,7 @@ static bool process_build_initial_stack(
                 return false;
         }
 
-        uint64_t *words = (uint64_t *)((uint8_t *)process->stack_page +
+        uint64_t *words = (uint64_t *)((uint8_t *)stack_page +
                                        stack_pointer - USER_STACK_ADDRESS);
         size_t word = 0U;
 
@@ -387,12 +409,41 @@ static bool process_build_initial_stack(
         words[word++] = 0U;
         words[word] = 0U;
 
-        process->context.sp = stack_pointer;
-        process->context.a0 = argument_count;
-        process->context.a1 = stack_pointer + sizeof(uint64_t);
-        process->context.a2 = process->context.a1 +
-                              (argument_count + 1U) * sizeof(uint64_t);
+        context->sp = stack_pointer;
+        context->a0 = argument_count;
+        context->a1 = stack_pointer + sizeof(uint64_t);
+        context->a2 = context->a1 +
+                      (argument_count + 1U) * sizeof(uint64_t);
         return true;
+}
+
+/* Verify the invariant mappings shared by freshly spawned and replaced
+ * images. These checks are assertions because all untrusted input has already
+ * passed through the mapping and ELF validators. */
+static void process_verify_address_space(const struct page_table *root,
+                                         const void *stack_page) {
+        uintptr_t unexpected_physical_address;
+
+        /* A guard page catches a one-page stack overflow before it can reach
+         * ELF memory. */
+        if (page_table_translate(root, USER_STACK_GUARD_ADDRESS,
+                                 &unexpected_physical_address, NULL)) {
+                panic("User stack guard page is unexpectedly mapped");
+        }
+
+        verify_user_mapping(root, USER_STACK_ADDRESS, (uintptr_t)stack_page,
+                            VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE,
+                            VM_PAGE_EXECUTE);
+
+        /* Kernel text is mapped in every process but remains supervisor-only. */
+        uintptr_t kernel_text_physical;
+        uint64_t kernel_text_flags;
+
+        if (!page_table_translate(root, (uintptr_t)text_start,
+                                  &kernel_text_physical, &kernel_text_flags) ||
+            (kernel_text_flags & VM_PAGE_USER) != 0U) {
+                panic("Kernel text is accessible from U-mode");
+        }
 }
 
 /*
@@ -449,7 +500,8 @@ static bool process_create(struct process *process, const char *path,
 
         struct page_table *root = process->address_space;
 
-        if (!process_build_initial_stack(process, path, startup) ||
+        if (!process_build_initial_stack(process->stack_page,
+                                         &process->context, path, startup) ||
             !page_table_map(root, USER_STACK_ADDRESS,
                             (uintptr_t)process->stack_page,
                             VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE) ||
@@ -463,29 +515,7 @@ static bool process_create(struct process *process, const char *path,
         }
 
         process->context.sepc = process->loaded_image.entry;
-
-        uintptr_t unexpected_physical_address;
-
-        /* A guard page catches a one-page stack overflow before it can reach
-         * ELF memory. */
-        if (page_table_translate(root, USER_STACK_GUARD_ADDRESS,
-                                 &unexpected_physical_address, NULL)) {
-                panic("User stack guard page is unexpectedly mapped");
-        }
-
-        verify_user_mapping(
-            root, USER_STACK_ADDRESS, (uintptr_t)process->stack_page,
-            VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE, VM_PAGE_EXECUTE);
-
-        /* Kernel text is mapped in every process but remains supervisor-only. */
-        uintptr_t kernel_text_physical;
-        uint64_t kernel_text_flags;
-
-        if (!page_table_translate(root, (uintptr_t)text_start,
-                                  &kernel_text_physical, &kernel_text_flags) ||
-            (kernel_text_flags & VM_PAGE_USER) != 0U) {
-                panic("Kernel text is accessible from U-mode");
-        }
+        process_verify_address_space(root, process->stack_page);
 
         return true;
 }
@@ -602,6 +632,253 @@ static uint64_t user_copy_path(uintptr_t user_path,
         }
 
         return (uint64_t)-(int64_t)USER_ERROR_NAME_TOO_LONG;
+}
+
+/* Copy one execve string into the shared transaction buffer. Its aggregate
+ * page-sized bound matches the maximum storage available on the new stack. */
+static uint64_t user_copy_exec_string(uintptr_t user_string,
+                                      size_t *buffer_offset) {
+        size_t source_offset = 0U;
+
+        while (*buffer_offset < sizeof(exec_string_buffer)) {
+                uintptr_t address;
+
+                if (user_string > UINTPTR_MAX - source_offset ||
+                    !user_range_is_valid(user_string + source_offset, 1U,
+                                         VM_PAGE_READ) ||
+                    !page_table_translate(active_process->address_space,
+                                          user_string + source_offset,
+                                          &address, NULL)) {
+                        return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+                }
+
+                char character = *(const char *)address;
+                exec_string_buffer[*buffer_offset] = character;
+                (*buffer_offset)++;
+                source_offset++;
+
+                if (character == '\0') {
+                        return 0U;
+                }
+        }
+
+        return (uint64_t)-(int64_t)USER_ERROR_ARGUMENT_LIST_TOO_LONG;
+}
+
+/* Copy a null-terminated argv or envp array without directly dereferencing
+ * either its user pointers or strings. The slot after the fixed limit is read
+ * only to distinguish a valid terminator from E2BIG. */
+static uint64_t user_copy_exec_vector(uintptr_t user_vector,
+                                      const char **destination,
+                                      size_t destination_limit,
+                                      bool require_entry, size_t *entry_count,
+                                      size_t *buffer_offset) {
+        for (size_t index = 0U; index <= destination_limit; index++) {
+                size_t pointer_offset = index * sizeof(uintptr_t);
+                uintptr_t user_string;
+
+                if (user_vector > UINTPTR_MAX - pointer_offset ||
+                    !user_range_is_valid(user_vector + pointer_offset,
+                                         sizeof(user_string), VM_PAGE_READ)) {
+                        return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+                }
+
+                user_copy_from((uint8_t *)&user_string,
+                               user_vector + pointer_offset,
+                               sizeof(user_string));
+
+                if (user_string == 0U) {
+                        if (require_entry && index == 0U) {
+                                return (uint64_t)-(int64_t)
+                                    USER_ERROR_INVALID_ARGUMENT;
+                        }
+                        *entry_count = index;
+                        return 0U;
+                }
+                if (index == destination_limit) {
+                        return (uint64_t)-(int64_t)
+                            USER_ERROR_ARGUMENT_LIST_TOO_LONG;
+                }
+
+                destination[index] = &exec_string_buffer[*buffer_offset];
+                uint64_t result =
+                    user_copy_exec_string(user_string, buffer_offset);
+
+                if (result != 0U) {
+                        return result;
+                }
+        }
+
+        return (uint64_t)-(int64_t)USER_ERROR_ARGUMENT_LIST_TOO_LONG;
+}
+
+static void process_release_replacement(void) {
+        process_release_image(&exec_replacement.address_space,
+                              &exec_replacement.loaded_image,
+                              &exec_replacement.stack_page);
+        bytes_zero(&exec_replacement.context,
+                   sizeof(exec_replacement.context));
+}
+
+/* Read and fully construct a replacement without modifying the running image.
+ * Every failure releases only the candidate, leaving execve able to return to
+ * its caller with registers, mappings, and descriptors unchanged. */
+static uint64_t process_prepare_replacement(
+    const char *path, const struct user_process_startup *startup) {
+        struct vfs_file executable;
+        int open_result = vfs_open(path, VFS_OPEN_READ, &executable);
+
+        if (open_result != 0) {
+                return (uint64_t)(int64_t)open_result;
+        }
+        if (executable.type != VFS_NODE_REGULAR || executable.size == 0U ||
+            executable.size > sizeof(executable_buffer)) {
+                return (uint64_t)-(int64_t)USER_ERROR_EXEC_FORMAT;
+        }
+
+        long executable_length = vfs_read(&executable, 0U, executable_buffer,
+                                          (size_t)executable.size);
+        if (executable_length < 0) {
+                return (uint64_t)(int64_t)executable_length;
+        }
+        if ((uint64_t)executable_length != executable.size) {
+                return (uint64_t)-(int64_t)USER_ERROR_IO;
+        }
+
+        if (exec_replacement.address_space != NULL ||
+            exec_replacement.stack_page != NULL ||
+            exec_replacement.loaded_image.page_count != 0U) {
+                panic("Stale execve replacement image");
+        }
+
+        bytes_zero(&exec_replacement, sizeof(exec_replacement));
+        exec_replacement.context.sstatus = SSTATUS_SPIE;
+        exec_replacement.address_space =
+            virtual_memory_create_address_space();
+        exec_replacement.stack_page = page_alloc();
+
+        if (exec_replacement.address_space == NULL ||
+            exec_replacement.stack_page == NULL) {
+                process_release_replacement();
+                return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
+        }
+
+        struct page_table *root = exec_replacement.address_space;
+
+        if (!process_build_initial_stack(exec_replacement.stack_page,
+                                         &exec_replacement.context, path,
+                                         startup)) {
+                process_release_replacement();
+                return (uint64_t)-(int64_t)
+                    USER_ERROR_ARGUMENT_LIST_TOO_LONG;
+        }
+        if (!page_table_map(root, USER_STACK_ADDRESS,
+                            (uintptr_t)exec_replacement.stack_page,
+                            VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE)) {
+                process_release_replacement();
+                return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
+        }
+        if (!elf_load_image(root, executable_buffer,
+                            (size_t)executable.size, USER_ADDRESS_MIN,
+                            USER_STACK_GUARD_ADDRESS,
+                            &exec_replacement.loaded_image)) {
+                process_release_replacement();
+                return (uint64_t)-(int64_t)USER_ERROR_EXEC_FORMAT;
+        }
+
+        exec_replacement.context.sepc = exec_replacement.loaded_image.entry;
+        process_verify_address_space(root, exec_replacement.stack_page);
+        return 0U;
+}
+
+static void loaded_image_move(struct elf_loaded_image *destination,
+                              struct elf_loaded_image *source) {
+        if (destination->page_count != 0U) {
+                panic("Replacing a live ELF ownership record");
+        }
+
+        destination->entry = source->entry;
+        destination->page_count = source->page_count;
+        for (size_t index = 0U; index < source->page_count; index++) {
+                destination->pages[index].virtual_address =
+                    source->pages[index].virtual_address;
+                destination->pages[index].physical_page =
+                    source->pages[index].physical_page;
+                destination->pages[index].flags = source->pages[index].flags;
+        }
+        bytes_zero(source, sizeof(*source));
+}
+
+/* Switch to the validated root before destroying the old page table. Open
+ * descriptors, PID, scheduling state, and the current supervisor trap stack
+ * intentionally remain properties of the same process. */
+static void process_commit_replacement(struct trap_frame *frame) {
+        struct page_table *new_address_space =
+            exec_replacement.address_space;
+        void *new_stack_page = exec_replacement.stack_page;
+        struct page_table *old_address_space = active_process->address_space;
+        void *old_stack_page = active_process->stack_page;
+
+        page_table_activate(new_address_space);
+        process_release_image(&old_address_space,
+                              &active_process->loaded_image,
+                              &old_stack_page);
+
+        active_process->address_space = new_address_space;
+        active_process->stack_page = new_stack_page;
+        exec_replacement.address_space = NULL;
+        exec_replacement.stack_page = NULL;
+        loaded_image_move(&active_process->loaded_image,
+                          &exec_replacement.loaded_image);
+
+        trap_frame_copy(&active_process->context,
+                        &exec_replacement.context);
+        trap_frame_copy(frame, &exec_replacement.context);
+        bytes_zero(&exec_replacement.context,
+                   sizeof(exec_replacement.context));
+}
+
+static uint64_t syscall_execve(struct trap_frame *frame, uintptr_t user_path,
+                               uintptr_t user_arguments,
+                               uintptr_t user_environment) {
+        char path[USER_PATH_MAX];
+        uint64_t result = user_copy_path(user_path, path);
+
+        if (result != 0U) {
+                return result;
+        }
+
+        size_t string_buffer_offset = 0U;
+        size_t argument_count;
+        size_t environment_count;
+
+        result = user_copy_exec_vector(
+            user_arguments, exec_arguments, PROCESS_ARGUMENT_LIMIT, true,
+            &argument_count, &string_buffer_offset);
+        if (result != 0U) {
+                return result;
+        }
+        result = user_copy_exec_vector(
+            user_environment, exec_environment, PROCESS_ENVIRONMENT_LIMIT,
+            false, &environment_count, &string_buffer_offset);
+        if (result != 0U) {
+                return result;
+        }
+
+        const struct user_process_startup startup = {
+            .arguments = exec_arguments,
+            .argument_count = argument_count,
+            .environment = exec_environment,
+            .environment_count = environment_count,
+        };
+
+        result = process_prepare_replacement(path, &startup);
+        if (result != 0U) {
+                return result;
+        }
+
+        process_commit_replacement(frame);
+        return 0U;
 }
 
 /*
@@ -1468,6 +1745,20 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 frame->a0 = syscall_path_operation((uintptr_t)frame->a0, false);
                 frame->sepc += 4U;
                 return;
+
+        case USER_SYSCALL_EXECVE: {
+                uint64_t result = syscall_execve(
+                    frame, (uintptr_t)frame->a0, (uintptr_t)frame->a1,
+                    (uintptr_t)frame->a2);
+
+                /* Success installed an entirely new frame and begins at its
+                 * ELF entry. Only failure resumes after the original ECALL. */
+                if (result != 0U) {
+                        frame->a0 = result;
+                        frame->sepc += 4U;
+                }
+                return;
+        }
 
         case USER_SYSCALL_EXIT:
                 frame->sepc += 4U;

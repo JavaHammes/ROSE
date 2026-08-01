@@ -33,7 +33,9 @@ scheduling, and automated emulator tests.
 - Eight-entry per-process descriptor tables with standard input, output, and
   error attached to `/dev/console`; ramfs files retain independent offsets.
 - U-mode C runtime with descriptor I/O, `open`, `close`, `stat`, `lseek`,
-  directory iteration, `mkdir`, `unlink`, `exit`, and `yield` system calls.
+  directory iteration, `mkdir`, `unlink`, `execve`, `exit`, and `yield` system
+  calls. A successful `execve` atomically replaces the user image while
+  preserving the process identity and open descriptors.
   Programs start with conventional `argc`, `argv`, and `envp` values copied to
   their private stack.
   UART reads and writes block on scheduler wait channels and resume from device
@@ -171,6 +173,6 @@ exited states between shell commands. The ext2 implementation is synchronous,
 write-through, limited to one block group and twelve direct blocks per inode
 (12 KiB files), and does not yet provide journaling or crash recovery. The
 VirtIO queue is polled synchronously; it is not yet connected to a scheduler
-completion channel. There is no descriptor duplication, pipes, `fork`,
-`execve`, signals, general-purpose kernel threads, ASIDs, networking, users, or
-permissions enforcement.
+completion channel. There is no descriptor duplication, pipes, `fork`, signals,
+general-purpose kernel threads, ASIDs, networking, users, or permissions
+enforcement.

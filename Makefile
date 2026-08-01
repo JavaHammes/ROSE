@@ -45,7 +45,7 @@ USER_COMMON_OBJECTS := \
 # with a build-time selector allowing dead-code elimination to retain only the
 # requested demonstration. The disk receives every image; the diagnostic
 # ramfs retains only the original seven programs.
-USER_PROGRAMS := hello fault process_a process_b syscall_test cat console_read init fs_test args_env
+USER_PROGRAMS := hello fault process_a process_b syscall_test cat console_read init fs_test args_env execve execve_target
 USER_PROGRAM_hello := 0
 USER_PROGRAM_fault := 1
 USER_PROGRAM_process_a := 2
@@ -56,6 +56,8 @@ USER_PROGRAM_console_read := 6
 USER_PROGRAM_init := 7
 USER_PROGRAM_fs_test := 8
 USER_PROGRAM_args_env := 9
+USER_PROGRAM_execve := 10
+USER_PROGRAM_execve_target := 11
 USER_ELFS := $(foreach program,$(USER_PROGRAMS),$(BUILD_DIR)/user/$(program)/program.elf)
 USER_LOAD_ELFS := $(USER_ELFS:.elf=.load.elf)
 USER_FALLBACK_PROGRAMS := hello fault process_a process_b syscall_test cat console_read
@@ -147,6 +149,8 @@ $(ROOT_IMAGE): tools/mkrosefs.py $(USER_LOAD_ELFS)
 		--file /bin/console-read=$(BUILD_DIR)/user/console_read/program.load.elf \
 		--file /bin/fs-test=$(BUILD_DIR)/user/fs_test/program.load.elf \
 		--file /bin/args-env=$(BUILD_DIR)/user/args_env/program.load.elf \
+		--file /bin/execve=$(BUILD_DIR)/user/execve/program.load.elf \
+		--file /bin/execve-target=$(BUILD_DIR)/user/execve_target/program.load.elf \
 		--file /sbin/init=$(BUILD_DIR)/user/init/program.load.elf
 
 
