@@ -35,6 +35,8 @@ enum {
         PROCESS_DESCRIPTOR_LIMIT = 8,
         PROCESS_FIRST_OPEN_DESCRIPTOR = 3,
         PROCESS_LIMIT = 8,
+        PIPE_LIMIT = 8,
+        PIPE_BUFFER_SIZE = USER_IO_MAX,
         PROCESS_ARGUMENT_LIMIT = 16,
         PROCESS_ENVIRONMENT_LIMIT = 16,
 };
@@ -91,7 +93,18 @@ struct process_open_file {
         uint8_t access;
         size_t references;
         uint64_t offset;
+        struct process_pipe *pipe;
         struct vfs_file file;
+};
+
+struct process_pipe {
+        bool used;
+        size_t readers;
+        size_t writers;
+        size_t read_offset;
+        size_t write_offset;
+        size_t count;
+        uint8_t buffer[PIPE_BUFFER_SIZE];
 };
 
 struct process_descriptor {
@@ -147,6 +160,7 @@ struct process_replacement {
 
 /* Fixed slots keep early process management independent of a kernel heap. */
 static struct process process_table[PROCESS_LIMIT];
+static struct process_pipe pipe_table[PIPE_LIMIT];
 static struct process *active_process;
 static struct process *uart_write_owner;
 static uint64_t next_pid = 1U;
@@ -165,6 +179,58 @@ static void bytes_zero(void *destination, size_t size) {
 
         for (size_t index = 0U; index < size; index++) {
                 bytes[index] = 0U;
+        }
+}
+
+static struct process_pipe *process_pipe_allocate(void) {
+        for (size_t index = 0U; index < PIPE_LIMIT; index++) {
+                if (!pipe_table[index].used) {
+                        struct process_pipe *pipe = &pipe_table[index];
+
+                        bytes_zero(pipe, sizeof(*pipe));
+                        pipe->used = true;
+                        return pipe;
+                }
+        }
+
+        return NULL;
+}
+
+static void process_pipe_retain(struct process_pipe *pipe, uint8_t access) {
+        if (pipe == NULL || !pipe->used ||
+            (access != DESCRIPTOR_READ && access != DESCRIPTOR_WRITE)) {
+                panic("Invalid pipe endpoint retention");
+        }
+
+        if (access == DESCRIPTOR_READ) {
+                pipe->readers++;
+        } else {
+                pipe->writers++;
+        }
+}
+
+static void process_pipe_release(struct process_pipe *pipe, uint8_t access) {
+        if (pipe == NULL || !pipe->used ||
+            (access != DESCRIPTOR_READ && access != DESCRIPTOR_WRITE)) {
+                panic("Invalid pipe endpoint release");
+        }
+
+        if (access == DESCRIPTOR_READ) {
+                if (pipe->readers == 0U) {
+                        panic("Pipe reader count underflow");
+                }
+                pipe->readers--;
+                (void)scheduler_wake_all(SCHEDULER_WAIT_PIPE_WRITE);
+        } else {
+                if (pipe->writers == 0U) {
+                        panic("Pipe writer count underflow");
+                }
+                pipe->writers--;
+                (void)scheduler_wake_all(SCHEDULER_WAIT_PIPE_READ);
+        }
+
+        if (pipe->readers == 0U && pipe->writers == 0U) {
+                bytes_zero(pipe, sizeof(*pipe));
         }
 }
 
@@ -221,6 +287,10 @@ static void process_descriptor_close(struct process_descriptor *descriptor) {
         descriptor->open_file = NULL;
         open_file->references--;
         if (open_file->references == 0U) {
+                if (open_file->pipe != NULL) {
+                        process_pipe_release(open_file->pipe,
+                                             open_file->access);
+                }
                 bytes_zero(open_file, sizeof(*open_file));
         }
 }
@@ -250,6 +320,59 @@ static bool process_descriptors_initialize(struct process *process) {
                 process_descriptor_install(&process->descriptors[descriptor],
                                            open_file);
         }
+        return true;
+}
+
+/* Spawn inherits descriptors. Each child receives local open-file records so
+ * its descriptor table remains self-contained, while aliases within a process
+ * and the underlying pipe endpoint are still shared correctly. */
+static bool process_descriptors_clone(struct process *destination,
+                                      const struct process *source) {
+        for (size_t descriptor = 0U; descriptor < PROCESS_DESCRIPTOR_LIMIT;
+             descriptor++) {
+                struct process_open_file *source_open_file =
+                    source->descriptors[descriptor].open_file;
+
+                if (source_open_file == NULL) {
+                        continue;
+                }
+
+                struct process_open_file *destination_open_file = NULL;
+                for (size_t previous = 0U; previous < descriptor; previous++) {
+                        if (source->descriptors[previous].open_file ==
+                            source_open_file) {
+                                destination_open_file =
+                                    destination->descriptors[previous]
+                                        .open_file;
+                                break;
+                        }
+                }
+
+                if (destination_open_file == NULL) {
+                        destination_open_file =
+                            process_open_file_allocate(destination);
+                        if (destination_open_file == NULL) {
+                                return false;
+                        }
+
+                        destination_open_file->access =
+                            source_open_file->access;
+                        destination_open_file->offset =
+                            source_open_file->offset;
+                        destination_open_file->pipe = source_open_file->pipe;
+                        destination_open_file->file = source_open_file->file;
+                        if (destination_open_file->pipe != NULL) {
+                                process_pipe_retain(
+                                    destination_open_file->pipe,
+                                    destination_open_file->access);
+                        }
+                }
+
+                process_descriptor_install(
+                    &destination->descriptors[descriptor],
+                    destination_open_file);
+        }
+
         return true;
 }
 
@@ -591,7 +714,8 @@ static void process_verify_address_space(const struct page_table *root,
  */
 static uint64_t process_create(struct process *process, const char *path,
                                const struct user_process_startup *startup,
-                               uint64_t parent_pid) {
+                               uint64_t parent_pid,
+                               const struct process *descriptor_source) {
         struct vfs_file executable;
         int open_result = vfs_open(path, VFS_OPEN_READ, &executable);
 
@@ -621,8 +745,12 @@ static uint64_t process_create(struct process *process, const char *path,
         process->exit_status = UINT64_MAX;
         process->current_directory[0] = '/';
         process->current_directory[1] = '\0';
-        if (!process_descriptors_initialize(process)) {
-                panic("Initial console descriptors are unavailable");
+        bool descriptors_ready = descriptor_source == NULL
+                                     ? process_descriptors_initialize(process)
+                                     : process_descriptors_clone(
+                                           process, descriptor_source);
+        if (!descriptors_ready) {
+                panic("Initial process descriptors are unavailable");
         }
         next_pid++;
         if (next_pid == 0U) {
@@ -1175,7 +1303,8 @@ static uint64_t syscall_spawn(uintptr_t user_path, uintptr_t user_arguments,
         };
         uint64_t parent_pid = active_process->pid;
 
-        result = process_create(child, path, &startup, parent_pid);
+        result = process_create(child, path, &startup, parent_pid,
+                                active_process);
         if (result != 0U) {
                 bytes_zero(child, sizeof(*child));
                 return result;
@@ -1295,6 +1424,17 @@ static uint64_t syscall_write_begin(uint64_t descriptor, uintptr_t user_buffer,
         }
         if (!user_range_is_valid(user_buffer, length, VM_PAGE_READ)) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+
+        if (open_file->pipe != NULL) {
+                user_copy_from((uint8_t *)active_process->write_buffer,
+                               user_buffer, length);
+                active_process->pending_write = length != 0U;
+                active_process->write_descriptor = (size_t)descriptor;
+                active_process->write_result_length = length;
+                active_process->write_length = length;
+                active_process->write_offset = 0U;
+                return length;
         }
 
         if (open_file->file.type == VFS_NODE_REGULAR) {
@@ -1434,6 +1574,14 @@ static uint64_t syscall_read_begin(uint64_t descriptor,
                 return 0U;
         }
 
+        if (open_file->pipe != NULL) {
+                active_process->pending_read = true;
+                active_process->read_descriptor = (size_t)descriptor;
+                active_process->read_buffer = user_buffer;
+                active_process->read_length = length;
+                return 0U;
+        }
+
         if (open_file->file.type == VFS_NODE_REGULAR) {
                 long result = vfs_read(&open_file->file, open_file->offset,
                                        active_process->write_buffer, length);
@@ -1507,6 +1655,17 @@ static uint64_t syscall_fstat(uint64_t descriptor, uintptr_t user_status) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
         }
 
+        if (open_file->pipe != NULL) {
+                struct user_file_status pipe_status;
+
+                bytes_zero(&pipe_status, sizeof(pipe_status));
+                pipe_status.size = open_file->pipe->count;
+                pipe_status.type = USER_FILE_PIPE;
+                user_copy_to(user_status, (const uint8_t *)&pipe_status,
+                             sizeof(pipe_status));
+                return 0U;
+        }
+
         struct vfs_stat status;
         int result = vfs_stat_file(&open_file->file, &status);
         return result == 0
@@ -1522,7 +1681,8 @@ static uint64_t syscall_lseek(uint64_t descriptor, int64_t adjustment,
         }
         struct process_open_file *open_file =
             active_process->descriptors[(size_t)descriptor].open_file;
-        if (open_file->file.type != VFS_NODE_REGULAR) {
+        if (open_file->pipe != NULL ||
+            open_file->file.type != VFS_NODE_REGULAR) {
                 return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
         }
         uint64_t base;
@@ -1569,6 +1729,9 @@ static uint64_t syscall_read_directory(uint64_t descriptor,
         if (directory == NULL ||
             (directory->access & DESCRIPTOR_READ) == 0U) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        if (directory->pipe != NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_NOT_DIRECTORY;
         }
         if (!user_range_is_valid(user_entry,
                                  sizeof(struct user_directory_entry),
@@ -1691,6 +1854,61 @@ static uint64_t syscall_dup2(uint64_t old_descriptor,
             target,
             active_process->descriptors[(size_t)old_descriptor].open_file);
         return new_descriptor;
+}
+
+static uint64_t syscall_pipe(uintptr_t user_descriptors) {
+        if (!user_range_is_valid(user_descriptors, 2U * sizeof(int),
+                                 VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+
+        size_t descriptor_pair[2];
+        size_t descriptor_count = 0U;
+        size_t free_open_files = 0U;
+
+        for (size_t index = 0U; index < PROCESS_DESCRIPTOR_LIMIT; index++) {
+                if (active_process->descriptors[index].open_file == NULL &&
+                    descriptor_count < 2U) {
+                        descriptor_pair[descriptor_count++] = index;
+                }
+                if (!active_process->open_files[index].used) {
+                        free_open_files++;
+                }
+        }
+        if (descriptor_count != 2U || free_open_files < 2U) {
+                return (uint64_t)-(int64_t)USER_ERROR_TOO_MANY_FILES;
+        }
+
+        struct process_pipe *pipe = process_pipe_allocate();
+        if (pipe == NULL) {
+                return (uint64_t)-(int64_t)
+                    USER_ERROR_FILE_TABLE_OVERFLOW;
+        }
+
+        struct process_open_file *read_end =
+            process_open_file_allocate(active_process);
+        struct process_open_file *write_end =
+            process_open_file_allocate(active_process);
+        if (read_end == NULL || write_end == NULL) {
+                panic("Reserved pipe open-file records disappeared");
+        }
+
+        read_end->access = DESCRIPTOR_READ;
+        read_end->pipe = pipe;
+        process_pipe_retain(pipe, read_end->access);
+        write_end->access = DESCRIPTOR_WRITE;
+        write_end->pipe = pipe;
+        process_pipe_retain(pipe, write_end->access);
+        process_descriptor_install(
+            &active_process->descriptors[descriptor_pair[0]], read_end);
+        process_descriptor_install(
+            &active_process->descriptors[descriptor_pair[1]], write_end);
+
+        int result[2] = {(int)descriptor_pair[0],
+                         (int)descriptor_pair[1]};
+        user_copy_to(user_descriptors, (const uint8_t *)result,
+                     sizeof(result));
+        return 0U;
 }
 
 /* Move the end of the process data segment. Heap pages are materialized
@@ -1864,6 +2082,44 @@ static void process_continue_write(struct trap_frame *frame) {
             process->write_descriptor >= PROCESS_DESCRIPTOR_LIMIT) {
                 panic_trap("Invalid pending write", frame);
         }
+
+        const struct process_open_file *open_file =
+            process->descriptors[process->write_descriptor].open_file;
+        if (open_file == NULL) {
+                panic_trap("Pending write descriptor was closed", frame);
+        }
+
+        if (open_file->pipe != NULL) {
+                struct process_pipe *pipe = open_file->pipe;
+
+                if (pipe->readers == 0U) {
+                        process->pending_write = false;
+                        frame->a0 = (uint64_t)-(int64_t)
+                            USER_ERROR_BROKEN_PIPE;
+                        frame->sepc += 4U;
+                        return;
+                }
+                if (process->write_length > PIPE_BUFFER_SIZE - pipe->count) {
+                        scheduler_block_current(
+                            frame, SCHEDULER_WAIT_PIPE_WRITE);
+                        return;
+                }
+
+                for (size_t offset = 0U; offset < process->write_length;
+                     offset++) {
+                        pipe->buffer[pipe->write_offset] =
+                            (uint8_t)process->write_buffer[offset];
+                        pipe->write_offset =
+                            (pipe->write_offset + 1U) % PIPE_BUFFER_SIZE;
+                }
+                pipe->count += process->write_length;
+                process->pending_write = false;
+                frame->a0 = process->write_result_length;
+                frame->sepc += 4U;
+                (void)scheduler_wake_all(SCHEDULER_WAIT_PIPE_READ);
+                return;
+        }
+
         if (uart_write_owner == NULL) {
                 uart_write_owner = process;
         }
@@ -1883,11 +2139,6 @@ static void process_continue_write(struct trap_frame *frame) {
                 return;
         }
 
-        const struct process_open_file *open_file =
-            process->descriptors[process->write_descriptor].open_file;
-        if (open_file == NULL) {
-                panic_trap("Pending write descriptor was closed", frame);
-        }
         const struct vfs_file *file = &open_file->file;
 
         if (file->operations->write_byte(
@@ -1913,6 +2164,43 @@ static void process_continue_read(struct trap_frame *frame) {
             process->descriptors[process->read_descriptor].open_file;
         if (open_file == NULL) {
                 panic_trap("Pending read descriptor was closed", frame);
+        }
+
+        if (open_file->pipe != NULL) {
+                struct process_pipe *pipe = open_file->pipe;
+
+                if (pipe->count == 0U) {
+                        if (pipe->writers == 0U) {
+                                process->pending_read = false;
+                                frame->a0 = 0U;
+                                frame->sepc += 4U;
+                                return;
+                        }
+
+                        scheduler_block_current(
+                            frame, SCHEDULER_WAIT_PIPE_READ);
+                        return;
+                }
+
+                size_t pipe_count = process->read_length;
+                if (pipe_count > pipe->count) {
+                        pipe_count = pipe->count;
+                }
+                for (size_t offset = 0U; offset < pipe_count; offset++) {
+                        process->write_buffer[offset] =
+                            (char)pipe->buffer[pipe->read_offset];
+                        pipe->read_offset =
+                            (pipe->read_offset + 1U) % PIPE_BUFFER_SIZE;
+                }
+                pipe->count -= pipe_count;
+                user_copy_to(process->read_buffer,
+                             (const uint8_t *)process->write_buffer,
+                             pipe_count);
+                process->pending_read = false;
+                frame->a0 = pipe_count;
+                frame->sepc += 4U;
+                (void)scheduler_wake_all(SCHEDULER_WAIT_PIPE_WRITE);
+                return;
         }
         const struct vfs_file *file = &open_file->file;
 
@@ -2116,7 +2404,7 @@ bool user_process_spawn(const char *path,
         if (process == NULL) {
                 return false;
         }
-        if (process_create(process, path, startup, 0U) != 0U) {
+        if (process_create(process, path, startup, 0U, NULL) != 0U) {
                 bytes_zero(process, sizeof(*process));
                 return false;
         }
@@ -2350,6 +2638,11 @@ void user_process_handle_syscall(struct trap_frame *frame) {
 
         case USER_SYSCALL_DUP2:
                 frame->a0 = syscall_dup2(frame->a0, frame->a1);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_PIPE:
+                frame->a0 = syscall_pipe((uintptr_t)frame->a0);
                 frame->sepc += 4U;
                 return;
 

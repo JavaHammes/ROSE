@@ -12,6 +12,8 @@ enum scheduler_wait_channel {
         SCHEDULER_WAIT_UART_TX,
         SCHEDULER_WAIT_UART_RX,
         SCHEDULER_WAIT_CHILD,
+        SCHEDULER_WAIT_PIPE_READ,
+        SCHEDULER_WAIT_PIPE_WRITE,
 };
 
 /* Block the current U-mode process and wake sleepers from an interrupt. */

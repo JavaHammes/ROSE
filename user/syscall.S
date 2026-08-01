@@ -125,6 +125,15 @@ rose_dup2:
     ret
 .size rose_dup2, . - rose_dup2
 
+.globl rose_pipe
+.type rose_pipe, @function
+rose_pipe:
+    /* a0 points at storage for the read and write descriptor pair. */
+    li a7, USER_SYSCALL_PIPE
+    ecall
+    ret
+.size rose_pipe, . - rose_pipe
+
 .globl rose_execve
 .type rose_execve, @function
 rose_execve:

@@ -251,6 +251,14 @@ def main() -> int:
         # fixed process table with concurrency tests.
         require(session.command("reap"), "Reaped 8 process(es)")
 
+        require(
+            session.command("run /bin/pipe-test"),
+            "Pipe communication passed",
+            "exited with status 0",
+            "Scheduler blocks:",
+        )
+        require(session.command("reap"), "Reaped 1 process(es)")
+
         first_cat = spawned_pid(session.command("spawn /bin/cat"))
         second_cat = spawned_pid(session.command("spawn /bin/cat"))
         cat_pair = session.command("wait")

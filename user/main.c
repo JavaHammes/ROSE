@@ -501,6 +501,106 @@ static int run_console_read(void) {
         return 0;
 }
 
+static int run_pipe_test(void) {
+        const void *kernel_address =
+            (const void *)(uintptr_t)UINT64_C(0x80200000);
+        int descriptors[2] = {-1, -1};
+        struct user_file_status status;
+
+        if (rose_pipe((int *)kernel_address) != -USER_ERROR_BAD_ADDRESS ||
+            rose_pipe(descriptors) != 0 || descriptors[0] != 3 ||
+            descriptors[1] != 4 ||
+            rose_fstat(descriptors[0], &status) != 0 ||
+            status.type != USER_FILE_PIPE ||
+            rose_lseek(descriptors[0], 0, USER_SEEK_SET) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_write(descriptors[0], "x", 1U) !=
+                -USER_ERROR_BAD_FILE_DESCRIPTOR ||
+            rose_read(descriptors[1], &descriptors[0], 1U) !=
+                -USER_ERROR_BAD_FILE_DESCRIPTOR) {
+                return 42;
+        }
+
+        char *arguments[] = {"/bin/pipe-writer", NULL};
+        char *environment[] = {NULL};
+        long child = rose_spawn("/bin/pipe-writer", arguments, environment);
+
+        if (child <= 0 || rose_close(descriptors[1]) != 0) {
+                return 43;
+        }
+
+        char streaming_buffer[257];
+        size_t received = 0U;
+        while (received < 2048U) {
+                long streaming_count = rose_read(
+                    descriptors[0], streaming_buffer,
+                    sizeof(streaming_buffer));
+                if (streaming_count <= 0 ||
+                    (size_t)streaming_count > 2048U - received) {
+                        return 44;
+                }
+                for (long index = 0; index < streaming_count; index++) {
+                        if (streaming_buffer[index] != 'P') {
+                                return 44;
+                        }
+                }
+                received += (size_t)streaming_count;
+        }
+
+        static const char expected[] = "Pipe communication passed";
+        char buffer[sizeof(expected)];
+        long count = rose_read(descriptors[0], buffer, sizeof(buffer) - 1U);
+        if (count != (long)(sizeof(expected) - 1U)) {
+                return 45;
+        }
+        buffer[count] = '\0';
+        if (!strings_equal(buffer, expected) ||
+            rose_read(descriptors[0], buffer, sizeof(buffer)) != 0 ||
+            rose_close(descriptors[0]) != 0) {
+                return 46;
+        }
+
+        int wait_status = -1;
+        if (rose_waitpid(child, &wait_status, 0U) != child ||
+            !USER_WAIT_STATUS_EXITED(wait_status) ||
+            USER_WAIT_STATUS_EXIT_CODE(wait_status) != 0U) {
+                return 47;
+        }
+
+        if (rose_pipe(descriptors) != 0 ||
+            rose_close(descriptors[0]) != 0 ||
+            rose_write(descriptors[1], "x", 1U) !=
+                -USER_ERROR_BROKEN_PIPE ||
+            rose_close(descriptors[1]) != 0) {
+                return 48;
+        }
+
+        print("Pipe communication passed\n");
+        return 0;
+}
+
+static int run_pipe_writer(void) {
+        static char full_buffer[1024];
+        static const char payload[] = "Pipe communication passed";
+
+        for (size_t index = 0U; index < sizeof(full_buffer); index++) {
+                full_buffer[index] = 'P';
+        }
+
+        if (rose_close(3) != 0 ||
+            rose_write(4, full_buffer, sizeof(full_buffer)) !=
+                (long)sizeof(full_buffer) ||
+            rose_write(4, full_buffer, sizeof(full_buffer)) !=
+                (long)sizeof(full_buffer) ||
+            rose_write(4, payload, sizeof(payload) - 1U) !=
+                (long)(sizeof(payload) - 1U) ||
+            rose_close(4) != 0) {
+                return 49;
+        }
+
+        return 0;
+}
+
 /* Referenced by the assembly entry point, so this must retain external linkage.
  */
 int user_main(int argc, char **argv,
@@ -560,6 +660,12 @@ int user_main(int argc, char **argv,
 
         case USER_PROGRAM_EXECVE_TARGET:
                 return run_execve_target(argc, argv, environment);
+
+        case USER_PROGRAM_PIPE_TEST:
+                return run_pipe_test();
+
+        case USER_PROGRAM_PIPE_WRITER:
+                return run_pipe_writer();
 
         default:
                 return 2;

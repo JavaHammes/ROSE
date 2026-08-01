@@ -25,6 +25,7 @@
 #define USER_SYSCALL_FSTAT 19
 #define USER_SYSCALL_DUP 20
 #define USER_SYSCALL_DUP2 21
+#define USER_SYSCALL_PIPE 22
 
 #else
 
@@ -51,6 +52,7 @@ enum user_syscall_number {
         USER_SYSCALL_FSTAT = 19,
         USER_SYSCALL_DUP = 20,
         USER_SYSCALL_DUP2 = 21,
+        USER_SYSCALL_PIPE = 22,
 };
 
 /* Stable negative error values returned in a0 by failed system calls. */
@@ -69,9 +71,11 @@ enum user_syscall_error {
         USER_ERROR_NOT_DIRECTORY = 20,
         USER_ERROR_IS_DIRECTORY = 21,
         USER_ERROR_INVALID_ARGUMENT = 22,
+        USER_ERROR_FILE_TABLE_OVERFLOW = 23,
         USER_ERROR_TOO_MANY_FILES = 24,
         USER_ERROR_NO_SPACE = 28,
         USER_ERROR_READ_ONLY = 30,
+        USER_ERROR_BROKEN_PIPE = 32,
         USER_ERROR_RANGE = 34,
         USER_ERROR_NAME_TOO_LONG = 36,
         USER_ERROR_NOT_IMPLEMENTED = 38,
@@ -104,6 +108,7 @@ enum user_file_type {
         USER_FILE_DIRECTORY,
         USER_FILE_REGULAR,
         USER_FILE_CHARACTER_DEVICE,
+        USER_FILE_PIPE,
 };
 
 enum { USER_DIRECTORY_NAME_MAX = 56 };
@@ -142,6 +147,8 @@ enum user_program {
         USER_PROGRAM_ARGUMENTS_ENVIRONMENT,
         USER_PROGRAM_EXECVE,
         USER_PROGRAM_EXECVE_TARGET,
+        USER_PROGRAM_PIPE_TEST,
+        USER_PROGRAM_PIPE_WRITER,
 };
 
 #endif

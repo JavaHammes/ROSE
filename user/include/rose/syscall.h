@@ -21,6 +21,7 @@ long rose_chdir(const char *path);
 long rose_getcwd(char *buffer, size_t size);
 long rose_dup(int descriptor);
 long rose_dup2(int old_descriptor, int new_descriptor);
+long rose_pipe(int descriptors[2]);
 
 /* Replace the calling process image. Success does not return. */
 long rose_execve(const char *path, char *const arguments[],
