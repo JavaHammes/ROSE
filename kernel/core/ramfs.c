@@ -36,8 +36,10 @@ extern uint8_t user_rm_elf_start[];
 extern uint8_t user_rm_elf_end[];
 extern uint8_t user_descriptor_test_elf_start[];
 extern uint8_t user_descriptor_test_elf_end[];
+extern uint8_t user_signal_exec_test_elf_start[];
+extern uint8_t user_signal_exec_test_elf_end[];
 
-enum { RAMFS_PROGRAM_COUNT = 15 };
+enum { RAMFS_PROGRAM_COUNT = 16 };
 
 static const uint8_t motd_data[] =
     "Welcome to ROSE. Files now have descriptors and independent offsets.\n";
@@ -58,6 +60,7 @@ static struct vfs_node bin_nodes[RAMFS_PROGRAM_COUNT] = {
     {.name = "mkdir", .type = VFS_NODE_REGULAR},
     {.name = "rm", .type = VFS_NODE_REGULAR},
     {.name = "descriptor-test", .type = VFS_NODE_REGULAR},
+    {.name = "signal-exec-test", .type = VFS_NODE_REGULAR},
 };
 
 static const struct vfs_node etc_nodes[] = {
@@ -122,6 +125,8 @@ void ramfs_init(void) {
         ramfs_set_file(13U, user_rm_elf_start, user_rm_elf_end);
         ramfs_set_file(14U, user_descriptor_test_elf_start,
                        user_descriptor_test_elf_end);
+        ramfs_set_file(15U, user_signal_exec_test_elf_start,
+                       user_signal_exec_test_elf_end);
 
         if (!vfs_mount_root(&ramfs_root)) {
                 panic("Failed to mount initial ramfs");

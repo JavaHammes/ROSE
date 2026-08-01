@@ -28,6 +28,9 @@
 #define USER_SYSCALL_PIPE 22
 #define USER_SYSCALL_SET_DESCRIPTOR_FLAGS 23
 #define USER_SYSCALL_FORK 24
+#define USER_SYSCALL_SIGNAL_ACTION 25
+#define USER_SYSCALL_KILL 26
+#define USER_SYSCALL_SIGNAL_RETURN 27
 
 #else
 
@@ -57,11 +60,16 @@ enum user_syscall_number {
         USER_SYSCALL_PIPE = 22,
         USER_SYSCALL_SET_DESCRIPTOR_FLAGS = 23,
         USER_SYSCALL_FORK = 24,
+        USER_SYSCALL_SIGNAL_ACTION = 25,
+        USER_SYSCALL_KILL = 26,
+        USER_SYSCALL_SIGNAL_RETURN = 27,
 };
 
 /* Stable negative error values returned in a0 by failed system calls. */
 enum user_syscall_error {
         USER_ERROR_NO_ENTRY = 2,
+        USER_ERROR_NO_PROCESS = 3,
+        USER_ERROR_INTERRUPTED = 4,
         USER_ERROR_IO = 5,
         USER_ERROR_ARGUMENT_LIST_TOO_LONG = 7,
         USER_ERROR_EXEC_FORMAT = 8,
@@ -111,6 +119,29 @@ enum user_wait_options {
 #define USER_WAIT_STATUS_EXITED(status) (((uint32_t)(status) & 0x7fU) == 0U)
 #define USER_WAIT_STATUS_EXIT_CODE(status) \
         (((uint32_t)(status) >> 8U) & 0xffU)
+#define USER_WAIT_STATUS_SIGNALED(status) \
+        ((((uint32_t)(status) & 0x7fU) != 0U) && \
+         (((uint32_t)(status) & 0x7fU) != 0x7fU))
+#define USER_WAIT_STATUS_TERMINATION_SIGNAL(status) \
+        ((uint32_t)(status) & 0x7fU)
+
+/* Initial process-directed signals. Values follow the conventional Unix ABI
+ * so wait statuses and programs can use familiar numbers. */
+enum user_signal_number {
+        USER_SIGNAL_INTERRUPT = 2,
+        USER_SIGNAL_KILL = 9,
+        USER_SIGNAL_USER_1 = 10,
+        USER_SIGNAL_TERMINATE = 15,
+        USER_SIGNAL_MAX = 31,
+};
+
+#define USER_SIGNAL_DEFAULT ((uintptr_t)0U)
+#define USER_SIGNAL_IGNORE ((uintptr_t)1U)
+
+struct user_signal_action {
+        uintptr_t handler;
+        uint64_t flags;
+};
 
 enum user_file_type {
         USER_FILE_DIRECTORY,
@@ -165,6 +196,7 @@ enum user_program {
         USER_PROGRAM_MKDIR,
         USER_PROGRAM_RM,
         USER_PROGRAM_DESCRIPTOR_TEST,
+        USER_PROGRAM_SIGNAL_EXEC_TEST,
 };
 
 #endif

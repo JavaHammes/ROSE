@@ -16,6 +16,7 @@
 #include <stdint.h>
 
 #include "elf_loader.h"
+#include "interrupt.h"
 #include "page_allocator.h"
 #include "panic.h"
 #include "scheduler.h"
@@ -113,6 +114,11 @@ struct process_descriptor {
         bool close_on_exec;
 };
 
+struct process_signal_disposition {
+        uintptr_t handler;
+        uintptr_t restorer;
+};
+
 struct process {
         /* Scheduler-visible identity and saved execution state. */
         uint64_t pid;
@@ -127,9 +133,19 @@ struct process {
         uintptr_t heap_start;
         uintptr_t heap_break;
         uint64_t exit_status;
+        uint32_t termination_signal;
         bool exit_reported;
         char current_directory[USER_PATH_MAX];
         struct process_descriptor descriptors[PROCESS_DESCRIPTOR_LIMIT];
+
+        /* Dispositions survive fork. Caught handlers reset on exec, while an
+         * ignored disposition remains ignored. Only one handler can be active
+         * until its trusted sigreturn trampoline restores this saved frame. */
+        struct process_signal_disposition
+            signal_dispositions[USER_SIGNAL_MAX + 1U];
+        uint64_t pending_signals;
+        bool signal_active;
+        struct trap_frame signal_context;
 
         /* Blocking syscall continuation state. A process never returns to
          * U-mode while either pending flag is true. */
@@ -387,6 +403,22 @@ static void process_descriptors_close_on_exec(struct process *process) {
                         process_descriptor_close(&process->descriptors[index]);
                 }
         }
+}
+
+static void process_signals_reset_on_exec(struct process *process) {
+        for (size_t signal = 1U; signal <= USER_SIGNAL_MAX; signal++) {
+                struct process_signal_disposition *disposition =
+                    &process->signal_dispositions[signal];
+
+                if (disposition->handler != USER_SIGNAL_IGNORE) {
+                        disposition->handler = USER_SIGNAL_DEFAULT;
+                }
+                disposition->restorer = 0U;
+        }
+
+        process->signal_active = false;
+        bytes_zero(&process->signal_context,
+                   sizeof(process->signal_context));
 }
 
 /* Assert an expected user mapping during process construction. */
@@ -902,6 +934,15 @@ static uint64_t syscall_fork(const struct trap_frame *frame) {
         trap_frame_copy(&child->context, frame);
         child->context.a0 = 0U;
         child->context.sepc += 4U;
+        for (size_t signal = 1U; signal <= USER_SIGNAL_MAX; signal++) {
+                child->signal_dispositions[signal] =
+                    parent->signal_dispositions[signal];
+        }
+        child->signal_active = parent->signal_active;
+        if (parent->signal_active) {
+                trap_frame_copy(&child->signal_context,
+                                &parent->signal_context);
+        }
 
         size_t directory_length =
             string_length(parent->current_directory) + 1U;
@@ -1035,6 +1076,127 @@ static void user_copy_from(uint8_t *destination, uintptr_t user_buffer,
                 }
                 offset += chunk;
         }
+}
+
+static bool signal_number_is_valid(int64_t signal) {
+        return signal > 0 && signal <= USER_SIGNAL_MAX;
+}
+
+static uint64_t signal_bit(uint32_t signal) {
+        return UINT64_C(1) << signal;
+}
+
+static struct process *process_find_pid(uint64_t pid) {
+        for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
+                struct process *process = &process_table[index];
+
+                if (process->state != PROCESS_UNUSED &&
+                    process->state != PROCESS_EXITED && process->pid == pid) {
+                        return process;
+                }
+        }
+
+        return NULL;
+}
+
+static uint64_t syscall_signal_action(
+    int64_t signal, uintptr_t user_action, uintptr_t user_old_action,
+    uintptr_t user_restorer) {
+        if (!signal_number_is_valid(signal)) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+
+        struct user_signal_action new_action;
+        if (user_action != 0U) {
+                if (!user_range_is_valid(user_action, sizeof(new_action),
+                                         VM_PAGE_READ)) {
+                        return (uint64_t)-(int64_t)
+                            USER_ERROR_BAD_ADDRESS;
+                }
+                user_copy_from((uint8_t *)&new_action, user_action,
+                               sizeof(new_action));
+
+                if (signal == USER_SIGNAL_KILL || new_action.flags != 0U) {
+                        return (uint64_t)-(int64_t)
+                            USER_ERROR_INVALID_ARGUMENT;
+                }
+                if (new_action.handler != USER_SIGNAL_DEFAULT &&
+                    new_action.handler != USER_SIGNAL_IGNORE &&
+                    (!user_range_is_valid(new_action.handler, 1U,
+                                          VM_PAGE_EXECUTE) ||
+                     !user_range_is_valid(user_restorer, 1U,
+                                          VM_PAGE_EXECUTE))) {
+                        return (uint64_t)-(int64_t)
+                            USER_ERROR_BAD_ADDRESS;
+                }
+        }
+        if (user_old_action != 0U &&
+            !user_range_is_valid(user_old_action,
+                                 sizeof(struct user_signal_action),
+                                 VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+
+        struct process_signal_disposition *disposition =
+            &active_process->signal_dispositions[(size_t)signal];
+
+        if (user_old_action != 0U) {
+                struct user_signal_action old_action;
+                bytes_zero(&old_action, sizeof(old_action));
+                old_action.handler = disposition->handler;
+                user_copy_to(user_old_action, (const uint8_t *)&old_action,
+                             sizeof(old_action));
+        }
+        if (user_action != 0U) {
+                disposition->handler = new_action.handler;
+                disposition->restorer =
+                    new_action.handler > USER_SIGNAL_IGNORE ? user_restorer
+                                                            : 0U;
+                if (new_action.handler == USER_SIGNAL_IGNORE) {
+                        active_process->pending_signals &=
+                            ~signal_bit((uint32_t)signal);
+                }
+        }
+
+        return 0U;
+}
+
+static uint64_t syscall_kill(int64_t pid, int64_t signal) {
+        if (pid <= 0 || signal < 0 || signal > USER_SIGNAL_MAX) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+
+        struct process *target = process_find_pid((uint64_t)pid);
+        if (target == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_NO_PROCESS;
+        }
+        if (signal == 0) {
+                return 0U;
+        }
+
+        target->pending_signals |= signal_bit((uint32_t)signal);
+        if (target->state == PROCESS_BLOCKED) {
+                target->state = PROCESS_READY;
+                target->wait_channel = SCHEDULER_WAIT_NONE;
+        }
+
+        return 0U;
+}
+
+/* The interrupted frame never enters userspace, so sigreturn cannot forge
+ * sstatus, kernel mappings, or a supervisor return address. */
+static uint64_t syscall_signal_return(struct trap_frame *frame) {
+        if (!active_process->signal_active) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+
+        trap_frame_copy(frame, &active_process->signal_context);
+        trap_frame_copy(&active_process->context,
+                        &active_process->signal_context);
+        bytes_zero(&active_process->signal_context,
+                   sizeof(active_process->signal_context));
+        active_process->signal_active = false;
+        return 0U;
 }
 
 /* Copy a bounded null-terminated path without dereferencing a user pointer. */
@@ -1359,6 +1521,7 @@ static void process_commit_replacement(struct trap_frame *frame) {
         trap_frame_copy(frame, &exec_replacement.context);
         bytes_zero(&exec_replacement.context,
                    sizeof(exec_replacement.context));
+        process_signals_reset_on_exec(active_process);
 }
 
 static uint64_t syscall_execve(struct trap_frame *frame, uintptr_t user_path,
@@ -1508,8 +1671,11 @@ static void syscall_waitpid(struct trap_frame *frame, int64_t requested_pid,
                 }
 
                 uint64_t child_pid = child->pid;
-                int wait_status =
-                    (int)((child->exit_status & UINT64_C(0xff)) << 8U);
+                int wait_status = child->termination_signal != 0U
+                                      ? (int)(child->termination_signal & 0x7fU)
+                                      : (int)((child->exit_status &
+                                               UINT64_C(0xff))
+                                              << 8U);
 
                 if (user_status != 0U) {
                         user_copy_to(user_status,
@@ -2429,6 +2595,12 @@ static void user_process_finish(struct trap_frame *frame, uint64_t status) {
                 panic_trap("Invalid user process return state", frame);
         }
 
+        if (uart_write_owner == active_process) {
+                uart_write_owner = NULL;
+                (void)scheduler_wake_all(SCHEDULER_WAIT_UART_TX);
+        }
+        active_process->pending_write = false;
+        active_process->pending_read = false;
         active_process->state = PROCESS_EXITED;
         active_process->exit_status = status;
         process_orphan_children(active_process->pid);
@@ -2445,12 +2617,73 @@ static void user_process_finish(struct trap_frame *frame, uint64_t status) {
         scheduler_return_to_kernel(frame);
 }
 
+static uint32_t process_next_pending_signal(const struct process *process) {
+        if ((process->pending_signals &
+             signal_bit(USER_SIGNAL_KILL)) != 0U) {
+                return USER_SIGNAL_KILL;
+        }
+
+        for (uint32_t signal = 1U; signal <= USER_SIGNAL_MAX; signal++) {
+                if ((process->pending_signals & signal_bit(signal)) != 0U) {
+                        return signal;
+                }
+        }
+
+        return 0U;
+}
+
+/* Deliver at the final trap-return boundary, after any scheduling decision has
+ * selected the address space represented by frame. Ignored signals are drained
+ * immediately; default termination may select another process and continue. */
+static void process_deliver_pending_signals(struct trap_frame *frame) {
+        while (user_process_is_active()) {
+                struct process *process = active_process;
+                uint32_t signal = process_next_pending_signal(process);
+
+                if (signal == 0U ||
+                    (process->signal_active &&
+                     signal != USER_SIGNAL_KILL)) {
+                        return;
+                }
+
+                process->pending_signals &= ~signal_bit(signal);
+                const struct process_signal_disposition *disposition =
+                    &process->signal_dispositions[signal];
+
+                if (disposition->handler == USER_SIGNAL_IGNORE &&
+                    signal != USER_SIGNAL_KILL) {
+                        continue;
+                }
+                if (disposition->handler == USER_SIGNAL_DEFAULT ||
+                    signal == USER_SIGNAL_KILL) {
+                        process->termination_signal = signal;
+                        user_process_finish(frame, 128U + signal);
+                        continue;
+                }
+
+                trap_frame_copy(&process->signal_context, frame);
+                process->signal_active = true;
+                frame->sepc = disposition->handler;
+                frame->ra = disposition->restorer;
+                frame->a0 = signal;
+                frame->a1 = 0U;
+                frame->a2 = 0U;
+                trap_frame_copy(&process->context, frame);
+                return;
+        }
+}
+
 /* Print a zombie's retained status exactly once. */
 static void print_process_exit(const struct process *process) {
         uart_puts("Process ");
         uart_put_uint64(process->pid);
-        uart_puts(" exited with status ");
-        uart_put_uint64(process->exit_status);
+        if (process->termination_signal != 0U) {
+                uart_puts(" terminated by signal ");
+                uart_put_uint64(process->termination_signal);
+        } else {
+                uart_puts(" exited with status ");
+                uart_put_uint64(process->exit_status);
+        }
         uart_putc('\n');
 }
 
@@ -2484,6 +2717,28 @@ static bool scheduler_has_blocked_processes(void) {
         return false;
 }
 
+static uint64_t scheduler_interrupts_disable(void) {
+        uint64_t previous_status;
+        uint64_t interrupt_enable = SSTATUS_SIE;
+
+        __asm__ volatile("csrrc %[previous], sstatus, %[mask]"
+                         : [previous] "=r"(previous_status)
+                         : [mask] "r"(interrupt_enable)
+                         : "memory");
+        return previous_status;
+}
+
+static void scheduler_interrupts_restore(uint64_t previous_status) {
+        if ((previous_status & SSTATUS_SIE) != 0U) {
+                uint64_t interrupt_enable = SSTATUS_SIE;
+
+                __asm__ volatile("csrs sstatus, %[mask]"
+                                 :
+                                 : [mask] "r"(interrupt_enable)
+                                 : "memory");
+        }
+}
+
 /*
  * Enter READY processes until no live work remains. user_mode_enter saves the
  * supervisor ABI context and sret enters U-mode; exits and all-blocked states
@@ -2512,22 +2767,25 @@ static bool scheduler_run_ready(void) {
          * of whichever process an interrupt makes READY. */
         while (true) {
                 if (first == NULL) {
+                        /* Mask trap delivery while deciding between running,
+                         * sleeping, and finishing. WFI still resumes for an
+                         * individually enabled pending interrupt when SIE is
+                         * clear, so an IRQ cannot be consumed between the
+                         * final state scan and sleep. */
+                        uint64_t previous_status =
+                            scheduler_interrupts_disable();
                         first = scheduler_find_next_ready();
                         if (first != NULL) {
+                                scheduler_interrupts_restore(previous_status);
                                 continue;
                         }
                         if (!scheduler_has_blocked_processes()) {
-                                /* Recheck READY after BLOCKED. An interrupt can
-                                 * wake the last blocked process between the
-                                 * first ready scan and the blocked scan. */
-                                first = scheduler_find_next_ready();
-                                if (first == NULL) {
-                                        break;
-                                }
-                                continue;
+                                scheduler_interrupts_restore(previous_status);
+                                break;
                         }
 
                         __asm__ volatile("wfi");
+                        scheduler_interrupts_restore(previous_status);
                         continue;
                 }
 
@@ -2800,6 +3058,28 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 frame->sepc += 4U;
                 return;
 
+        case USER_SYSCALL_SIGNAL_ACTION:
+                frame->a0 = syscall_signal_action(
+                    (int64_t)frame->a0, (uintptr_t)frame->a1,
+                    (uintptr_t)frame->a2, (uintptr_t)frame->a3);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_KILL:
+                frame->a0 = syscall_kill((int64_t)frame->a0,
+                                         (int64_t)frame->a1);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_SIGNAL_RETURN: {
+                uint64_t result = syscall_signal_return(frame);
+                if (result != 0U) {
+                        frame->a0 = result;
+                        frame->sepc += 4U;
+                }
+                return;
+        }
+
         case USER_SYSCALL_BRK:
                 frame->a0 = syscall_brk((uintptr_t)frame->a0);
                 frame->sepc += 4U;
@@ -2839,8 +3119,14 @@ void user_process_handle_fault(struct trap_frame *frame, uint64_t cause) {
  * again after sret. This is done after scheduling because the selected process
  * may differ from the one which entered the handler. */
 void user_process_prepare_user_return(struct trap_frame *frame) {
-        if (!user_process_is_active() ||
-            active_process->kernel_trap_stack == NULL) {
+        process_deliver_pending_signals(frame);
+
+        /* Default termination of the final process redirects this trap back
+         * to the suspended supervisor scheduler rather than to U-mode. */
+        if (!user_process_is_active()) {
+                return;
+        }
+        if (active_process->kernel_trap_stack == NULL) {
                 panic_trap("Invalid scheduled user return", frame);
         }
 

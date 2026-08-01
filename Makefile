@@ -44,7 +44,7 @@ USER_COMMON_OBJECTS := \
 # Each userspace path is a distinct ELF. Demonstrations share a build-time
 # selected source, while /bin/sh adds its own implementation object. The disk
 # receives every image; the diagnostic ramfs retains its programs and shell.
-USER_PROGRAMS := hello fault process_a process_b syscall_test cat console_read init fs_test args_env execve execve_target pipe_test pipe_writer sh ls echo pwd env mkdir rm descriptor_test
+USER_PROGRAMS := hello fault process_a process_b syscall_test cat console_read init fs_test args_env execve execve_target pipe_test pipe_writer sh ls echo pwd env mkdir rm descriptor_test signal_exec_test
 USER_PROGRAM_hello := 0
 USER_PROGRAM_fault := 1
 USER_PROGRAM_process_a := 2
@@ -67,11 +67,12 @@ USER_PROGRAM_env := 18
 USER_PROGRAM_mkdir := 19
 USER_PROGRAM_rm := 20
 USER_PROGRAM_descriptor_test := 21
+USER_PROGRAM_signal_exec_test := 22
 # The shell must stay within ext2's twelve-direct-block file limit.
 USER_PROGRAM_CFLAGS_sh := -Os
 USER_ELFS := $(foreach program,$(USER_PROGRAMS),$(BUILD_DIR)/user/$(program)/program.elf)
 USER_LOAD_ELFS := $(USER_ELFS:.elf=.load.elf)
-USER_FALLBACK_PROGRAMS := hello fault process_a process_b syscall_test cat console_read sh ls echo pwd env mkdir rm descriptor_test
+USER_FALLBACK_PROGRAMS := hello fault process_a process_b syscall_test cat console_read sh ls echo pwd env mkdir rm descriptor_test signal_exec_test
 USER_FALLBACK_ELFS := $(foreach program,$(USER_FALLBACK_PROGRAMS),$(BUILD_DIR)/user/$(program)/program.load.elf)
 USER_IMAGE_OBJECT := $(BUILD_DIR)/kernel/arch/riscv64/user_image.o
 
@@ -177,6 +178,7 @@ $(ROOT_IMAGE): tools/mkrosefs.py $(USER_LOAD_ELFS)
 		--file /bin/mkdir=$(BUILD_DIR)/user/mkdir/program.load.elf \
 		--file /bin/rm=$(BUILD_DIR)/user/rm/program.load.elf \
 		--file /bin/descriptor-test=$(BUILD_DIR)/user/descriptor_test/program.load.elf \
+		--file /bin/signal-exec-test=$(BUILD_DIR)/user/signal_exec_test/program.load.elf \
 		--file /sbin/init=$(BUILD_DIR)/user/init/program.load.elf
 
 

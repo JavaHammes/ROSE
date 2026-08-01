@@ -193,6 +193,7 @@ def main() -> int:
             "Descriptor duplication passed",
             "Descriptor inheritance passed",
             "Fork semantics passed",
+            "Signal delivery passed",
             "Process hierarchy passed",
             "Userspace heap passed",
             "Syscall validation passed",
@@ -293,6 +294,7 @@ def main() -> int:
             fallback.command("syscall-test"),
             "Descriptor inheritance passed",
             "Fork semantics passed",
+            "Signal delivery passed",
             "Syscall validation passed",
         )
         fallback.shutdown()

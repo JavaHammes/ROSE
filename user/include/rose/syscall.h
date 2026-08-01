@@ -35,6 +35,11 @@ long rose_spawn(const char *path, char *const arguments[],
 long rose_getpid(void);
 long rose_waitpid(int64_t pid, int *status, uint32_t options);
 
+/* Install signal dispositions and direct a signal to one process. */
+long rose_sigaction(int signal, const struct user_signal_action *action,
+                    struct user_signal_action *old_action);
+long rose_kill(int64_t pid, int signal);
+
 /* Query or move the process break. Address zero queries without changing it;
  * success returns the resulting break and failure returns a negative error. */
 long rose_brk(uintptr_t address);

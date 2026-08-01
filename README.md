@@ -35,14 +35,14 @@ scheduling, and automated emulator tests.
   open-file table, with standard input, output, and error attached to
   `/dev/console`; aliases inherited by `dup`, `fork`, and `spawn` share their
   file offset and remain usable until the final alias is closed. Anonymous
-  pipes provide buffered interprocess byte streams, blocking reads and writes, EOF
-  and broken-pipe handling, descriptor inheritance across `spawn`, and endpoint
+  pipes provide buffered interprocess byte streams, blocking reads and writes,
+  EOF and broken-pipe handling, descriptor inheritance across `spawn`, and endpoint
   lifetime tracking across descriptor aliases. Per-descriptor close-on-exec
   flags keep shell-private pipe ends and saved descriptors out of child images.
 - U-mode C runtime with descriptor I/O, `open`, `close`, `stat`, `fstat`,
   `lseek`, `dup`, `dup2`, directory iteration, `mkdir`, `unlink`, `chdir`,
   `getcwd`, `pipe`, descriptor flags, `fork`, `spawn`, `execve`, `getpid`,
-  `waitpid`, `brk`, `exit`, and `yield`
+  `waitpid`, `sigaction`, `kill`, `brk`, `exit`, and `yield`
   system calls. Relative paths resolve from a canonical per-process working
   directory. `brk` provides a private, zero-filled, growable userspace heap
   between the ELF image and stack guard; shrinking or process teardown returns
@@ -53,11 +53,17 @@ scheduling, and automated emulator tests.
   and preserves shared open-file descriptions and descriptor flags. `spawn`
   creates a child with copied arguments,
   environment, working directory, and inheritable descriptors; `waitpid`
-  supports a specific child or any child and optional nonblocking polling.
+  supports a specific child or any child, signal termination status, and
+  optional nonblocking polling.
   Programs start with conventional `argc`, `argv`, and `envp` values copied to
   their private stack.
   UART reads and writes block on scheduler wait channels and resume from device
   interrupts without polling in syscall traps.
+- Process-directed signals with default termination, ignore, and caught
+  dispositions. Caught handlers return through a runtime trampoline and a
+  kernel-held register frame, preventing `sigreturn` from forging privileged
+  state. `SIGKILL` remains uncatchable, delivery wakes blocked targets,
+  dispositions are inherited by `fork`, and caught handlers reset on `execve`.
 - Interactive `/bin/sh` process with console line editing, quoted and escaped
   argument parsing, mutable environment variables, `PATH` lookup, working
   directory built-ins, `<` and truncating `>` redirection, and foreground
@@ -67,8 +73,9 @@ scheduling, and automated emulator tests.
 - Eight-slot round-robin process scheduler with timer preemption, guarded user
   stacks, per-process kernel trap stacks, process creation, termination,
   parent/child ownership, orphan adoption by PID 0, waiting, reaping, typed
-  block/wake channels, and an interruptible idle path. On a disk-root boot,
-  `/sbin/init` remains PID 1 while its `/bin/sh` child is running.
+  block/wake channels, and an interruptible idle path with an atomic
+  interrupt-masked readiness check. On a disk-root boot, `/sbin/init` remains
+  PID 1 while its `/bin/sh` child is running.
 - Interrupt-driven UART input, PLIC external interrupts, SBI timers, panic
   diagnostics, and clean shutdown after the userspace shell exits.
 - Automated QEMU tests at two RAM sizes, including leak detection.
@@ -171,8 +178,10 @@ mutation, directory utilities, input/output redirection, multi-stage pipelines,
 user/kernel isolation, syscall validation, working-directory resolution,
 shared descriptor offsets across aliases and processes, close-on-exec
 inheritance, userspace heap growth and shrinkage, eager `fork` address-space
-isolation, blocking UART and pipe I/O, child creation and waiting, memory
-reclamation, fallback-ramfs shell boot, and clean shutdown.
+isolation, caught/ignored/default signal delivery, signal wakeup of blocked
+processes, fork inheritance and exec reset of dispositions, blocking UART and
+pipe I/O, child creation and waiting, memory reclamation, fallback-ramfs shell
+boot, and clean shutdown.
 
 For source-level debugging, use `make debug` in one terminal and `make gdb` in
 another. `make disassemble` writes an annotated disassembly to
@@ -213,5 +222,7 @@ write-through, limited to one block group and twelve direct blocks per inode
 (12 KiB files), and does not yet provide journaling or crash recovery. The
 VirtIO queue is polled synchronously; it is not yet connected to a scheduler
 completion channel. `fork` currently copies pages eagerly rather than using
-copy-on-write. There are no signals, general-purpose kernel threads, ASIDs,
-networking, users, or permissions enforcement.
+copy-on-write. Signals do not yet have masks, alternate stacks, process-group
+delivery, stop/continue behavior, or realtime queues. There are no
+general-purpose kernel threads, ASIDs, networking, users, or permissions
+enforcement.

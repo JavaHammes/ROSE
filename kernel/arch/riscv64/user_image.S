@@ -109,6 +109,13 @@ user_descriptor_test_elf_start:
 .globl user_descriptor_test_elf_end
 user_descriptor_test_elf_end:
 
+.balign 16
+.globl user_signal_exec_test_elf_start
+user_signal_exec_test_elf_start:
+    .incbin "kernel/build/user/signal_exec_test/program.load.elf"
+.globl user_signal_exec_test_elf_end
+user_signal_exec_test_elf_end:
+
 .globl user_program_elf_end
 user_program_elf_end:
 

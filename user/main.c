@@ -20,6 +20,13 @@
 /* Nonzero .data and zero-initialized .bss values verify both ELF load paths. */
 static volatile uint64_t user_cookie = UINT64_C(0x524f5345);
 static volatile uint64_t user_counter;
+static volatile uint64_t user_signal_count;
+
+static void signal_test_handler(int signal) {
+        if (signal == USER_SIGNAL_USER_1) {
+                user_signal_count++;
+        }
+}
 
 /* Linked only into /bin/sh; constant program selection removes the reference
  * from every other independently linked user image. */
@@ -312,6 +319,135 @@ static int run_syscall_test(void) {
                 return 56;
         }
 
+        struct user_signal_action signal_action = {
+            .handler = (uintptr_t)signal_test_handler,
+            .flags = 0U,
+        };
+        struct user_signal_action old_signal_action;
+        struct user_signal_action ignored_signal_action = {
+            .handler = USER_SIGNAL_IGNORE,
+            .flags = 0U,
+        };
+        struct user_signal_action default_signal_action = {
+            .handler = USER_SIGNAL_DEFAULT,
+            .flags = 0U,
+        };
+
+        if (rose_sigaction(0, &signal_action, NULL) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_sigaction(USER_SIGNAL_KILL, &signal_action, NULL) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_sigaction(USER_SIGNAL_USER_1,
+                           (const struct user_signal_action *)kernel_address,
+                           NULL) != -USER_ERROR_BAD_ADDRESS ||
+            rose_sigaction(USER_SIGNAL_USER_1, &signal_action,
+                           (struct user_signal_action *)kernel_address) !=
+                -USER_ERROR_BAD_ADDRESS ||
+            rose_sigaction(USER_SIGNAL_USER_1, &signal_action,
+                           &old_signal_action) != 0 ||
+            old_signal_action.handler != USER_SIGNAL_DEFAULT ||
+            old_signal_action.flags != 0U ||
+            rose_kill(-1, 0) != -USER_ERROR_INVALID_ARGUMENT ||
+            rose_kill(INT64_MAX, 0) != -USER_ERROR_NO_PROCESS ||
+            rose_kill(parent_pid, USER_SIGNAL_MAX + 1) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_kill(parent_pid, 0) != 0 ||
+            rose_syscall(USER_SYSCALL_SIGNAL_RETURN, 0U, 0U, 0U) !=
+                -USER_ERROR_INVALID_ARGUMENT) {
+                return 59;
+        }
+
+        user_signal_count = 0U;
+        if (rose_kill(parent_pid, USER_SIGNAL_USER_1) != 0 ||
+            user_signal_count != 1U ||
+            rose_sigaction(USER_SIGNAL_TERMINATE, &ignored_signal_action,
+                           NULL) != 0 ||
+            rose_kill(parent_pid, USER_SIGNAL_TERMINATE) != 0 ||
+            user_signal_count != 1U ||
+            rose_sigaction(USER_SIGNAL_TERMINATE, &default_signal_action,
+                           NULL) != 0) {
+                return 60;
+        }
+
+        /* Caught dispositions survive fork, while the handler's data and
+         * interrupted frame remain private to each address space. */
+        long signal_child = rose_fork();
+        if (signal_child < 0) {
+                return 61;
+        }
+        if (signal_child == 0) {
+                long signal_child_pid = rose_getpid();
+                if (user_signal_count != 1U || signal_child_pid <= 0 ||
+                    rose_kill(signal_child_pid, USER_SIGNAL_USER_1) != 0 ||
+                    user_signal_count != 2U) {
+                        rose_exit(62U);
+                }
+                rose_exit(0U);
+        }
+        fork_status = -1;
+        if (rose_waitpid(signal_child, &fork_status, 0U) != signal_child ||
+            !USER_WAIT_STATUS_EXITED(fork_status) ||
+            USER_WAIT_STATUS_EXIT_CODE(fork_status) != 0U ||
+            user_signal_count != 1U) {
+                return 63;
+        }
+
+        /* A default disposition terminates a target before it next enters
+         * userspace and waitpid reports the signal rather than an exit code. */
+        int signal_pipe[2] = {-1, -1};
+        if (rose_pipe(signal_pipe) != 0) {
+                return 64;
+        }
+        signal_child = rose_fork();
+        if (signal_child < 0) {
+                return 64;
+        }
+        if (signal_child == 0) {
+                char blocked_byte;
+                if (rose_close(signal_pipe[1]) != 0 ||
+                    rose_read(signal_pipe[0], &blocked_byte, 1U) >= 0) {
+                        rose_exit(64U);
+                }
+                rose_exit(64U);
+        }
+        if (rose_close(signal_pipe[0]) != 0) {
+                return 65;
+        }
+        rose_yield();
+        if (rose_kill(signal_child, USER_SIGNAL_TERMINATE) != 0 ||
+            rose_close(signal_pipe[1]) != 0) {
+                return 65;
+        }
+        fork_status = -1;
+        if (rose_waitpid(signal_child, &fork_status, 0U) != signal_child ||
+            !USER_WAIT_STATUS_SIGNALED(fork_status) ||
+            USER_WAIT_STATUS_TERMINATION_SIGNAL(fork_status) !=
+                USER_SIGNAL_TERMINATE) {
+                return 66;
+        }
+
+        /* exec resets a caught disposition to default. */
+        signal_child = rose_fork();
+        if (signal_child < 0) {
+                return 67;
+        }
+        if (signal_child == 0) {
+                char *signal_arguments[] = {
+                    "/bin/signal-exec-test", NULL};
+                char *signal_environment[] = {NULL};
+                (void)rose_execve("/bin/signal-exec-test",
+                                  signal_arguments,
+                                  signal_environment);
+                rose_exit(68U);
+        }
+        fork_status = -1;
+        if (rose_waitpid(signal_child, &fork_status, 0U) != signal_child ||
+            !USER_WAIT_STATUS_SIGNALED(fork_status) ||
+            USER_WAIT_STATUS_TERMINATION_SIGNAL(fork_status) !=
+                USER_SIGNAL_USER_1) {
+                return 69;
+        }
+
         char *child_arguments[] = {"/bin/hello", NULL};
         char *child_environment[] = {NULL};
 
@@ -371,6 +507,7 @@ static int run_syscall_test(void) {
 
         print("Process hierarchy passed\n");
         print("Fork semantics passed\n");
+        print("Signal delivery passed\n");
         print("Descriptor inheritance passed\n");
         print("Userspace heap passed\n");
         print("Syscall validation passed\n");
@@ -544,6 +681,17 @@ static int run_descriptor_test(void) {
                 return 1;
         }
         return 0;
+}
+
+/* A caught disposition must reset to default across exec. The calling test
+ * expects this image to be terminated before rose_kill can return. */
+static int run_signal_exec_test(void) {
+        long pid = rose_getpid();
+
+        if (pid <= 0 || rose_kill(pid, USER_SIGNAL_USER_1) != 0) {
+                return 57;
+        }
+        return 58;
 }
 
 static bool strings_equal(const char *left, const char *right) {
@@ -875,7 +1023,8 @@ int user_main(int argc, char **argv,
         /* Every address space starts from the original ELF contents. A failure
          * here catches missing .data copies, missing BSS zeroing, or leaked
          * writable pages between processes. */
-        if (user_cookie != UINT64_C(0x524f5345) || user_counter != 0U) {
+        if (user_cookie != UINT64_C(0x524f5345) || user_counter != 0U ||
+            user_signal_count != 0U) {
                 return 3;
         }
 
@@ -956,6 +1105,9 @@ int user_main(int argc, char **argv,
 
         case USER_PROGRAM_DESCRIPTOR_TEST:
                 return run_descriptor_test();
+
+        case USER_PROGRAM_SIGNAL_EXEC_TEST:
+                return run_signal_exec_test();
 
         default:
                 return 2;

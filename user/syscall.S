@@ -228,6 +228,41 @@ rose_waitpid:
     ret
 .size rose_waitpid, . - rose_waitpid
 
+.section .text.rose_sigaction,"ax",@progbits
+.align 2
+.globl rose_sigaction
+.type rose_sigaction, @function
+rose_sigaction:
+    /* a3 gives the kernel the trusted userspace return trampoline associated
+     * with this runtime. It is retained only for a caught disposition. */
+    la a3, rose_signal_trampoline
+    li a7, USER_SYSCALL_SIGNAL_ACTION
+    ecall
+    ret
+.size rose_sigaction, . - rose_sigaction
+
+.section .text.rose_kill,"ax",@progbits
+.align 2
+.globl rose_kill
+.type rose_kill, @function
+rose_kill:
+    li a7, USER_SYSCALL_KILL
+    ecall
+    ret
+.size rose_kill, . - rose_kill
+
+.section .text.rose_signal_trampoline,"ax",@progbits
+.align 2
+.type rose_signal_trampoline, @function
+rose_signal_trampoline:
+    /* A signal handler returns here through ra. sigreturn restores the entire
+     * interrupted register frame and therefore never resumes this sequence. */
+    li a7, USER_SYSCALL_SIGNAL_RETURN
+    ecall
+1:
+    j 1b
+.size rose_signal_trampoline, . - rose_signal_trampoline
+
 .section .text.rose_brk,"ax",@progbits
 .align 2
 .globl rose_brk
