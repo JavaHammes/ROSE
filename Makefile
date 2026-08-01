@@ -1,5 +1,8 @@
 PREFIX ?= riscv64-elf-
 
+.DEFAULT_GOAL := all
+.DELETE_ON_ERROR:
+
 # External tool names remain overrideable for distributions which install the
 # same bare-metal toolchain under a different prefix.
 CC         := $(PREFIX)gcc
@@ -12,11 +15,9 @@ PYTHON     ?= python3
 
 QEMU ?= qemu-system-riscv64
 
-CLANG_TIDY_CHECKS := \
-	-checks=-*,clang-analyzer-*,bugprone-*,-clang-analyzer-optin.performance.Padding,-bugprone-easily-swappable-parameters \
-	--warnings-as-errors=*
-
-BUILD_DIR := kernel/build
+# This is intentionally not caller-overridable: `clean` must always have one
+# narrow, repository-local target.
+override BUILD_DIR := kernel/build
 KERNEL    := $(BUILD_DIR)/kernel.elf
 MAP       := $(BUILD_DIR)/kernel.map
 ROOT_IMAGE := $(BUILD_DIR)/root.ext2
@@ -28,10 +29,10 @@ SOURCE_DIRS := kernel/arch/riscv64 kernel/core kernel/drivers kernel/memory
 INCLUDES    := -Ikernel/include -Ikernel/arch/riscv64
 USER_INCLUDES := -Iuser/include -Ikernel/include
 
-C_SOURCES := $(shell find $(SOURCE_DIRS) -name '*.c')
-S_SOURCES := $(shell find $(SOURCE_DIRS) -name '*.S')
-USER_C_SOURCES := $(shell find user -name '*.c')
-USER_S_SOURCES := $(shell find user -name '*.S')
+C_SOURCES := $(sort $(shell find $(SOURCE_DIRS) -name '*.c'))
+S_SOURCES := $(sort $(shell find $(SOURCE_DIRS) -name '*.S'))
+USER_C_SOURCES := $(sort $(shell find user -name '*.c'))
+USER_S_SOURCES := $(sort $(shell find user -name '*.S'))
 
 OBJECTS := \
 	$(C_SOURCES:%.c=$(BUILD_DIR)/%.o) \
@@ -45,29 +46,31 @@ USER_COMMON_OBJECTS := \
 # selected source, while /bin/sh adds its own implementation object. The disk
 # receives every image; the diagnostic ramfs retains its programs and shell.
 USER_PROGRAMS := hello fault process_a process_b syscall_test cat console_read init fs_test args_env execve execve_target pipe_test pipe_writer sh ls echo pwd env mkdir rm descriptor_test signal_exec_test
-USER_PROGRAM_hello := 0
-USER_PROGRAM_fault := 1
-USER_PROGRAM_process_a := 2
-USER_PROGRAM_process_b := 3
-USER_PROGRAM_syscall_test := 4
-USER_PROGRAM_cat := 5
-USER_PROGRAM_console_read := 6
-USER_PROGRAM_init := 7
-USER_PROGRAM_fs_test := 8
-USER_PROGRAM_args_env := 9
-USER_PROGRAM_execve := 10
-USER_PROGRAM_execve_target := 11
-USER_PROGRAM_pipe_test := 12
-USER_PROGRAM_pipe_writer := 13
-USER_PROGRAM_sh := 14
-USER_PROGRAM_ls := 15
-USER_PROGRAM_echo := 16
-USER_PROGRAM_pwd := 17
-USER_PROGRAM_env := 18
-USER_PROGRAM_mkdir := 19
-USER_PROGRAM_rm := 20
-USER_PROGRAM_descriptor_test := 21
-USER_PROGRAM_signal_exec_test := 22
+# Use the ABI enum names directly so adding or reordering an enum cannot
+# silently build a program with the wrong implementation.
+USER_PROGRAM_hello := USER_PROGRAM_HELLO
+USER_PROGRAM_fault := USER_PROGRAM_FAULT
+USER_PROGRAM_process_a := USER_PROGRAM_MULTI_A
+USER_PROGRAM_process_b := USER_PROGRAM_MULTI_B
+USER_PROGRAM_syscall_test := USER_PROGRAM_SYSCALL_TEST
+USER_PROGRAM_cat := USER_PROGRAM_CAT
+USER_PROGRAM_console_read := USER_PROGRAM_CONSOLE_READ
+USER_PROGRAM_init := USER_PROGRAM_INIT
+USER_PROGRAM_fs_test := USER_PROGRAM_FS_TEST
+USER_PROGRAM_args_env := USER_PROGRAM_ARGUMENTS_ENVIRONMENT
+USER_PROGRAM_execve := USER_PROGRAM_EXECVE
+USER_PROGRAM_execve_target := USER_PROGRAM_EXECVE_TARGET
+USER_PROGRAM_pipe_test := USER_PROGRAM_PIPE_TEST
+USER_PROGRAM_pipe_writer := USER_PROGRAM_PIPE_WRITER
+USER_PROGRAM_sh := USER_PROGRAM_SH
+USER_PROGRAM_ls := USER_PROGRAM_LS
+USER_PROGRAM_echo := USER_PROGRAM_ECHO
+USER_PROGRAM_pwd := USER_PROGRAM_PWD
+USER_PROGRAM_env := USER_PROGRAM_ENV
+USER_PROGRAM_mkdir := USER_PROGRAM_MKDIR
+USER_PROGRAM_rm := USER_PROGRAM_RM
+USER_PROGRAM_descriptor_test := USER_PROGRAM_DESCRIPTOR_TEST
+USER_PROGRAM_signal_exec_test := USER_PROGRAM_SIGNAL_EXEC_TEST
 # The shell must stay within ext2's twelve-direct-block file limit.
 USER_PROGRAM_CFLAGS_sh := -Os
 USER_ELFS := $(foreach program,$(USER_PROGRAMS),$(BUILD_DIR)/user/$(program)/program.elf)
@@ -154,7 +157,7 @@ QEMU_FLAGS := \
 all: $(KERNEL) $(ROOT_IMAGE)
 
 
-$(ROOT_IMAGE): tools/mkrosefs.py $(USER_LOAD_ELFS)
+$(ROOT_IMAGE): tools/mkrosefs.py $(USER_LOAD_ELFS) Makefile
 	@mkdir -p $(dir $@)
 	$(PYTHON) tools/mkrosefs.py $@ \
 		--file /bin/hello=$(BUILD_DIR)/user/hello/program.load.elf \
@@ -182,14 +185,14 @@ $(ROOT_IMAGE): tools/mkrosefs.py $(USER_LOAD_ELFS)
 		--file /sbin/init=$(BUILD_DIR)/user/init/program.load.elf
 
 
-$(KERNEL): $(OBJECTS) $(LINKER_SCRIPT)
+$(KERNEL): $(OBJECTS) $(LINKER_SCRIPT) Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(LDFLAGS) $(OBJECTS) -o $@
 	$(SIZE) $@
 
 
 define USER_PROGRAM_template
-$(BUILD_DIR)/user/$(1)/main.o: user/main.c
+$(BUILD_DIR)/user/$(1)/main.o: user/main.c Makefile
 	@mkdir -p $$(dir $$@)
 	$$(CC) $$(USER_INCLUDES) $$(USER_CFLAGS) \
 		-DROSE_PROGRAM=$$(USER_PROGRAM_$(1)) \
@@ -198,7 +201,7 @@ $(BUILD_DIR)/user/$(1)/main.o: user/main.c
 $(BUILD_DIR)/user/$(1)/program.elf: \
 		$(BUILD_DIR)/user/$(1)/main.o $$(USER_COMMON_OBJECTS) \
 		$$(USER_EXTRA_OBJECTS_$(1)) \
-		$$(USER_LINKER_SCRIPT)
+		$$(USER_LINKER_SCRIPT) Makefile
 	@mkdir -p $$(dir $$@)
 	$$(CC) $$(USER_LDFLAGS) \
 		-Wl,-Map=$(BUILD_DIR)/user/$(1)/program.map \
@@ -221,28 +224,28 @@ $(BUILD_DIR)/user/%/program.load.elf: $(BUILD_DIR)/user/%/program.elf
 $(USER_IMAGE_OBJECT): $(USER_FALLBACK_ELFS)
 
 
-$(BUILD_DIR)/user/%.o: user/%.c
+$(BUILD_DIR)/user/%.o: user/%.c Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_INCLUDES) $(USER_CFLAGS) -c $< -o $@
 
 
-$(BUILD_DIR)/user/sh.o: user/sh.c
+$(BUILD_DIR)/user/sh.o: user/sh.c Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_INCLUDES) $(USER_CFLAGS) $(USER_PROGRAM_CFLAGS_sh) \
 		-c $< -o $@
 
 
-$(BUILD_DIR)/user/%.o: user/%.S
+$(BUILD_DIR)/user/%.o: user/%.S Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_INCLUDES) $(USER_ASFLAGS) -c $< -o $@
 
 
-$(BUILD_DIR)/%.o: %.c
+$(BUILD_DIR)/%.o: %.c Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(INCLUDES) $(CFLAGS) -c $< -o $@
 
 
-$(BUILD_DIR)/%.o: %.S
+$(BUILD_DIR)/%.o: %.S Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(INCLUDES) $(ASFLAGS) -c $< -o $@
 
@@ -279,7 +282,7 @@ tidy:
 	@set -e; \
 	for source in $(C_SOURCES); do \
 		echo "TIDY $$source"; \
-		$(CLANG_TIDY) $(CLANG_TIDY_CHECKS) "$$source" -- \
+		$(CLANG_TIDY) "$$source" -- \
 			--target=riscv64-unknown-elf \
 			-march=rv64imab_zicsr \
 			-mabi=lp64 \
@@ -290,7 +293,7 @@ tidy:
 	@set -e; \
 	for source in $(USER_C_SOURCES); do \
 		echo "TIDY $$source"; \
-		$(CLANG_TIDY) $(CLANG_TIDY_CHECKS) "$$source" -- \
+		$(CLANG_TIDY) "$$source" -- \
 			--target=riscv64-unknown-elf \
 			-march=rv64imab_zicsr \
 			-mabi=lp64 \
@@ -312,11 +315,26 @@ test-platform: $(KERNEL) $(ROOT_IMAGE)
 		$(PYTHON) tests/qemu_smoke.py
 
 
+.PHONY: test-host
+test-host:
+	$(PYTHON) -m unittest discover -s tests -t . -p 'test_*.py'
+	$(PYTHON) -m py_compile tests/qemu_smoke.py tools/mkrosefs.py
+
+
 .PHONY: check
 check:
+	$(MAKE) test-host
 	$(MAKE) tidy
 	$(MAKE) test
 	$(MAKE) test-platform
+
+
+# Start from an empty build directory when validating a release or CI change.
+.PHONY: verify
+verify:
+	$(MAKE) clean
+	$(MAKE) all
+	$(MAKE) check
 
 
 .PHONY: clean

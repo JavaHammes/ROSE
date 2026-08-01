@@ -5,12 +5,18 @@ repos:
         name: clang-format
         entry: clang-format -i
         language: system
-        files: ^kernel/.*\.(c|h)$
+        files: ^(kernel|user)/.*\.(c|h)$
 
       - id: clang-tidy
         name: clang-tidy
         entry: make tidy
         language: system
         pass_filenames: false
-        files: ^kernel/.*\.(c|h)$
+        files: ^(kernel|user)/.*\.(c|h)$
 
+      - id: host-tests
+        name: host-side tests
+        entry: make test-host
+        language: system
+        pass_filenames: false
+        files: ^(tests|tools)/.*\.py$

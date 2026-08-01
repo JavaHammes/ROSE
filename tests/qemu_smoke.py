@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Union
 
 
 class QemuSession:
@@ -22,13 +23,23 @@ class QemuSession:
             stderr=subprocess.STDOUT,
         )
         self.output = bytearray()
+        self.cursor = 0
+
+    @staticmethod
+    def _decode(output: Union[bytes, bytearray]) -> str:
+        return output.decode("utf-8", errors="replace").replace("\r", "")
 
     def read_until(self, marker: bytes, timeout: float = 10.0) -> str:
         """Collect output until marker appears, or fail with the transcript."""
         deadline = time.monotonic() + timeout
-        start = len(self.output)
+        start = self.cursor
 
-        while marker not in self.output[start:]:
+        while True:
+            marker_index = self.output.find(marker, self.cursor)
+            if marker_index >= 0:
+                end = marker_index + len(marker)
+                self.cursor = end
+                return self._decode(self.output[start:end])
             if self.process.poll() is not None:
                 self._fail(f"QEMU exited with status {self.process.returncode}")
             if time.monotonic() >= deadline:
@@ -41,30 +52,24 @@ class QemuSession:
                 if chunk:
                     self.output.extend(chunk)
 
-        return self.output[start:].decode("utf-8", errors="replace").replace("\r", "")
-
     def command(self, text: str, timeout: float = 10.0) -> str:
         """Submit one shell command and return everything through its prompt."""
-        start = len(self.output)
         assert self.process.stdin is not None
         self.process.stdin.write((text + "\n").encode())
         self.process.stdin.flush()
-        self.read_until(b"rose> ", timeout)
-        return self.output[start:].decode("utf-8", errors="replace").replace("\r", "")
+        return self.read_until(b"rose> ", timeout)
 
     def command_with_input(
         self, text: str, wait_marker: bytes, input_bytes: bytes, timeout: float = 10.0
     ) -> str:
         """Start a blocking command, wait for readiness, then inject input."""
-        start = len(self.output)
         assert self.process.stdin is not None
         self.process.stdin.write((text + "\n").encode())
         self.process.stdin.flush()
-        self.read_until(wait_marker, timeout)
+        before_input = self.read_until(wait_marker, timeout)
         self.process.stdin.write(input_bytes)
         self.process.stdin.flush()
-        self.read_until(b"rose> ", timeout)
-        return self.output[start:].decode("utf-8", errors="replace").replace("\r", "")
+        return before_input + self.read_until(b"rose> ", timeout)
 
     def shutdown(self) -> None:
         """Exercise the guest exit command and require a successful QEMU exit."""
@@ -88,9 +93,16 @@ class QemuSession:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait()
+        if self.process.stdin is not None:
+            try:
+                self.process.stdin.close()
+            except BrokenPipeError:
+                pass
+        if self.process.stdout is not None:
+            self.process.stdout.close()
 
     def _fail(self, message: str) -> None:
-        transcript = self.output.decode("utf-8", errors="replace").replace("\r", "")
+        transcript = self._decode(self.output)
         raise RuntimeError(f"{message}\n\nQEMU transcript:\n{transcript}")
 
 

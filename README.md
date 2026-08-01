@@ -100,7 +100,7 @@ kernel/
   linker/         kernel memory layout
   memory/         physical and virtual memory managers
 user/             `/bin/sh`, freestanding programs, syscall stubs, linker script
-tests/            end-to-end QEMU smoke test
+tests/            host-side regressions and end-to-end QEMU smoke test
 tools/            deterministic ext2 root-image generator
 ```
 
@@ -108,7 +108,7 @@ tools/            deterministic ext2 root-image generator
 
 - `riscv64-elf-gcc`, binutils, and GDB
 - `qemu-system-riscv64` with the default OpenSBI firmware
-- Python 3 for automated tests
+- Python 3.9 or newer for host tooling and automated tests
 - `clang-tidy` for static analysis
 
 On Arch Linux, the relevant packages are `riscv64-elf-gcc`,
@@ -158,6 +158,13 @@ Useful commands are:
 
 ## Verification
 
+Fast host-side tests cover the deterministic ext2 image builder and the QEMU
+session harness without requiring a cross-toolchain or emulator:
+
+```sh
+make test-host
+```
+
 Run the normal smoke test:
 
 ```sh
@@ -177,6 +184,17 @@ Run static analysis and both emulator configurations:
 make check
 ```
 
+For CI or release validation, remove all generated artifacts, rebuild every
+kernel and userspace image, and then run the complete check suite:
+
+```sh
+make verify
+```
+
+The same clean verification runs automatically on pushes and pull requests.
+The local pre-commit configuration formats C sources, runs static analysis,
+and executes host-side tests for changes in `tests/` or `tools/`.
+
 The smoke test covers disk-root boot through `/sbin/init` into `/bin/sh`,
 userspace line parsing and built-ins, `PATH` execution, VirtIO-backed ext2
 mutation, directory utilities, input/output redirection, multi-stage pipelines,
@@ -188,6 +206,11 @@ processes, fork inheritance and exec reset of dispositions, blocking UART and
 pipe I/O, process-group signal delivery, stop/continue wait events, Ctrl-C and
 Ctrl-Z foreground handling, background commands, `jobs`/`fg`, child creation
 and waiting, memory reclamation, fallback-ramfs shell boot, and clean shutdown.
+
+The host-side image tests additionally validate filesystem metadata, output
+determinism, atomic replacement, guest path constraints, and malformed tree
+rejection. Invalid image-builder mappings are reported as concise usage errors
+instead of Python tracebacks.
 
 For source-level debugging, use `make debug` in one terminal and `make gdb` in
 another. `make disassemble` writes an annotated disassembly to

@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import math
 import struct
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 BLOCK_SIZE = 1024
 BLOCK_COUNT = 4096
@@ -22,6 +24,10 @@ FIRST_CONTENT_BLOCK = INODE_TABLE_BLOCK + INODE_TABLE_BLOCKS
 FIRST_NORMAL_INODE = 11
 ROOT_INODE = 2
 DIRECT_BLOCK_COUNT = 12
+GUEST_PATH_MAX = 64
+# Keep this in sync with VFS_DIRECTORY_NAME_MAX. The guest reserves one byte
+# for the terminator, so valid on-disk names must be shorter than this value.
+DIRECTORY_NAME_MAX = 56
 
 
 @dataclass
@@ -61,14 +67,43 @@ def directory_entry(inode: int, name: str, file_type: int, length: int) -> bytes
     return bytes(result)
 
 
+def validate_guest_path(path: str) -> list[str]:
+    """Return safe path components accepted by the guest's ext2 driver."""
+    if (
+        not path.startswith("/")
+        or path == "/"
+        or path.endswith("/")
+        or "\0" in path
+    ):
+        raise ValueError(f"invalid guest path: {path}")
+    if path == "/dev/console":
+        raise ValueError("guest path is reserved for the console device")
+
+    try:
+        encoded_path = path.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError(f"guest path must be ASCII: {path}") from error
+    if len(encoded_path) >= GUEST_PATH_MAX:
+        raise ValueError(f"guest path is too long: {path}")
+
+    components = path[1:].split("/")
+    for component in components:
+        if component in ("", ".", ".."):
+            raise ValueError(f"guest path is not canonical: {path}")
+        if len(component.encode("ascii")) >= DIRECTORY_NAME_MAX:
+            raise ValueError(f"guest path component is too long: {path}")
+    return components
+
+
 def parse_files(values: list[str]) -> dict[str, bytes]:
     files: dict[str, bytes] = {}
     for value in values:
         if "=" not in value:
             raise ValueError(f"file mapping lacks '=': {value}")
         guest, host = value.split("=", 1)
-        if not guest.startswith("/") or guest.endswith("/"):
-            raise ValueError(f"invalid guest path: {guest}")
+        validate_guest_path(guest)
+        if guest in files:
+            raise ValueError(f"duplicate guest path: {guest}")
         files[guest] = Path(host).read_bytes()
     return files
 
@@ -79,11 +114,16 @@ def build_nodes(files: dict[str, bytes]) -> dict[str, Node]:
         "/dev": Node("/dev", True),
     }
     for path, data in sorted(files.items()):
-        components = path.strip("/").split("/")
+        components = validate_guest_path(path)
         current = ""
         for component in components[:-1]:
             current += "/" + component
+            existing = nodes.get(current)
+            if existing is not None and not existing.directory:
+                raise ValueError(f"file is used as a parent directory: {current}")
             nodes.setdefault(current, Node(current, True))
+        if path in nodes:
+            raise ValueError(f"file conflicts with a required directory: {path}")
         nodes[path] = Node(path, False, data=data)
 
     next_inode = FIRST_NORMAL_INODE
@@ -246,9 +286,21 @@ def build_image(output: Path, files: dict[str, bytes]) -> None:
     write_directories(image, nodes)
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_suffix(output.suffix + ".tmp")
-    temporary.write_bytes(image)
-    temporary.replace(output)
+    temporary: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output.parent,
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_file.write(image)
+            temporary = Path(temporary_file.name)
+        temporary.replace(output)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def main() -> None:
@@ -256,11 +308,15 @@ def main() -> None:
     parser.add_argument("output", type=Path)
     parser.add_argument("--file", action="append", default=[])
     arguments = parser.parse_args()
-    files = parse_files(arguments.file)
-    files["/etc/motd"] = (
-        b"Welcome to ROSE. This message was read from writable ext2.\n"
-    )
-    build_image(arguments.output, files)
+    try:
+        files = parse_files(arguments.file)
+        files.setdefault(
+            "/etc/motd",
+            b"Welcome to ROSE. This message was read from writable ext2.\n",
+        )
+        build_image(arguments.output, files)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":
