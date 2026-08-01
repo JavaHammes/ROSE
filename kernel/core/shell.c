@@ -1,6 +1,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "block_device.h"
 #include "page_allocator.h"
 #include "platform.h"
 #include "sbi.h"
@@ -8,6 +9,7 @@
 #include "uart.h"
 #include "user_process.h"
 #include "virtual_memory.h"
+#include "vfs.h"
 
 #define SHELL_MAX_ARGUMENTS 8U
 
@@ -153,6 +155,18 @@ static void shell_command_info(int argc, char **argv) {
         uart_puts("PLIC: ");
         uart_put_hex64(platform_plic_base());
         uart_putc('\n');
+        uart_puts("Root filesystem: ");
+        uart_puts(vfs_uses_disk_root() ? "writable ext2\n"
+                                      : "embedded ramfs fallback\n");
+        uart_puts("VirtIO transports: ");
+        uart_put_uint64(platform_virtio_count());
+        uart_putc('\n');
+        struct block_device *disk = block_device_primary();
+        if (disk != NULL) {
+                uart_puts("Block device: VirtIO (512-byte sectors: ");
+                uart_put_uint64(disk->sector_count);
+                uart_puts(")\n");
+        }
 }
 
 static void shell_print_page_count(const char *label, size_t count) {

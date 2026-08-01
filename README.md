@@ -12,8 +12,8 @@ scheduling, and automated emulator tests.
 ## Current features
 
 - RV64 supervisor-mode kernel on one hart.
-- Device-tree discovery for RAM, reserved regions, timer frequency, UART, UART
-  interrupt, and PLIC.
+- Device-tree discovery for RAM, reserved regions, timer frequency, UART, PLIC,
+  and VirtIO-MMIO transports.
 - Bitmap physical-page allocator with 4 KiB pages, zero-on-allocation,
   permanent reservations, misuse checks, and a boot self-test.
 - Sv39 address spaces with strict kernel RX/R/RW permissions, supervisor-only
@@ -22,13 +22,20 @@ scheduling, and automated emulator tests.
   reclamation.
 - Validated ELF64 RISC-V loader with `PT_LOAD` support, BSS zeroing, overlapping
   segment handling, W^X enforcement, and complete unload ownership tracking.
-- Read-only ramfs mounted through a small VFS, with regular files, character
-  devices, and independently linked executables available by absolute path.
+- Generic sector-device interface, modern VirtIO-MMIO block driver, and a
+  sixteen-entry write-through cache for 1 KiB filesystem blocks.
+- Writable ext2 root filesystem containing `/sbin/init`, programs, and data.
+  The supported ext2 profile uses one block group, direct blocks, 1 KiB blocks,
+  128-byte inodes, and file-type directory entries. A linker-embedded ramfs is
+  retained as a boot-diagnostic fallback.
+- VFS regular files, directories, and character devices with absolute-path
+  lookup, create/truncate, stat, seek, directory iteration, mkdir, and unlink.
 - Eight-entry per-process descriptor tables with standard input, output, and
   error attached to `/dev/console`; ramfs files retain independent offsets.
-- U-mode C runtime with `open`, `read`, `write`, `close`, `exit`, and `yield`
-  system calls. UART reads and writes block on scheduler wait channels and
-  resume from device interrupts without polling in syscall traps.
+- U-mode C runtime with descriptor I/O, `open`, `close`, `stat`, `lseek`,
+  directory iteration, `mkdir`, `unlink`, `exit`, and `yield` system calls.
+  UART reads and writes block on scheduler wait channels and resume from device
+  interrupts without polling in syscall traps.
 - Eight-slot round-robin process scheduler with timer preemption, guarded user
   stacks, per-process kernel trap stacks, process creation, termination,
   waiting, reaping, typed block/wake channels, and an interruptible idle path.
@@ -46,12 +53,13 @@ ensure it returns to that baseline.
 kernel/
   arch/riscv64/   boot, trap, context-switch, and embedded-image assembly
   core/           kernel entry, platform parser, shell, traps, ELF, processes
-  drivers/        NS16550A UART and PLIC drivers
+  drivers/        NS16550A UART, PLIC, and VirtIO block drivers
   include/        kernel and shared ABI headers
   linker/         kernel memory layout
   memory/         physical and virtual memory managers
 user/             freestanding C test program, runtime stubs, and linker script
 tests/            end-to-end QEMU smoke test
+tools/            deterministic ext2 root-image generator
 ```
 
 ## Requirements
@@ -91,6 +99,7 @@ The terminal starts at `rose>`. Useful commands are:
 | `run /bin/syscall-test` | Verify invalid pointers and unknown syscall handling. |
 | `run /bin/cat` | Read `/etc/motd` through a regular-file descriptor. |
 | `run /bin/console-read` | Block until one byte arrives on standard input. |
+| `run /bin/fs-test` | Exercise writable files, directories, stat, and seek. |
 | `runmulti` | Run two timer-preempted processes. |
 | `spawn [PATH]` | Create a ready process (defaults to `/bin/hello`). |
 | `wait` | Run all ready processes until they exit. |
@@ -120,9 +129,10 @@ Run static analysis and both emulator configurations:
 make check
 ```
 
-The smoke test covers boot, discovered hardware, the idle page-table budget,
-ELF execution, user/kernel isolation, syscall validation, preemption, process
-lifecycle commands, memory reclamation, and clean shutdown.
+The smoke test covers disk-root boot through `/sbin/init`, VirtIO discovery,
+ext2 mutation, ELF execution from disk, user/kernel isolation, syscall
+validation, blocking UART I/O, preemption, process lifecycle commands, memory
+reclamation, and clean shutdown.
 
 For source-level debugging, use `make debug` in one terminal and `make gdb` in
 another. `make disassemble` writes an annotated disassembly to
@@ -134,9 +144,11 @@ another. `make disassemble` writes an annotated disassembly to
 2. Assembly establishes the boot stack, clears BSS, and calls `kernel_main`.
 3. The kernel parses the DTB, initializes physical memory, builds the kernel
    Sv39 address space, and enables interrupts and the terminal.
-4. The initial ramfs mounts user ELFs under `/bin`, `/etc/motd`, and the
-   `/dev/console` character device.
-5. A process resolves its executable through the VFS, then receives a private
+4. The kernel mounts its embedded diagnostic ramfs, negotiates the modern
+   VirtIO-MMIO block device, validates ext2, and replaces the VFS root with the
+   disk filesystem. `/dev/console` remains a VFS character-device overlay.
+5. `/sbin/init` is read from the disk and runs as the first user process. A
+   process resolving any later executable receives a private
    Sv39 root, user stack, kernel trap stack, and pages populated from that ELF.
 6. Traps switch from the untrusted user stack to the process kernel stack.
    Syscalls, faults, yields, and timer ticks may update the saved trap frame.
@@ -149,8 +161,11 @@ another. `make disassemble` writes an annotated disassembly to
 ## Deliberate limitations
 
 ROSE currently targets one hart and one QEMU `virt` platform. User workloads
-run as a foreground batch while the kernel still maintains persistent ready
-and exited states between shell commands. The ramfs is immutable and populated
-only at build time; there is no filesystem mutation, persistent storage,
-descriptor duplication, seek, general-purpose kernel threads, ASIDs, or
-networking.
+run as a foreground batch while the kernel maintains persistent ready and
+exited states between shell commands. The ext2 implementation is synchronous,
+write-through, limited to one block group and twelve direct blocks per inode
+(12 KiB files), and does not yet provide journaling or crash recovery. The
+VirtIO queue is polled synchronously; it is not yet connected to a scheduler
+completion channel. There is no descriptor duplication, pipes, `fork`,
+`execve`, signals, general-purpose kernel threads, ASIDs, networking, users, or
+permissions enforcement.

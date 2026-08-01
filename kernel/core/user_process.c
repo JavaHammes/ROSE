@@ -31,6 +31,7 @@ enum {
         USER_IO_MAX = 1024,
         USER_WRITE_TRANSMIT_MAX = USER_IO_MAX * 2,
         USER_PATH_MAX = 64,
+        PROCESS_EXECUTABLE_MAX = 16 * 1024,
         PROCESS_DESCRIPTOR_LIMIT = 8,
         PROCESS_FIRST_OPEN_DESCRIPTOR = 3,
         PROCESS_LIMIT = 8,
@@ -50,6 +51,15 @@ enum process_state {
         PROCESS_BLOCKED,
         PROCESS_EXITED,
 };
+
+_Static_assert((uint32_t)USER_OPEN_READ == (uint32_t)VFS_OPEN_READ &&
+                   (uint32_t)USER_OPEN_WRITE == (uint32_t)VFS_OPEN_WRITE &&
+                   (uint32_t)USER_OPEN_CREATE == (uint32_t)VFS_OPEN_CREATE &&
+                   (uint32_t)USER_OPEN_TRUNCATE ==
+                       (uint32_t)VFS_OPEN_TRUNCATE &&
+                   (uint32_t)USER_OPEN_DIRECTORY ==
+                       (uint32_t)VFS_OPEN_DIRECTORY,
+               "User and VFS open flags must match");
 
 /*
  * User virtual-address layout:
@@ -76,7 +86,7 @@ extern uintptr_t user_saved_kernel_context_sp;
 struct process_descriptor {
         bool open;
         uint8_t access;
-        size_t offset;
+        uint64_t offset;
         struct vfs_file file;
 };
 
@@ -118,6 +128,7 @@ static uint64_t next_pid = 1U;
 static uint64_t scheduler_preemptions;
 static uint64_t scheduler_context_switches;
 static uint64_t scheduler_blocks;
+static uint8_t executable_buffer[PROCESS_EXECUTABLE_MAX];
 
 /* Freestanding replacement for clearing process records. */
 static void bytes_zero(void *destination, size_t size) {
@@ -144,7 +155,8 @@ static void trap_frame_copy(struct trap_frame *destination,
 static bool process_descriptors_initialize(struct process *process) {
         struct vfs_file console;
 
-        if (!vfs_open("/dev/console", &console) ||
+        if (vfs_open("/dev/console", VFS_OPEN_READ | VFS_OPEN_WRITE,
+                     &console) != 0 ||
             console.type != VFS_NODE_CHARACTER_DEVICE ||
             console.device != VFS_DEVICE_CONSOLE) {
                 return false;
@@ -270,8 +282,16 @@ static struct process *process_find_by_pid(uint64_t pid) {
 static bool process_create(struct process *process, const char *path) {
         struct vfs_file executable;
 
-        if (!vfs_open(path, &executable) ||
-            executable.type != VFS_NODE_REGULAR || executable.size == 0U) {
+        if (vfs_open(path, VFS_OPEN_READ, &executable) != 0 ||
+            executable.type != VFS_NODE_REGULAR || executable.size == 0U ||
+            executable.size > sizeof(executable_buffer)) {
+                return false;
+        }
+
+        long executable_length = vfs_read(&executable, 0U, executable_buffer,
+                                          (size_t)executable.size);
+        if (executable_length < 0 ||
+            (uint64_t)executable_length != executable.size) {
                 return false;
         }
 
@@ -307,7 +327,7 @@ static bool process_create(struct process *process, const char *path) {
         if (!page_table_map(root, USER_STACK_ADDRESS,
                             (uintptr_t)process->stack_page,
                             VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE) ||
-            !elf_load_image(root, executable.data, executable.size,
+            !elf_load_image(root, executable_buffer, (size_t)executable.size,
                             USER_ADDRESS_MIN, USER_STACK_GUARD_ADDRESS,
                             &process->loaded_image)) {
                 process_release_resources(process);
@@ -410,6 +430,31 @@ static void user_copy_to(uintptr_t user_buffer, const uint8_t *source,
         }
 }
 
+/* Copy a previously validated user range into kernel-owned memory. */
+static void user_copy_from(uint8_t *destination, uintptr_t user_buffer,
+                           size_t length) {
+        const struct page_table *root = active_process->address_space;
+
+        for (size_t offset = 0U; offset < length;) {
+                uintptr_t physical_address;
+                if (!page_table_translate(root, user_buffer + offset,
+                                          &physical_address, NULL)) {
+                        panic("Validated readable user mapping disappeared");
+                }
+                size_t page_remaining =
+                    PAGE_SIZE - ((user_buffer + offset) & (PAGE_SIZE - 1U));
+                size_t chunk = length - offset;
+                if (chunk > page_remaining) {
+                        chunk = page_remaining;
+                }
+                const uint8_t *source = (const uint8_t *)physical_address;
+                for (size_t index = 0U; index < chunk; index++) {
+                        destination[offset + index] = source[index];
+                }
+                offset += chunk;
+        }
+}
+
 /* Copy a bounded null-terminated path without dereferencing a user pointer. */
 static uint64_t user_copy_path(uintptr_t user_path,
                                char path[USER_PATH_MAX]) {
@@ -446,13 +491,7 @@ static uint64_t syscall_write_begin(uint64_t descriptor, uintptr_t user_buffer,
         if (descriptor >= PROCESS_DESCRIPTOR_LIMIT ||
             !active_process->descriptors[(size_t)descriptor].open ||
             (active_process->descriptors[(size_t)descriptor].access &
-             DESCRIPTOR_WRITE) == 0U ||
-            active_process->descriptors[(size_t)descriptor].file.type !=
-                VFS_NODE_CHARACTER_DEVICE ||
-            active_process->descriptors[(size_t)descriptor].file.operations ==
-                NULL ||
-            active_process->descriptors[(size_t)descriptor]
-                    .file.operations->write_byte == NULL) {
+             DESCRIPTOR_WRITE) == 0U) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
         }
         if (length > USER_IO_MAX) {
@@ -460,6 +499,24 @@ static uint64_t syscall_write_begin(uint64_t descriptor, uintptr_t user_buffer,
         }
         if (!user_range_is_valid(user_buffer, length, VM_PAGE_READ)) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+
+        struct process_descriptor *open_file =
+            &active_process->descriptors[(size_t)descriptor];
+        if (open_file->file.type == VFS_NODE_REGULAR) {
+                user_copy_from((uint8_t *)active_process->write_buffer,
+                               user_buffer, length);
+                long result = vfs_write(&open_file->file, open_file->offset,
+                                        active_process->write_buffer, length);
+                if (result > 0) {
+                        open_file->offset += (uint64_t)result;
+                }
+                return (uint64_t)(int64_t)result;
+        }
+        if (open_file->file.type != VFS_NODE_CHARACTER_DEVICE ||
+            open_file->file.operations == NULL ||
+            open_file->file.operations->write_byte == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
         }
 
         struct process *process = active_process;
@@ -507,18 +564,12 @@ static uint64_t syscall_write_begin(uint64_t descriptor, uintptr_t user_buffer,
         return length;
 }
 
-static uint64_t syscall_open(uintptr_t user_path) {
+static uint64_t syscall_open(uintptr_t user_path, uint32_t flags) {
         char path[USER_PATH_MAX];
         uint64_t copy_result = user_copy_path(user_path, path);
 
         if (copy_result != 0U) {
                 return copy_result;
-        }
-
-        struct vfs_file file;
-
-        if (!vfs_open(path, &file)) {
-                return (uint64_t)-(int64_t)USER_ERROR_NO_ENTRY;
         }
 
         size_t descriptor = PROCESS_FIRST_OPEN_DESCRIPTOR;
@@ -531,10 +582,17 @@ static uint64_t syscall_open(uintptr_t user_path) {
                 return (uint64_t)-(int64_t)USER_ERROR_TOO_MANY_FILES;
         }
 
-        uint8_t access = DESCRIPTOR_READ;
+        struct vfs_file file;
+        int open_result = vfs_open(path, flags, &file);
+        if (open_result != 0) {
+                return (uint64_t)(int64_t)open_result;
+        }
 
-        if (file.type == VFS_NODE_CHARACTER_DEVICE &&
-            file.device == VFS_DEVICE_CONSOLE) {
+        uint8_t access = 0U;
+        if ((flags & VFS_OPEN_READ) != 0U) {
+                access |= DESCRIPTOR_READ;
+        }
+        if ((flags & VFS_OPEN_WRITE) != 0U) {
                 access |= DESCRIPTOR_WRITE;
         }
 
@@ -580,19 +638,16 @@ static uint64_t syscall_read_begin(uint64_t descriptor,
             &active_process->descriptors[(size_t)descriptor];
 
         if (open_file->file.type == VFS_NODE_REGULAR) {
-                size_t available = open_file->file.size - open_file->offset;
-                size_t count = length;
-
-                if (count > available) {
-                        count = available;
+                long result = vfs_read(&open_file->file, open_file->offset,
+                                       active_process->write_buffer, length);
+                if (result > 0) {
+                        user_copy_to(user_buffer,
+                                     (const uint8_t *)active_process
+                                         ->write_buffer,
+                                     (size_t)result);
+                        open_file->offset += (uint64_t)result;
                 }
-                if (count != 0U) {
-                        user_copy_to(
-                            user_buffer,
-                            &open_file->file.data[open_file->offset], count);
-                }
-                open_file->offset += count;
-                return count;
+                return (uint64_t)(int64_t)result;
         }
         if (open_file->file.type != VFS_NODE_CHARACTER_DEVICE ||
             open_file->file.operations == NULL ||
@@ -605,6 +660,121 @@ static uint64_t syscall_read_begin(uint64_t descriptor,
         active_process->read_buffer = user_buffer;
         active_process->read_length = length;
         return 0U;
+}
+
+static uint64_t syscall_stat(uintptr_t user_path, uintptr_t user_status) {
+        char path[USER_PATH_MAX];
+        uint64_t copy_result = user_copy_path(user_path, path);
+        if (copy_result != 0U) {
+                return copy_result;
+        }
+        if (!user_range_is_valid(user_status, sizeof(struct user_file_status),
+                                 VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        struct vfs_stat status;
+        int result = vfs_stat_path(path, &status);
+        if (result != 0) {
+                return (uint64_t)(int64_t)result;
+        }
+        struct user_file_status user;
+        bytes_zero(&user, sizeof(user));
+        user.size = status.size;
+        user.inode = status.inode;
+        user.mode = status.mode;
+        user.type = (uint32_t)status.type;
+        user_copy_to(user_status, (const uint8_t *)&user, sizeof(user));
+        return 0U;
+}
+
+static uint64_t syscall_lseek(uint64_t descriptor, int64_t adjustment,
+                              uint32_t whence) {
+        if (descriptor >= PROCESS_DESCRIPTOR_LIMIT ||
+            !active_process->descriptors[(size_t)descriptor].open) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        struct process_descriptor *open_file =
+            &active_process->descriptors[(size_t)descriptor];
+        if (open_file->file.type != VFS_NODE_REGULAR) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+        uint64_t base;
+        if (whence == USER_SEEK_SET) {
+                base = 0U;
+        } else if (whence == USER_SEEK_CURRENT) {
+                base = open_file->offset;
+        } else if (whence == USER_SEEK_END) {
+                struct vfs_stat status;
+                int result = vfs_stat_file(&open_file->file, &status);
+                if (result != 0) {
+                        return (uint64_t)(int64_t)result;
+                }
+                base = status.size;
+        } else {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+
+        uint64_t position;
+        if (adjustment < 0) {
+                uint64_t magnitude = (uint64_t)(-(adjustment + 1)) + 1U;
+                if (magnitude > base) {
+                        return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+                }
+                position = base - magnitude;
+        } else {
+                if ((uint64_t)adjustment > UINT64_MAX - base ||
+                    base + (uint64_t)adjustment > INT64_MAX) {
+                        return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+                }
+                position = base + (uint64_t)adjustment;
+        }
+        open_file->offset = position;
+        return position;
+}
+
+static uint64_t syscall_read_directory(uint64_t descriptor,
+                                       uintptr_t user_entry) {
+        if (descriptor >= PROCESS_DESCRIPTOR_LIMIT ||
+            !active_process->descriptors[(size_t)descriptor].open ||
+            (active_process->descriptors[(size_t)descriptor].access &
+             DESCRIPTOR_READ) == 0U) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        if (!user_range_is_valid(user_entry,
+                                 sizeof(struct user_directory_entry),
+                                 VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        struct process_descriptor *directory =
+            &active_process->descriptors[(size_t)descriptor];
+        struct vfs_directory_entry entry;
+        bytes_zero(&entry, sizeof(entry));
+        long next = vfs_read_directory(&directory->file, directory->offset,
+                                       &entry);
+        if (next <= 0) {
+                return (uint64_t)(int64_t)next;
+        }
+        struct user_directory_entry user;
+        bytes_zero(&user, sizeof(user));
+        user.inode = entry.inode;
+        user.type = (uint32_t)entry.type;
+        for (size_t index = 0U; index < sizeof(user.name); index++) {
+                user.name[index] = entry.name[index];
+        }
+        directory->offset = (uint64_t)next;
+        user_copy_to(user_entry, (const uint8_t *)&user, sizeof(user));
+        return 1U;
+}
+
+static uint64_t syscall_path_operation(uintptr_t user_path, bool make_directory) {
+        char path[USER_PATH_MAX];
+        uint64_t copy_result = user_copy_path(user_path, path);
+        if (copy_result != 0U) {
+                return copy_result;
+        }
+        int result = make_directory ? vfs_make_directory(path)
+                                    : vfs_unlink(path);
+        return (uint64_t)(int64_t)result;
 }
 
 /* Select the first READY slot after the current process, wrapping once. */
@@ -1131,12 +1301,41 @@ void user_process_handle_syscall(struct trap_frame *frame) {
         }
 
         case USER_SYSCALL_OPEN:
-                frame->a0 = syscall_open((uintptr_t)frame->a0);
+                frame->a0 =
+                    syscall_open((uintptr_t)frame->a0, (uint32_t)frame->a1);
                 frame->sepc += 4U;
                 return;
 
         case USER_SYSCALL_CLOSE:
                 frame->a0 = syscall_close(frame->a0);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_STAT:
+                frame->a0 = syscall_stat((uintptr_t)frame->a0,
+                                         (uintptr_t)frame->a1);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_LSEEK:
+                frame->a0 = syscall_lseek(frame->a0, (int64_t)frame->a1,
+                                          (uint32_t)frame->a2);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_READ_DIRECTORY:
+                frame->a0 = syscall_read_directory(frame->a0,
+                                                   (uintptr_t)frame->a1);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_MKDIR:
+                frame->a0 = syscall_path_operation((uintptr_t)frame->a0, true);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_UNLINK:
+                frame->a0 = syscall_path_operation((uintptr_t)frame->a0, false);
                 frame->sepc += 4U;
                 return;
 

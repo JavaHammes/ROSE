@@ -45,6 +45,46 @@ rose_close:
     ret
 .size rose_close, . - rose_close
 
+.globl rose_stat
+.type rose_stat, @function
+rose_stat:
+    li a7, USER_SYSCALL_STAT
+    ecall
+    ret
+.size rose_stat, . - rose_stat
+
+.globl rose_lseek
+.type rose_lseek, @function
+rose_lseek:
+    li a7, USER_SYSCALL_LSEEK
+    ecall
+    ret
+.size rose_lseek, . - rose_lseek
+
+.globl rose_read_directory
+.type rose_read_directory, @function
+rose_read_directory:
+    li a7, USER_SYSCALL_READ_DIRECTORY
+    ecall
+    ret
+.size rose_read_directory, . - rose_read_directory
+
+.globl rose_mkdir
+.type rose_mkdir, @function
+rose_mkdir:
+    li a7, USER_SYSCALL_MKDIR
+    ecall
+    ret
+.size rose_mkdir, . - rose_mkdir
+
+.globl rose_unlink
+.type rose_unlink, @function
+rose_unlink:
+    li a7, USER_SYSCALL_UNLINK
+    ecall
+    ret
+.size rose_unlink, . - rose_unlink
+
 .globl rose_exit
 .type rose_exit, @function
 rose_exit:

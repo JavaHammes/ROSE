@@ -5,9 +5,9 @@
  *
  * This file implements the small FDT subset that ROSE currently needs. It
  * discovers RAM, firmware-reserved regions, the timer frequency, the NS16550A
- * UART, and the PLIC. Keeping this parser in one place means the allocator,
- * virtual-memory manager, timer, and drivers do not each carry their own QEMU
- * address constants.
+ * UART, the PLIC, and VirtIO-MMIO transports. Keeping this parser in one place
+ * means the allocator, virtual-memory manager, timer, and drivers do not each
+ * carry their own QEMU address constants.
  *
  * No pointers obtained from the blob are trusted until their containing range
  * has been checked against the total DTB size. The parser also uses fixed-size
@@ -33,6 +33,7 @@ enum {
         FDT_HEADER_SIZE = 40,
         FDT_MAX_DEPTH = 16,
         PLATFORM_RESERVED_REGION_LIMIT = 32,
+        PLATFORM_VIRTIO_LIMIT = 8,
 };
 
 /* These defaults are used only while reporting an early device-tree panic. */
@@ -70,6 +71,7 @@ struct fdt_node {
         bool is_memory;
         bool is_uart;
         bool is_plic;
+        bool is_virtio;
         bool is_cpus;
         bool is_reserved_container;
         bool parent_is_reserved_container;
@@ -79,6 +81,12 @@ struct fdt_node {
 struct reserved_region {
         uintptr_t start;
         size_t size;
+};
+
+struct virtio_region {
+        uintptr_t base;
+        size_t size;
+        uint32_t interrupt;
 };
 
 /* Parsed platform values become immutable after platform_init returns. */
@@ -95,6 +103,8 @@ static size_t reserved_region_count;
 static bool ram_contains_kernel;
 static bool uart_found;
 static bool plic_found;
+static struct virtio_region virtio_regions[PLATFORM_VIRTIO_LIMIT];
+static size_t virtio_region_count;
 static bool platform_initialized;
 
 extern char kernel_start[];
@@ -319,6 +329,9 @@ static void parse_node_property(const struct fdt_view *view,
                     string_list_contains(value, length, "riscv,plic0") ||
                     string_list_contains(value, length,
                                          "sifive,plic-1.0.0");
+                node->is_virtio =
+                    node->is_virtio ||
+                    string_list_contains(value, length, "virtio,mmio");
         } else if (property_name_is(view, name, "reg")) {
                 parse_reg_property(node, value, length);
         } else if (property_name_is(view, name, "interrupts") &&
@@ -369,6 +382,16 @@ static void finish_node(const struct fdt_node *node) {
                 plic_base = node->reg_start;
                 plic_size = node->reg_size;
                 plic_found = true;
+        }
+        if (node->is_virtio && node->has_interrupt) {
+                if (virtio_region_count >= PLATFORM_VIRTIO_LIMIT) {
+                        panic("Too many VirtIO device-tree regions");
+                }
+
+                virtio_regions[virtio_region_count++] =
+                    (struct virtio_region){.base = node->reg_start,
+                                           .size = node->reg_size,
+                                           .interrupt = node->interrupt};
         }
         if (node->parent_is_reserved_container) {
                 add_reserved_region(node->reg_start, node->reg_size);
@@ -458,6 +481,8 @@ static bool parse_structure(const struct fdt_view *view) {
                             node_name, name_length, "serial@");
                         node.is_plic = bounded_string_starts_with(
                             node_name, name_length, "plic@");
+                        node.is_virtio = bounded_string_starts_with(
+                            node_name, name_length, "virtio_mmio@");
                         node.is_cpus = bounded_string_equals(
                             node_name, name_length + 1U, "cpus");
                         node.is_reserved_container = bounded_string_equals(
@@ -561,6 +586,21 @@ uint32_t platform_uart_interrupt(void) { return uart_interrupt; }
 uintptr_t platform_plic_base(void) { return plic_base; }
 
 size_t platform_plic_size(void) { return plic_size; }
+
+size_t platform_virtio_count(void) { return virtio_region_count; }
+
+bool platform_virtio_device(size_t index, uintptr_t *base, size_t *size,
+                            uint32_t *interrupt) {
+        if (index >= virtio_region_count || base == NULL || size == NULL ||
+            interrupt == NULL) {
+                return false;
+        }
+
+        *base = virtio_regions[index].base;
+        *size = virtio_regions[index].size;
+        *interrupt = virtio_regions[index].interrupt;
+        return true;
+}
 
 size_t platform_reserved_region_count(void) { return reserved_region_count; }
 

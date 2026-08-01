@@ -685,6 +685,19 @@ static bool map_kernel_space(struct page_table *root) {
                 return false;
         }
 
+        for (size_t index = 0U; index < platform_virtio_count(); index++) {
+                uintptr_t base;
+                size_t size;
+                uint32_t interrupt;
+
+                if (!platform_virtio_device(index, &base, &size, &interrupt) ||
+                    !map_identity_range(root, base, base + size,
+                                        VM_PAGE_READ | VM_PAGE_WRITE)) {
+                        return false;
+                }
+                (void)interrupt;
+        }
+
         return true;
 }
 

@@ -4,11 +4,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "user_abi.h"
+
 /* Descriptor I/O and path lookup. Failures are returned as negative errors. */
 long rose_read(int descriptor, void *buffer, size_t length);
 long rose_write(int descriptor, const void *buffer, size_t length);
-long rose_open(const char *path);
+long rose_open(const char *path, uint32_t flags);
 long rose_close(int descriptor);
+long rose_stat(const char *path, struct user_file_status *status);
+long rose_lseek(int descriptor, int64_t offset, uint32_t whence);
+long rose_read_directory(int descriptor, struct user_directory_entry *entry);
+long rose_mkdir(const char *path);
+long rose_unlink(const char *path);
 
 /* Terminate the calling process or voluntarily give another process a turn. */
 _Noreturn void rose_exit(uint64_t status);

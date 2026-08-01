@@ -70,7 +70,7 @@ static int run_syscall_test(void) {
         if (rose_write(99, "x", 1U) != -USER_ERROR_BAD_FILE_DESCRIPTOR) {
                 return 6;
         }
-        if (rose_open("/missing") != -USER_ERROR_NO_ENTRY ||
+        if (rose_open("/missing", USER_OPEN_READ) != -USER_ERROR_NO_ENTRY ||
             rose_close(99) != -USER_ERROR_BAD_FILE_DESCRIPTOR) {
                 return 7;
         }
@@ -78,12 +78,13 @@ static int run_syscall_test(void) {
         long descriptors[5];
 
         for (size_t index = 0U; index < 5U; index++) {
-                descriptors[index] = rose_open("/etc/motd");
+                descriptors[index] = rose_open("/etc/motd", USER_OPEN_READ);
                 if (descriptors[index] != (long)(index + 3U)) {
                         return 14;
                 }
         }
-        if (rose_open("/etc/motd") != -USER_ERROR_TOO_MANY_FILES) {
+        if (rose_open("/etc/motd", USER_OPEN_READ) !=
+            -USER_ERROR_TOO_MANY_FILES) {
                 return 15;
         }
         for (size_t index = 0U; index < 5U; index++) {
@@ -92,7 +93,7 @@ static int run_syscall_test(void) {
                 }
         }
 
-        long descriptor = rose_open("/etc/motd");
+        long descriptor = rose_open("/etc/motd", USER_OPEN_READ);
         char byte;
 
         if (descriptor != 3 ||
@@ -114,7 +115,7 @@ static int run_syscall_test(void) {
 }
 
 static int run_cat(void) {
-        long descriptor = rose_open("/etc/motd");
+        long descriptor = rose_open("/etc/motd", USER_OPEN_READ);
 
         if (descriptor < 0) {
                 return 8;
@@ -140,6 +141,74 @@ static int run_cat(void) {
         }
 
         return rose_close((int)descriptor) == 0 ? 0 : 11;
+}
+
+static bool strings_equal(const char *left, const char *right) {
+        while (*left != '\0' && *left == *right) {
+                left++;
+                right++;
+        }
+        return *left == *right;
+}
+
+static int run_filesystem_test(void) {
+        struct user_file_status status;
+        if (rose_stat("/etc/motd", &status) != 0 ||
+            status.type != USER_FILE_REGULAR || status.size == 0U) {
+                return 18;
+        }
+        if (rose_mkdir("/tmp") != 0) {
+                return 19;
+        }
+        if (rose_stat("/tmp", &status) != 0 ||
+            status.type != USER_FILE_DIRECTORY) {
+                return 19;
+        }
+
+        long descriptor = rose_open("/tmp/state", USER_OPEN_READ |
+                                                      USER_OPEN_WRITE |
+                                                      USER_OPEN_CREATE |
+                                                      USER_OPEN_TRUNCATE);
+        static const char payload[] = "persistent ext2\n";
+        if (descriptor < 0 ||
+            rose_write((int)descriptor, payload, sizeof(payload) - 1U) !=
+                (long)(sizeof(payload) - 1U) ||
+            rose_lseek((int)descriptor, 0, USER_SEEK_END) !=
+                (long)(sizeof(payload) - 1U) ||
+            rose_lseek((int)descriptor, -(int64_t)(sizeof(payload) - 1U),
+                       USER_SEEK_CURRENT) != 0 ||
+            rose_stat("/tmp/state", &status) != 0 ||
+            status.size != sizeof(payload) - 1U) {
+                return 20;
+        }
+
+        char buffer[sizeof(payload)];
+        long count = rose_read((int)descriptor, buffer, sizeof(payload) - 1U);
+        buffer[sizeof(payload) - 1U] = '\0';
+        if (count != (long)(sizeof(payload) - 1U) ||
+            !strings_equal(buffer, payload) || rose_close((int)descriptor) != 0) {
+                return 21;
+        }
+
+        descriptor = rose_open("/tmp", USER_OPEN_READ | USER_OPEN_DIRECTORY);
+        bool found = false;
+        struct user_directory_entry entry;
+        long directory_result;
+        while ((directory_result =
+                    rose_read_directory((int)descriptor, &entry)) > 0) {
+                if (strings_equal(entry.name, "state")) {
+                        found = true;
+                }
+        }
+        if (descriptor < 0 || directory_result != 0 || !found ||
+            rose_close((int)descriptor) != 0 ||
+            rose_unlink("/tmp") != -USER_ERROR_NOT_EMPTY ||
+            rose_unlink("/tmp/state") != 0 || rose_unlink("/tmp") != 0) {
+                return 22;
+        }
+
+        print("Filesystem mutation passed\n");
+        return 0;
 }
 
 static int run_console_read(void) {
@@ -200,6 +269,13 @@ int user_main(void) { // NOLINT(misc-use-internal-linkage)
 
         case USER_PROGRAM_CONSOLE_READ:
                 return run_console_read();
+
+        case USER_PROGRAM_INIT:
+                print("ROSE init: writable disk root online\n");
+                return 0;
+
+        case USER_PROGRAM_FS_TEST:
+                return run_filesystem_test();
 
         default:
                 return 2;

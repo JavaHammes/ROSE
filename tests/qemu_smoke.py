@@ -124,8 +124,11 @@ def main() -> int:
     repository = Path(__file__).resolve().parents[1]
     qemu = os.environ.get("QEMU", "qemu-system-riscv64")
     kernel = Path(os.environ.get("KERNEL", repository / "kernel/build/kernel.elf"))
+    root_image = Path(
+        os.environ.get("ROOT_IMAGE", repository / "kernel/build/root.ext2")
+    )
     memory = os.environ.get("QEMU_MEMORY", "128M")
-    command = [
+    base_command = [
         qemu,
         "-machine",
         "virt",
@@ -139,10 +142,19 @@ def main() -> int:
         "-kernel",
         str(kernel),
     ]
+    command = base_command + [
+        "-drive",
+        f"file={root_image},format=raw,if=none,id=rose-root",
+        "-device",
+        "virtio-blk-device,drive=rose-root",
+        "-global",
+        "virtio-mmio.force-legacy=false",
+    ]
 
     session = QemuSession(command)
     try:
-        session.read_until(b"rose> ", 15.0)
+        boot = session.read_until(b"rose> ", 15.0)
+        require(boot, "ROSE init: writable disk root online")
 
         info = session.command("info")
         memory_match = re.fullmatch(r"(\d+)M", memory)
@@ -159,6 +171,8 @@ def main() -> int:
             "Timer frequency: 10000000 Hz",
             "UART: 0x0000000010000000 (IRQ 10)",
             "PLIC: 0x000000000c000000",
+            "Root filesystem: writable ext2",
+            "Block device: VirtIO (512-byte sectors: 8192)",
         )
 
         # The upper bound guards against accidentally returning to the original
@@ -189,8 +203,14 @@ def main() -> int:
             "Unable to load program: /bin/missing",
         )
 
-        motd = "Welcome to ROSE. Files now have descriptors and independent offsets."
+        motd = "Welcome to ROSE. This message was read from writable ext2."
         require(session.command("run /bin/cat"), motd, "exited with status 0")
+
+        require(
+            session.command("run /bin/fs-test"),
+            "Filesystem mutation passed",
+            "exited with status 0",
+        )
 
         console = session.command_with_input(
             "run /bin/console-read", b"Console reader waiting\r\n", b"Z"
@@ -205,7 +225,7 @@ def main() -> int:
 
         # Direct runs leave zombies by design. Reap them before filling the
         # fixed process table with concurrency tests.
-        require(session.command("reap"), "Reaped 5 process(es)")
+        require(session.command("reap"), "Reaped 6 process(es)")
 
         first_cat = spawned_pid(session.command("spawn /bin/cat"))
         second_cat = spawned_pid(session.command("spawn /bin/cat"))
@@ -260,6 +280,24 @@ def main() -> int:
         session.shutdown()
     finally:
         session.close()
+
+    # The disk is the primary boot path, but a missing device must retain the
+    # embedded diagnostic environment rather than preventing recovery.
+    fallback = QemuSession(base_command)
+    try:
+        fallback.read_until(b"rose> ", 15.0)
+        require(
+            fallback.command("info"),
+            "Root filesystem: embedded ramfs fallback",
+        )
+        require(
+            fallback.command("run /bin/hello"),
+            "Hello from U-mode C",
+            "exited with status 0",
+        )
+        fallback.shutdown()
+    finally:
+        fallback.close()
 
     print(f"QEMU smoke test passed ({memory}, {baseline} kernel pages in use)")
     return 0

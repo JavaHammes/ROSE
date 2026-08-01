@@ -1,10 +1,9 @@
-/* Mount build-time executables, immutable data, and /dev/console. */
+/* Mount the immutable diagnostic fallback used when no ext2 disk is valid. */
 #include <stddef.h>
 #include <stdint.h>
 
 #include "panic.h"
 #include "ramfs.h"
-#include "uart.h"
 #include "vfs.h"
 
 extern uint8_t user_hello_elf_start[];
@@ -27,11 +26,6 @@ enum { RAMFS_PROGRAM_COUNT = 7 };
 static const uint8_t motd_data[] =
     "Welcome to ROSE. Files now have descriptors and independent offsets.\n";
 
-static const struct vfs_character_device_operations console_operations = {
-    .read_byte = uart_getc,
-    .write_byte = uart_tx_submit,
-};
-
 static struct vfs_node bin_nodes[RAMFS_PROGRAM_COUNT] = {
     {.name = "hello", .type = VFS_NODE_REGULAR},
     {.name = "fault", .type = VFS_NODE_REGULAR},
@@ -49,13 +43,6 @@ static const struct vfs_node etc_nodes[] = {
      .size = sizeof(motd_data) - 1U},
 };
 
-static const struct vfs_node dev_nodes[] = {
-    {.name = "console",
-     .type = VFS_NODE_CHARACTER_DEVICE,
-     .device = VFS_DEVICE_CONSOLE,
-     .operations = &console_operations},
-};
-
 static const struct vfs_node root_nodes[] = {
     {.name = "bin",
      .type = VFS_NODE_DIRECTORY,
@@ -67,8 +54,8 @@ static const struct vfs_node root_nodes[] = {
      .child_count = sizeof(etc_nodes) / sizeof(etc_nodes[0])},
     {.name = "dev",
      .type = VFS_NODE_DIRECTORY,
-     .children = dev_nodes,
-     .child_count = sizeof(dev_nodes) / sizeof(dev_nodes[0])},
+     .children = NULL,
+     .child_count = 0U},
 };
 
 static const struct vfs_node ramfs_root = {
