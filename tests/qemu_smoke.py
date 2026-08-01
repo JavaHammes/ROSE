@@ -212,6 +212,20 @@ def main() -> int:
             "exited with status 0",
         )
 
+        session.command("setenv ROSE_TEST passed")
+        require(
+            session.command("run /bin/args-env alpha beta"),
+            "Program arguments and environment passed",
+            "exited with status 0",
+        )
+        require(
+            session.command("env"),
+            "HOME=/",
+            "PATH=/bin:/sbin",
+            "TERM=rose",
+            "ROSE_TEST=passed",
+        )
+
         console = session.command_with_input(
             "run /bin/console-read", b"Console reader waiting\r\n", b"Z"
         )
@@ -225,7 +239,7 @@ def main() -> int:
 
         # Direct runs leave zombies by design. Reap them before filling the
         # fixed process table with concurrency tests.
-        require(session.command("reap"), "Reaped 6 process(es)")
+        require(session.command("reap"), "Reaped 7 process(es)")
 
         first_cat = spawned_pid(session.command("spawn /bin/cat"))
         second_cat = spawned_pid(session.command("spawn /bin/cat"))

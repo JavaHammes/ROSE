@@ -12,6 +12,8 @@
 #include "vfs.h"
 
 #define SHELL_MAX_ARGUMENTS 8U
+#define SHELL_ENVIRONMENT_LIMIT 8U
+#define SHELL_ENVIRONMENT_ENTRY_MAX 64U
 
 /*
  * Number of elements in a compile-time array.
@@ -30,6 +32,25 @@ static int string_compare(const char *left, const char *right) {
         return (unsigned char)*left - (unsigned char)*right;
 }
 
+static size_t string_length(const char *text) {
+        size_t length = 0U;
+
+        while (text[length] != '\0') {
+                length++;
+        }
+
+        return length;
+}
+
+/* A small persistent shell environment is inherited by run and spawn. */
+static char shell_environment[SHELL_ENVIRONMENT_LIMIT]
+                             [SHELL_ENVIRONMENT_ENTRY_MAX] = {
+                                 "HOME=/",
+                                 "PATH=/bin:/sbin",
+                                 "TERM=rose",
+                             };
+static size_t shell_environment_count = 3U;
+
 static void shell_command_help(int argc, char **argv);
 static void shell_command_echo(int argc, char **argv);
 static void shell_command_clear(int argc, char **argv);
@@ -43,6 +64,9 @@ static void shell_command_wait(int argc, char **argv);
 static void shell_command_kill(int argc, char **argv);
 static void shell_command_reap(int argc, char **argv);
 static void shell_command_ps(int argc, char **argv);
+static void shell_command_env(int argc, char **argv);
+static void shell_command_setenv(int argc, char **argv);
+static void shell_command_unsetenv(int argc, char **argv);
 
 static const struct shell_command commands[] = {
     {.name = "help",
@@ -83,7 +107,16 @@ static const struct shell_command commands[] = {
      .handler = shell_command_reap},
     {.name = "ps",
      .description = "Show the process table",
-     .handler = shell_command_ps}};
+     .handler = shell_command_ps},
+    {.name = "env",
+     .description = "Show inherited environment variables",
+     .handler = shell_command_env},
+    {.name = "setenv",
+     .description = "Set an inherited environment variable",
+     .handler = shell_command_setenv},
+    {.name = "unsetenv",
+     .description = "Remove an inherited environment variable",
+     .handler = shell_command_unsetenv}};
 
 /*
  * Print all registered shell commands.
@@ -199,12 +232,31 @@ static void shell_command_exit(int argc, char **argv) {
 }
 
 static void shell_command_run(int argc, char **argv) {
-        if (argc > 2) {
-                uart_puts("Usage: run [PATH]\n");
-                return;
+        const char *arguments[SHELL_MAX_ARGUMENTS];
+        size_t argument_count = 1U;
+
+        if (argc == 1) {
+                arguments[0] = "/bin/hello";
+        } else {
+                argument_count = (size_t)argc - 1U;
+                for (size_t index = 0U; index < argument_count; index++) {
+                        arguments[index] = argv[index + 1U];
+                }
         }
 
-        user_process_run_path(argc == 1 ? "/bin/hello" : argv[1]);
+        const char *environment[SHELL_ENVIRONMENT_LIMIT];
+        for (size_t index = 0U; index < shell_environment_count; index++) {
+                environment[index] = shell_environment[index];
+        }
+
+        struct user_process_startup startup = {
+            .argument_count = argument_count,
+            .arguments = arguments,
+            .environment_count = shell_environment_count,
+            .environment = environment,
+        };
+
+        user_process_run_path(arguments[0], &startup);
 }
 
 static void shell_command_runmulti(int argc, char **argv) {
@@ -248,15 +300,33 @@ static bool shell_parse_uint64(const char *text, uint64_t *value) {
 
 /* Create a READY process while leaving the shell active for more commands. */
 static void shell_command_spawn(int argc, char **argv) {
-        if (argc > 2) {
-                uart_puts("Usage: spawn [PATH]\n");
-                return;
+        const char *arguments[SHELL_MAX_ARGUMENTS];
+        size_t argument_count = 1U;
+
+        if (argc == 1) {
+                arguments[0] = "/bin/hello";
+        } else {
+                argument_count = (size_t)argc - 1U;
+                for (size_t index = 0U; index < argument_count; index++) {
+                        arguments[index] = argv[index + 1U];
+                }
         }
 
         uint64_t pid;
-        const char *path = argc == 1 ? "/bin/hello" : argv[1];
+        const char *environment[SHELL_ENVIRONMENT_LIMIT];
+        for (size_t index = 0U; index < shell_environment_count; index++) {
+                environment[index] = shell_environment[index];
+        }
 
-        if (!user_process_spawn(path, &pid)) {
+        struct user_process_startup startup = {
+            .argument_count = argument_count,
+            .arguments = arguments,
+            .environment_count = shell_environment_count,
+            .environment = environment,
+        };
+        const char *path = arguments[0];
+
+        if (!user_process_spawn(path, &startup, &pid)) {
                 uart_puts("Unable to load program: ");
                 uart_puts(path);
                 uart_putc('\n');
@@ -323,6 +393,118 @@ static void shell_command_ps(int argc, char **argv) {
         }
 
         user_process_print_table();
+}
+
+static bool shell_environment_name_is_valid(const char *name) {
+        if (*name == '\0') {
+                return false;
+        }
+
+        while (*name != '\0') {
+                if (*name == '=') {
+                        return false;
+                }
+                name++;
+        }
+
+        return true;
+}
+
+static bool shell_environment_entry_has_name(const char *entry,
+                                             const char *name) {
+        while (*name != '\0' && *entry == *name) {
+                entry++;
+                name++;
+        }
+
+        return *name == '\0' && *entry == '=';
+}
+
+static void shell_command_env(int argc, char **argv) {
+        (void)argv;
+
+        if (argc != 1) {
+                uart_puts("Usage: env\n");
+                return;
+        }
+
+        for (size_t index = 0U; index < shell_environment_count; index++) {
+                uart_puts(shell_environment[index]);
+                uart_putc('\n');
+        }
+}
+
+static void shell_command_setenv(int argc, char **argv) {
+        if (argc != 3 || !shell_environment_name_is_valid(argv[1])) {
+                uart_puts("Usage: setenv NAME VALUE\n");
+                return;
+        }
+
+        size_t name_length = string_length(argv[1]);
+        size_t value_length = string_length(argv[2]);
+        if (name_length + 1U + value_length + 1U >
+            SHELL_ENVIRONMENT_ENTRY_MAX) {
+                uart_puts("Environment entry is too long\n");
+                return;
+        }
+
+        size_t destination = shell_environment_count;
+        for (size_t index = 0U; index < shell_environment_count; index++) {
+                if (shell_environment_entry_has_name(shell_environment[index],
+                                                     argv[1])) {
+                        destination = index;
+                        break;
+                }
+        }
+
+        if (destination == SHELL_ENVIRONMENT_LIMIT) {
+                uart_puts("Environment is full\n");
+                return;
+        }
+        if (destination == shell_environment_count) {
+                shell_environment_count++;
+        }
+
+        size_t offset = 0U;
+        for (size_t index = 0U; index < name_length; index++) {
+                shell_environment[destination][offset++] = argv[1][index];
+        }
+        shell_environment[destination][offset++] = '=';
+        for (size_t index = 0U; index < value_length; index++) {
+                shell_environment[destination][offset++] = argv[2][index];
+        }
+        shell_environment[destination][offset] = '\0';
+}
+
+static void shell_command_unsetenv(int argc, char **argv) {
+        if (argc != 2 || !shell_environment_name_is_valid(argv[1])) {
+                uart_puts("Usage: unsetenv NAME\n");
+                return;
+        }
+
+        size_t removed = shell_environment_count;
+        for (size_t index = 0U; index < shell_environment_count; index++) {
+                if (shell_environment_entry_has_name(shell_environment[index],
+                                                     argv[1])) {
+                        removed = index;
+                        break;
+                }
+        }
+
+        if (removed == shell_environment_count) {
+                return;
+        }
+
+        for (size_t index = removed; index + 1U < shell_environment_count;
+             index++) {
+                for (size_t character = 0U;
+                     character < SHELL_ENVIRONMENT_ENTRY_MAX; character++) {
+                        shell_environment[index][character] =
+                            shell_environment[index + 1U][character];
+                }
+        }
+        shell_environment_count--;
+        shell_environment[shell_environment_count][0] = '\0';
 }
 
 /*

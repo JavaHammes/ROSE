@@ -46,7 +46,7 @@ void kernel_main(unsigned long hart_id, const void *dtb) {
         /* A disk root owns the first userspace process. The embedded ramfs is
          * retained only as a diagnostic fallback when no valid disk mounts. */
         if (vfs_uses_disk_root()) {
-                user_process_run_path("/sbin/init");
+                user_process_run_path("/sbin/init", NULL);
                 (void)user_process_reap_exited();
         }
 

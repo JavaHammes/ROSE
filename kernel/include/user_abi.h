@@ -105,6 +105,7 @@ enum user_program {
         USER_PROGRAM_CONSOLE_READ,
         USER_PROGRAM_INIT,
         USER_PROGRAM_FS_TEST,
+        USER_PROGRAM_ARGUMENTS_ENVIRONMENT,
 };
 
 #endif

@@ -35,6 +35,8 @@ enum {
         PROCESS_DESCRIPTOR_LIMIT = 8,
         PROCESS_FIRST_OPEN_DESCRIPTOR = 3,
         PROCESS_LIMIT = 8,
+        PROCESS_ARGUMENT_LIMIT = 16,
+        PROCESS_ENVIRONMENT_LIMIT = 16,
 };
 
 enum descriptor_access {
@@ -270,6 +272,129 @@ static struct process *process_find_by_pid(uint64_t pid) {
         return NULL;
 }
 
+static size_t string_length(const char *text) {
+        size_t length = 0U;
+
+        while (text[length] != '\0') {
+                length++;
+        }
+
+        return length;
+}
+
+static bool stack_copy_string(void *stack_page, uintptr_t *cursor,
+                              const char *text, uintptr_t *user_address) {
+        size_t length = string_length(text) + 1U;
+
+        if (length > *cursor - USER_STACK_ADDRESS) {
+                return false;
+        }
+
+        *cursor -= length;
+        char *destination =
+            (char *)stack_page + (*cursor - USER_STACK_ADDRESS);
+
+        for (size_t index = 0U; index < length; index++) {
+                destination[index] = text[index];
+        }
+
+        *user_address = *cursor;
+        return true;
+}
+
+/*
+ * Build the conventional process-entry stack:
+ *
+ *   argc, argv[], NULL, envp[], NULL, AT_NULL
+ *
+ * Strings occupy the high end of the page and the pointer table remains
+ * 16-byte aligned for the RISC-V C ABI. A missing startup description creates
+ * the usual single argv[0] entry from the executable path.
+ */
+static bool process_build_initial_stack(
+    struct process *process, const char *path,
+    const struct user_process_startup *startup) {
+        const char *default_arguments[] = {path};
+        size_t argument_count = 1U;
+        const char *const *arguments = default_arguments;
+        size_t environment_count = 0U;
+        const char *const *environment = NULL;
+
+        if (startup != NULL) {
+                argument_count = startup->argument_count;
+                arguments = startup->arguments;
+                environment_count = startup->environment_count;
+                environment = startup->environment;
+        }
+
+        if (argument_count == 0U || argument_count > PROCESS_ARGUMENT_LIMIT ||
+            arguments == NULL ||
+            environment_count > PROCESS_ENVIRONMENT_LIMIT ||
+            (environment_count != 0U && environment == NULL)) {
+                return false;
+        }
+
+        uintptr_t argument_addresses[PROCESS_ARGUMENT_LIMIT];
+        uintptr_t environment_addresses[PROCESS_ENVIRONMENT_LIMIT];
+        uintptr_t cursor = USER_STACK_TOP;
+
+        for (size_t index = argument_count; index != 0U; index--) {
+                if (arguments[index - 1U] == NULL ||
+                    !stack_copy_string(process->stack_page, &cursor,
+                                       arguments[index - 1U],
+                                       &argument_addresses[index - 1U])) {
+                        return false;
+                }
+        }
+
+        for (size_t index = environment_count; index != 0U; index--) {
+                if (environment[index - 1U] == NULL ||
+                    !stack_copy_string(process->stack_page, &cursor,
+                                       environment[index - 1U],
+                                       &environment_addresses[index - 1U])) {
+                        return false;
+                }
+        }
+
+        /* argc, both terminated pointer arrays, and the two-word AT_NULL
+         * auxiliary-vector terminator. */
+        size_t word_count =
+            1U + argument_count + 1U + environment_count + 1U + 2U;
+        size_t table_size = word_count * sizeof(uint64_t);
+
+        if (table_size > cursor - USER_STACK_ADDRESS) {
+                return false;
+        }
+
+        uintptr_t stack_pointer = (cursor - table_size) & ~UINT64_C(0xf);
+        if (stack_pointer < USER_STACK_ADDRESS) {
+                return false;
+        }
+
+        uint64_t *words = (uint64_t *)((uint8_t *)process->stack_page +
+                                       stack_pointer - USER_STACK_ADDRESS);
+        size_t word = 0U;
+
+        words[word++] = argument_count;
+        for (size_t index = 0U; index < argument_count; index++) {
+                words[word++] = argument_addresses[index];
+        }
+        words[word++] = 0U;
+        for (size_t index = 0U; index < environment_count; index++) {
+                words[word++] = environment_addresses[index];
+        }
+        words[word++] = 0U;
+        words[word++] = 0U;
+        words[word] = 0U;
+
+        process->context.sp = stack_pointer;
+        process->context.a0 = argument_count;
+        process->context.a1 = stack_pointer + sizeof(uint64_t);
+        process->context.a2 = process->context.a1 +
+                              (argument_count + 1U) * sizeof(uint64_t);
+        return true;
+}
+
 /*
  * Construct a READY process from an ELF resolved by absolute VFS path.
  *
@@ -279,7 +404,8 @@ static struct process *process_find_by_pid(uint64_t pid) {
  * virtual_memory_create_address_space; only the ELF and stack mappings receive
  * VM_PAGE_USER.
  */
-static bool process_create(struct process *process, const char *path) {
+static bool process_create(struct process *process, const char *path,
+                           const struct user_process_startup *startup) {
         struct vfs_file executable;
 
         if (vfs_open(path, VFS_OPEN_READ, &executable) != 0 ||
@@ -298,7 +424,6 @@ static bool process_create(struct process *process, const char *path) {
         bytes_zero(process, sizeof(*process));
         process->pid = next_pid;
         process->state = PROCESS_READY;
-        process->context.sp = USER_STACK_TOP;
         /* SPIE causes sret to enable supervisor interrupts while U-mode runs. */
         process->context.sstatus = SSTATUS_SPIE;
         process->exit_status = UINT64_MAX;
@@ -324,7 +449,8 @@ static bool process_create(struct process *process, const char *path) {
 
         struct page_table *root = process->address_space;
 
-        if (!page_table_map(root, USER_STACK_ADDRESS,
+        if (!process_build_initial_stack(process, path, startup) ||
+            !page_table_map(root, USER_STACK_ADDRESS,
                             (uintptr_t)process->stack_page,
                             VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE) ||
             !elf_load_image(root, executable_buffer, (size_t)executable.size,
@@ -1127,13 +1253,15 @@ static bool scheduler_run_ready(bool require_preemption) {
 }
 
 /* Create a persistent READY entry without starting the scheduler. */
-bool user_process_spawn(const char *path, uint64_t *pid) {
+bool user_process_spawn(const char *path,
+                        const struct user_process_startup *startup,
+                        uint64_t *pid) {
         struct process *process = process_find_available_slot();
 
         if (process == NULL) {
                 return false;
         }
-        if (!process_create(process, path)) {
+        if (!process_create(process, path, startup)) {
                 bytes_zero(process, sizeof(*process));
                 return false;
         }
@@ -1191,7 +1319,7 @@ size_t user_process_reap_exited(void) {
 void user_process_run(void) {
         uint64_t pid;
 
-        if (!user_process_spawn("/bin/hello", &pid)) {
+        if (!user_process_spawn("/bin/hello", NULL, &pid)) {
                 uart_puts("Unable to create process; run 'reap' and retry\n");
                 return;
         }
@@ -1201,10 +1329,11 @@ void user_process_run(void) {
 }
 
 /* Spawn one executable by absolute VFS path and run it immediately. */
-void user_process_run_path(const char *path) {
+void user_process_run_path(const char *path,
+                           const struct user_process_startup *startup) {
         uint64_t pid;
 
-        if (!user_process_spawn(path, &pid)) {
+        if (!user_process_spawn(path, startup, &pid)) {
                 uart_puts("Unable to load program: ");
                 uart_puts(path);
                 uart_putc('\n');
@@ -1227,7 +1356,8 @@ void user_process_run_multi(void) {
         /* Construct both processes before entering U-mode so a creation failure
          * cannot leave the shell suspended with a partial demonstration. */
         for (size_t index = 0U; index < 2U; index++) {
-                if (!user_process_spawn(programs[index], &created_pids[index])) {
+                if (!user_process_spawn(programs[index], NULL,
+                                        &created_pids[index])) {
                         for (size_t created = 0U; created < index; created++) {
                                 (void)user_process_kill(created_pids[created]);
                         }

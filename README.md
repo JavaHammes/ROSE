@@ -34,6 +34,8 @@ scheduling, and automated emulator tests.
   error attached to `/dev/console`; ramfs files retain independent offsets.
 - U-mode C runtime with descriptor I/O, `open`, `close`, `stat`, `lseek`,
   directory iteration, `mkdir`, `unlink`, `exit`, and `yield` system calls.
+  Programs start with conventional `argc`, `argv`, and `envp` values copied to
+  their private stack.
   UART reads and writes block on scheduler wait channels and resume from device
   interrupts without polling in syscall traps.
 - Eight-slot round-robin process scheduler with timer preemption, guarded user
@@ -94,14 +96,17 @@ The terminal starts at `rose>`. Useful commands are:
 | `help` | List every command. |
 | `info` | Show the discovered platform and virtual-memory state. |
 | `meminfo` | Show usable, used, and free physical pages. |
-| `run [PATH]` | Run an executable path (defaults to `/bin/hello`). |
+| `run [PATH [ARG...]]` | Run a program with arguments (defaults to `/bin/hello`). |
 | `run /bin/fault` | Verify that U-mode cannot read supervisor kernel text. |
 | `run /bin/syscall-test` | Verify invalid pointers and unknown syscall handling. |
 | `run /bin/cat` | Read `/etc/motd` through a regular-file descriptor. |
 | `run /bin/console-read` | Block until one byte arrives on standard input. |
 | `run /bin/fs-test` | Exercise writable files, directories, stat, and seek. |
 | `runmulti` | Run two timer-preempted processes. |
-| `spawn [PATH]` | Create a ready process (defaults to `/bin/hello`). |
+| `spawn [PATH [ARG...]]` | Create a ready process with arguments. |
+| `env` | Show environment variables inherited by new programs. |
+| `setenv NAME VALUE` | Set an inherited environment variable. |
+| `unsetenv NAME` | Remove an inherited environment variable. |
 | `wait` | Run all ready processes until they exit. |
 | `kill PID` | Terminate a ready process. |
 | `ps` | Show ready and exited process-table entries. |

@@ -151,6 +151,48 @@ static bool strings_equal(const char *left, const char *right) {
         return *left == *right;
 }
 
+static const char *find_environment_value(char **environment,
+                                          const char *name) {
+        size_t name_length = string_length(name);
+
+        for (size_t index = 0U; environment[index] != NULL; index++) {
+                const char *entry = environment[index];
+                size_t character = 0U;
+
+                while (character < name_length &&
+                       entry[character] == name[character]) {
+                        character++;
+                }
+                if (character == name_length && entry[character] == '=') {
+                        return &entry[character + 1U];
+                }
+        }
+
+        return NULL;
+}
+
+static int run_arguments_environment_test(int argc, char **argv,
+                                          char **environment) {
+        if (argc != 3 || argv == NULL ||
+            !strings_equal(argv[0], "/bin/args-env") ||
+            !strings_equal(argv[1], "alpha") ||
+            !strings_equal(argv[2], "beta") || argv[3] != NULL) {
+                return 23;
+        }
+
+        const char *test_value =
+            find_environment_value(environment, "ROSE_TEST");
+        const char *home = find_environment_value(environment, "HOME");
+
+        if (test_value == NULL || !strings_equal(test_value, "passed") ||
+            home == NULL || !strings_equal(home, "/")) {
+                return 24;
+        }
+
+        print("Program arguments and environment passed\n");
+        return 0;
+}
+
 static int run_filesystem_test(void) {
         struct user_file_status status;
         if (rose_stat("/etc/motd", &status) != 0 ||
@@ -229,7 +271,8 @@ static int run_console_read(void) {
 
 /* Referenced by the assembly entry point, so this must retain external linkage.
  */
-int user_main(void) { // NOLINT(misc-use-internal-linkage)
+int user_main(int argc, char **argv,
+              char **environment) { // NOLINT(misc-use-internal-linkage)
         /* Every address space starts from the original ELF contents. A failure
          * here catches missing .data copies, missing BSS zeroing, or leaked
          * writable pages between processes. */
@@ -276,6 +319,9 @@ int user_main(void) { // NOLINT(misc-use-internal-linkage)
 
         case USER_PROGRAM_FS_TEST:
                 return run_filesystem_test();
+
+        case USER_PROGRAM_ARGUMENTS_ENVIRONMENT:
+                return run_arguments_environment_test(argc, argv, environment);
 
         default:
                 return 2;
