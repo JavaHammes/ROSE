@@ -34,11 +34,13 @@ scheduling, and automated emulator tests.
   error attached to `/dev/console`; ramfs files retain independent offsets.
 - U-mode C runtime with descriptor I/O, `open`, `close`, `stat`, `lseek`,
   directory iteration, `mkdir`, `unlink`, `spawn`, `execve`, `getpid`,
-  `waitpid`, `exit`, and `yield` system calls. A successful `execve` atomically
-  replaces the user image while preserving the process identity and open
-  descriptors. `spawn` creates a child with copied arguments and environment;
-  `waitpid` supports a specific child or any child and optional nonblocking
-  polling.
+  `waitpid`, `brk`, `exit`, and `yield` system calls. `brk` provides a private,
+  zero-filled, growable userspace heap between the ELF image and stack guard;
+  shrinking or process teardown returns its physical pages. A successful
+  `execve` atomically replaces the user image while preserving the process
+  identity and open descriptors. `spawn` creates a child with copied arguments
+  and environment; `waitpid` supports a specific child or any child and
+  optional nonblocking polling.
   Programs start with conventional `argc`, `argv`, and `envp` values copied to
   their private stack.
   UART reads and writes block on scheduler wait channels and resume from device
@@ -142,8 +144,9 @@ make check
 
 The smoke test covers disk-root boot through `/sbin/init`, VirtIO discovery,
 ext2 mutation, ELF execution from disk, user/kernel isolation, syscall
-validation, blocking UART I/O, child creation and waiting, preemption, process
-lifecycle commands, memory reclamation, and clean shutdown.
+validation, userspace heap growth and shrinkage, blocking UART I/O, child
+creation and waiting, preemption, process lifecycle commands, memory
+reclamation, and clean shutdown.
 
 For source-level debugging, use `make debug` in one terminal and `make gdb` in
 another. `make disassemble` writes an annotated disassembly to

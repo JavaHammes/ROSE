@@ -120,6 +120,15 @@ rose_waitpid:
     ret
 .size rose_waitpid, . - rose_waitpid
 
+.globl rose_brk
+.type rose_brk, @function
+rose_brk:
+    /* a0 is the requested process break, or zero to query it. */
+    li a7, USER_SYSCALL_BRK
+    ecall
+    ret
+.size rose_brk, . - rose_brk
+
 .globl rose_exit
 .type rose_exit, @function
 rose_exit:

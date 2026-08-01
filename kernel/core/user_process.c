@@ -67,6 +67,7 @@ _Static_assert((uint32_t)USER_OPEN_READ == (uint32_t)VFS_OPEN_READ &&
  * User virtual-address layout:
  *
  *   0x00001000 .. 0x007fefff   ELF load range
+ *   first page after ELF ..     growable userspace heap
  *   0x007ff000                 unmapped stack guard
  *   0x00800000                 one-page user stack
  *
@@ -103,6 +104,8 @@ struct process {
         struct elf_loaded_image loaded_image;
         void *stack_page;
         void *kernel_trap_stack;
+        uintptr_t heap_start;
+        uintptr_t heap_break;
         uint64_t exit_status;
         bool exit_reported;
         struct process_descriptor descriptors[PROCESS_DESCRIPTOR_LIMIT];
@@ -130,6 +133,8 @@ struct process_replacement {
         struct page_table *address_space;
         struct elf_loaded_image loaded_image;
         void *stack_page;
+        uintptr_t heap_start;
+        uintptr_t heap_break;
         struct trap_frame context;
 };
 
@@ -222,12 +227,72 @@ static void verify_user_mapping(const struct page_table *root,
         }
 }
 
+static uintptr_t align_up_to_page(uintptr_t address) {
+        return (address + PAGE_SIZE - 1U) & ~(PAGE_SIZE - 1U);
+}
+
+/* The heap starts on the first page not owned by the ELF loader. Keeping the
+ * two ownership regions disjoint makes shrinking and image teardown exact. */
+static uintptr_t process_heap_start(
+    const struct elf_loaded_image *loaded_image) {
+        uintptr_t heap_start = USER_ADDRESS_MIN;
+
+        for (size_t index = 0U; index < loaded_image->page_count; index++) {
+                uintptr_t page_end =
+                    loaded_image->pages[index].virtual_address + PAGE_SIZE;
+
+                if (page_end > heap_start) {
+                        heap_start = page_end;
+                }
+        }
+
+        return heap_start;
+}
+
+/* Heap leaves own their physical pages. Unmap before freeing so a live page
+ * table can never retain a translation to returned memory. */
+static void process_free_heap_pages(struct page_table *root, uintptr_t start,
+                                    uintptr_t end) {
+        for (uintptr_t address = start; address < end;
+             address += PAGE_SIZE) {
+                uintptr_t physical_address;
+                uint64_t flags;
+
+                if (!page_table_translate(root, address, &physical_address,
+                                          &flags) ||
+                    (physical_address & (PAGE_SIZE - 1U)) != 0U ||
+                    (flags & (VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE)) !=
+                        (VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE) ||
+                    (flags & VM_PAGE_EXECUTE) != 0U ||
+                    !page_table_unmap(root, address)) {
+                        panic("User heap ownership mismatch");
+                }
+
+                page_free((void *)physical_address);
+        }
+}
+
+static void process_release_heap(struct page_table *root,
+                                 uintptr_t heap_start,
+                                 uintptr_t *heap_break) {
+        if (root == NULL || heap_break == NULL) {
+                return;
+        }
+
+        process_free_heap_pages(root, heap_start,
+                                align_up_to_page(*heap_break));
+
+        *heap_break = heap_start;
+}
+
 /* Release one user image without touching the process identity, descriptors,
  * or supervisor trap stack. This is shared by exit and execve rollback. */
 static void process_release_image(
     struct page_table **address_space, struct elf_loaded_image *loaded_image,
-    void **stack_page) {
+    void **stack_page, uintptr_t *heap_start, uintptr_t *heap_break) {
         if (*address_space != NULL) {
+                process_release_heap(*address_space, *heap_start, heap_break);
+
                 if (*stack_page != NULL) {
                         uintptr_t stack_physical_address;
 
@@ -251,6 +316,8 @@ static void process_release_image(
                 page_free(*stack_page);
                 *stack_page = NULL;
         }
+        *heap_start = 0U;
+        *heap_break = 0U;
 }
 
 /*
@@ -261,7 +328,8 @@ static void process_release_image(
 static void process_release_resources(struct process *process) {
         process_descriptors_close_all(process);
         process_release_image(&process->address_space, &process->loaded_image,
-                              &process->stack_page);
+                              &process->stack_page, &process->heap_start,
+                              &process->heap_break);
 
         if (process->kernel_trap_stack != NULL) {
                 page_free(process->kernel_trap_stack);
@@ -546,6 +614,8 @@ static uint64_t process_create(struct process *process, const char *path,
                 return (uint64_t)-(int64_t)USER_ERROR_EXEC_FORMAT;
         }
 
+        process->heap_start = process_heap_start(&process->loaded_image);
+        process->heap_break = process->heap_start;
         process->context.sepc = process->loaded_image.entry;
         process_verify_address_space(root, process->stack_page);
 
@@ -748,7 +818,9 @@ static uint64_t user_copy_startup_vector(uintptr_t user_vector,
 static void process_release_replacement(void) {
         process_release_image(&exec_replacement.address_space,
                               &exec_replacement.loaded_image,
-                              &exec_replacement.stack_page);
+                              &exec_replacement.stack_page,
+                              &exec_replacement.heap_start,
+                              &exec_replacement.heap_break);
         bytes_zero(&exec_replacement.context,
                    sizeof(exec_replacement.context));
 }
@@ -819,6 +891,9 @@ static uint64_t process_prepare_replacement(
                 return (uint64_t)-(int64_t)USER_ERROR_EXEC_FORMAT;
         }
 
+        exec_replacement.heap_start =
+            process_heap_start(&exec_replacement.loaded_image);
+        exec_replacement.heap_break = exec_replacement.heap_start;
         exec_replacement.context.sepc = exec_replacement.loaded_image.entry;
         process_verify_address_space(root, exec_replacement.stack_page);
         return 0U;
@@ -851,16 +926,23 @@ static void process_commit_replacement(struct trap_frame *frame) {
         void *new_stack_page = exec_replacement.stack_page;
         struct page_table *old_address_space = active_process->address_space;
         void *old_stack_page = active_process->stack_page;
+        uintptr_t old_heap_start = active_process->heap_start;
+        uintptr_t old_heap_break = active_process->heap_break;
 
         page_table_activate(new_address_space);
         process_release_image(&old_address_space,
                               &active_process->loaded_image,
-                              &old_stack_page);
+                              &old_stack_page, &old_heap_start,
+                              &old_heap_break);
 
         active_process->address_space = new_address_space;
         active_process->stack_page = new_stack_page;
+        active_process->heap_start = exec_replacement.heap_start;
+        active_process->heap_break = exec_replacement.heap_break;
         exec_replacement.address_space = NULL;
         exec_replacement.stack_page = NULL;
+        exec_replacement.heap_start = 0U;
+        exec_replacement.heap_break = 0U;
         loaded_image_move(&active_process->loaded_image,
                           &exec_replacement.loaded_image);
 
@@ -1341,6 +1423,61 @@ static uint64_t syscall_path_operation(uintptr_t user_path, bool make_directory)
         int result = make_directory ? vfs_make_directory(path)
                                     : vfs_unlink(path);
         return (uint64_t)(int64_t)result;
+}
+
+/* Move the end of the process data segment. Heap pages are materialized
+ * eagerly so a successful return guarantees that every byte below the new
+ * break is writable. Growth is transactional; shrink releases complete pages
+ * while retaining the partial page which still contains live heap bytes. */
+static uint64_t syscall_brk(uintptr_t requested_break) {
+        if (requested_break == 0U) {
+                return active_process->heap_break;
+        }
+        if (requested_break < active_process->heap_start) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+        if (requested_break > USER_STACK_GUARD_ADDRESS) {
+                return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
+        }
+
+        uintptr_t old_mapped_end =
+            align_up_to_page(active_process->heap_break);
+        uintptr_t new_mapped_end = align_up_to_page(requested_break);
+
+        if (new_mapped_end < old_mapped_end) {
+                process_free_heap_pages(active_process->address_space,
+                                        new_mapped_end, old_mapped_end);
+        } else if (new_mapped_end > old_mapped_end) {
+                uintptr_t mapped_end = old_mapped_end;
+
+                while (mapped_end < new_mapped_end) {
+                        void *page = page_alloc();
+
+                        if (page == NULL) {
+                                process_free_heap_pages(
+                                    active_process->address_space,
+                                    old_mapped_end, mapped_end);
+                                return (uint64_t)-(int64_t)
+                                    USER_ERROR_OUT_OF_MEMORY;
+                        }
+                        if (!page_table_map(
+                                active_process->address_space, mapped_end,
+                                (uintptr_t)page,
+                                VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE)) {
+                                page_free(page);
+                                process_free_heap_pages(
+                                    active_process->address_space,
+                                    old_mapped_end, mapped_end);
+                                return (uint64_t)-(int64_t)
+                                    USER_ERROR_OUT_OF_MEMORY;
+                        }
+
+                        mapped_end += PAGE_SIZE;
+                }
+        }
+
+        active_process->heap_break = requested_break;
+        return requested_break;
 }
 
 /* Select the first READY slot after the current process, wrapping once. */
@@ -1942,6 +2079,11 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 frame->a0 = syscall_spawn((uintptr_t)frame->a0,
                                           (uintptr_t)frame->a1,
                                           (uintptr_t)frame->a2);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_BRK:
+                frame->a0 = syscall_brk((uintptr_t)frame->a0);
                 frame->sepc += 4U;
                 return;
 

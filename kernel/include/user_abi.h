@@ -19,6 +19,7 @@
 #define USER_SYSCALL_GETPID 13
 #define USER_SYSCALL_WAITPID 14
 #define USER_SYSCALL_SPAWN 15
+#define USER_SYSCALL_BRK 16
 
 #else
 
@@ -39,6 +40,7 @@ enum user_syscall_number {
         USER_SYSCALL_GETPID = 13,
         USER_SYSCALL_WAITPID = 14,
         USER_SYSCALL_SPAWN = 15,
+        USER_SYSCALL_BRK = 16,
 };
 
 /* Stable negative error values returned in a0 by failed system calls. */

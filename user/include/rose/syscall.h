@@ -27,6 +27,10 @@ long rose_spawn(const char *path, char *const arguments[],
 long rose_getpid(void);
 long rose_waitpid(int64_t pid, int *status, uint32_t options);
 
+/* Query or move the process break. Address zero queries without changing it;
+ * success returns the resulting break and failure returns a negative error. */
+long rose_brk(uintptr_t address);
+
 /* Terminate the calling process or voluntarily give another process a turn. */
 _Noreturn void rose_exit(uint64_t status);
 void rose_yield(void);

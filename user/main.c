@@ -110,6 +110,48 @@ static int run_syscall_test(void) {
                 return 5;
         }
 
+        /* brk(0) exposes the page-aligned end of the loaded ELF. Growing by a
+         * non-page multiple verifies both full and partial heap pages. */
+        long heap_query = rose_brk(0U);
+        if (heap_query <= 0 ||
+            ((uintptr_t)heap_query & (UINT64_C(4096) - 1U)) != 0U) {
+                return 33;
+        }
+
+        uintptr_t heap_start = (uintptr_t)heap_query;
+        uintptr_t heap_end = heap_start + UINT64_C(8192) + 37U;
+
+        if (rose_brk(heap_start - 1U) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_brk(UINTPTR_MAX) != -USER_ERROR_OUT_OF_MEMORY ||
+            rose_brk(0U) != heap_query ||
+            rose_brk(heap_end) != (long)heap_end) {
+                return 34;
+        }
+
+        volatile uint8_t *heap = (volatile uint8_t *)heap_start;
+        if (heap[0] != 0U || heap[4095] != 0U || heap[4096] != 0U ||
+            heap[8192] != 0U || heap[8228] != 0U) {
+                return 35;
+        }
+
+        heap[0] = UINT8_C(0x11);
+        heap[4096] = UINT8_C(0x22);
+        heap[8192] = UINT8_C(0x33);
+        heap[8228] = UINT8_C(0x44);
+
+        /* Dropping the third page and growing it again must provide a fresh,
+         * zero-filled page rather than exposing its old contents. The test
+         * deliberately exits with the heap still mapped so teardown is also
+         * covered by the global leak check. */
+        uintptr_t shrunken_end = heap_start + UINT64_C(4096) + 1U;
+        if (rose_brk(shrunken_end) != (long)shrunken_end ||
+            rose_brk(heap_end) != (long)heap_end || heap[0] != UINT8_C(0x11) ||
+            heap[4096] != UINT8_C(0x22) || heap[8192] != 0U ||
+            heap[8228] != 0U) {
+                return 36;
+        }
+
         char *child_arguments[] = {"/bin/hello", NULL};
         char *child_environment[] = {NULL};
         long parent_pid = rose_getpid();
@@ -147,6 +189,7 @@ static int run_syscall_test(void) {
         }
 
         print("Process hierarchy passed\n");
+        print("Userspace heap passed\n");
         print("Syscall validation passed\n");
         return 0;
 }
@@ -238,12 +281,17 @@ static int run_execve_test(void) {
             (const void *)(uintptr_t)UINT64_C(0x80200000);
         long descriptor = rose_open("/etc/motd", USER_OPEN_READ);
         char first_character;
+        long heap_query = rose_brk(0U);
 
         if (descriptor != 3 ||
             rose_read((int)descriptor, &first_character, 1U) != 1 ||
-            first_character != 'W') {
+            first_character != 'W' || heap_query <= 0 ||
+            rose_brk((uintptr_t)heap_query + 1U) != heap_query + 1) {
                 return 25;
         }
+
+        volatile uint8_t *heap = (volatile uint8_t *)(uintptr_t)heap_query;
+        heap[0] = UINT8_C(0x5a);
 
         for (size_t index = 0U; index < 17U; index++) {
                 too_many_arguments[index] = "x";
@@ -267,6 +315,9 @@ static int run_execve_test(void) {
                 -USER_ERROR_ARGUMENT_LIST_TOO_LONG) {
                 return 26;
         }
+        if (rose_brk(0U) != heap_query + 1 || heap[0] != UINT8_C(0x5a)) {
+                return 37;
+        }
 
         /* Success cannot return; the target verifies the copied vectors and
          * the descriptor and offset inherited from this image. */
@@ -279,6 +330,7 @@ static int run_execve_target(int argc, char **argv, char **environment) {
         const char *test_value =
             find_environment_value(environment, "EXECVE_TEST");
         char second_character;
+        long heap_query = rose_brk(0U);
 
         if (argc != 2 || argv == NULL ||
             !strings_equal(argv[0], "/bin/execve-target") ||
@@ -287,8 +339,14 @@ static int run_execve_target(int argc, char **argv, char **environment) {
             environment[1] != NULL || test_value == NULL ||
             !strings_equal(test_value, "passed") ||
             rose_read(3, &second_character, 1U) != 1 ||
-            second_character != 'e') {
+            second_character != 'e' || heap_query <= 0 ||
+            rose_brk((uintptr_t)heap_query + 1U) != heap_query + 1) {
                 return 29;
+        }
+
+        volatile uint8_t *heap = (volatile uint8_t *)(uintptr_t)heap_query;
+        if (heap[0] != 0U) {
+                return 38;
         }
 
         print("Execve replacement passed\n");
