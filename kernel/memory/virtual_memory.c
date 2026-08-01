@@ -49,6 +49,9 @@ enum page_table_entry_bits {
         PTE_GLOBAL = (UINT64_C(1) << 5),
         PTE_ACCESSED = (UINT64_C(1) << 6),
         PTE_DIRTY = (UINT64_C(1) << 7),
+        /* Reserved-for-software bit used to distinguish intentional COW write
+         * faults from genuine protection violations. */
+        PTE_COPY_ON_WRITE = (UINT64_C(1) << 8),
 };
 
 #define PTE_LEAF_BITS (PTE_READ | PTE_WRITE | PTE_EXECUTE)
@@ -148,6 +151,9 @@ static uint64_t page_table_entry_flags(uint64_t flags) {
         if ((flags & VM_PAGE_GLOBAL) != 0U) {
                 entry_flags |= PTE_GLOBAL;
         }
+        if ((flags & VM_PAGE_COPY_ON_WRITE) != 0U) {
+                entry_flags |= PTE_COPY_ON_WRITE;
+        }
 
         return entry_flags;
 }
@@ -171,6 +177,9 @@ static uint64_t virtual_memory_flags(uint64_t entry) {
         }
         if ((entry & PTE_GLOBAL) != 0U) {
                 flags |= VM_PAGE_GLOBAL;
+        }
+        if ((entry & PTE_COPY_ON_WRITE) != 0U) {
+                flags |= VM_PAGE_COPY_ON_WRITE;
         }
 
         return flags;
@@ -203,14 +212,23 @@ static bool page_table_is_empty(const struct page_table *table) {
 static bool page_flags_are_valid(uint64_t flags) {
         const uint64_t valid_flags = VM_PAGE_READ | VM_PAGE_WRITE |
                                      VM_PAGE_EXECUTE | VM_PAGE_USER |
-                                     VM_PAGE_GLOBAL;
+                                     VM_PAGE_GLOBAL | VM_PAGE_COPY_ON_WRITE;
 
         /* RISC-V reserves the W=1,R=0 PTE encoding. A leaf must also grant at
          * least read or execute permission. */
+        bool copy_on_write = (flags & VM_PAGE_COPY_ON_WRITE) != 0U;
+        bool copy_on_write_flags_are_valid =
+            !copy_on_write ||
+            ((flags & (VM_PAGE_USER | VM_PAGE_READ)) ==
+                 (VM_PAGE_USER | VM_PAGE_READ) &&
+             (flags &
+              (VM_PAGE_WRITE | VM_PAGE_EXECUTE | VM_PAGE_GLOBAL)) == 0U);
+
         return (flags & ~valid_flags) == 0U &&
                (flags & (VM_PAGE_READ | VM_PAGE_EXECUTE)) != 0U &&
                ((flags & VM_PAGE_WRITE) == 0U ||
-                (flags & VM_PAGE_READ) != 0U);
+                (flags & VM_PAGE_READ) != 0U) &&
+               copy_on_write_flags_are_valid;
 }
 
 static bool page_table_map_at_level(struct page_table *root,
@@ -293,7 +311,7 @@ fail:
         while (created_count != 0U) {
                 created_count--;
                 *created_parent_entries[created_count] = 0U;
-                page_free(created_tables[created_count]);
+                page_release(created_tables[created_count]);
         }
 
         return false;
@@ -339,13 +357,13 @@ void page_table_destroy(struct page_table *root) {
                         void *level_zero =
                             (void *)page_table_entry_physical_address(
                                 level_one_entry);
-                        page_free(level_zero);
+                        page_release(level_zero);
                 }
 
-                page_free(level_one);
+                page_release(level_one);
         }
 
-        page_free(root);
+        page_release(root);
 }
 
 bool page_table_map(struct page_table *root, uintptr_t virtual_address,
@@ -437,6 +455,52 @@ bool page_table_protect(struct page_table *root, uintptr_t virtual_address,
         return false;
 }
 
+/* Replace one level-zero leaf without dropping its page-table hierarchy. This
+ * is the atomic mapping operation needed by a copy-on-write fault after its
+ * private physical page has already been allocated. */
+bool page_table_replace(struct page_table *root, uintptr_t virtual_address,
+                        uintptr_t physical_address, uint64_t flags) {
+        if (root == NULL || (virtual_address & (PAGE_SIZE - 1U)) != 0U ||
+            (physical_address & (PAGE_SIZE - 1U)) != 0U ||
+            !sv39_virtual_address_is_valid(virtual_address) ||
+            !physical_address_is_valid(physical_address) ||
+            !page_flags_are_valid(flags)) {
+                return false;
+        }
+
+        struct page_table *table = root;
+
+        for (size_t level = SV39_LEVELS; level-- > 0U;) {
+                size_t index = virtual_page_number(virtual_address, level);
+                uint64_t *entry = &table->entries[index];
+
+                if ((*entry & PTE_VALID) == 0U) {
+                        return false;
+                }
+                if (page_table_entry_is_leaf(*entry)) {
+                        if (level != 0U) {
+                                return false;
+                        }
+
+                        *entry = page_table_entry_from_physical_address(
+                                     physical_address) |
+                                 page_table_entry_flags(flags) | PTE_VALID;
+                        if (root == active_page_table) {
+                                invalidate_virtual_address(virtual_address);
+                        }
+                        return true;
+                }
+                if (level == 0U) {
+                        return false;
+                }
+
+                table = (struct page_table *)page_table_entry_physical_address(
+                    *entry);
+        }
+
+        return false;
+}
+
 /*
  * Remove one 4 KiB leaf and reclaim empty lower-level tables on the way back to
  * the root. Large leaves are deliberately not split implicitly.
@@ -484,7 +548,7 @@ bool page_table_unmap(struct page_table *root, uintptr_t virtual_address) {
                 }
 
                 *parent_entries[level] = 0U;
-                page_free(tables[level]);
+                page_release(tables[level]);
         }
 
         if (root == active_page_table) {

@@ -14,6 +14,9 @@ enum virtual_memory_page_flags {
         VM_PAGE_EXECUTE = (1U << 2),
         VM_PAGE_USER = (1U << 3),
         VM_PAGE_GLOBAL = (1U << 4),
+        /* RISC-V RSW state: the mapping is logically writable but must fault
+         * before a private physical page is installed. */
+        VM_PAGE_COPY_ON_WRITE = (1U << 5),
 };
 
 /* Page tables own hierarchy pages, not physical pages referenced by leaves. */
@@ -28,6 +31,8 @@ bool page_table_map_range(struct page_table *root, uintptr_t virtual_address,
                           uint64_t flags);
 bool page_table_protect(struct page_table *root, uintptr_t virtual_address,
                         uint64_t flags);
+bool page_table_replace(struct page_table *root, uintptr_t virtual_address,
+                        uintptr_t physical_address, uint64_t flags);
 bool page_table_unmap(struct page_table *root, uintptr_t virtual_address);
 
 /* Software translation can also report the encountered leaf's public flags. */

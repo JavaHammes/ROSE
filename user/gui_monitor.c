@@ -51,6 +51,9 @@ static void monitor_render(struct rose_gui_context *gui,
                     (uint32_t)(info->scheduler_preemptions % available));
         draw_metric(gui, 302, "BLOCKS", info->scheduler_blocks, MONITOR_GREEN,
                     (uint32_t)(info->scheduler_blocks % available));
+        draw_metric(gui, 354, "COW COPIES", info->copy_on_write_copies,
+                    MONITOR_BLUE,
+                    (uint32_t)(info->copy_on_write_copies % available));
         rose_gui_present(gui, 0, 0, (int32_t)gui->width,
                          (int32_t)gui->height);
 }

@@ -38,7 +38,7 @@ enum {
         PROCESS_EXECUTABLE_MAX = 64 * 1024,
         PROCESS_DESCRIPTOR_LIMIT = 8,
         PROCESS_FIRST_OPEN_DESCRIPTOR = 3,
-        PROCESS_LIMIT = 8,
+        PROCESS_LIMIT = 16,
         PROCESS_OPEN_FILE_LIMIT = PROCESS_LIMIT * PROCESS_DESCRIPTOR_LIMIT,
         PIPE_LIMIT = 8,
         PIPE_BUFFER_SIZE = USER_IO_MAX,
@@ -224,6 +224,8 @@ static uint64_t terminal_foreground_process_group;
 static uint64_t scheduler_preemptions;
 static uint64_t scheduler_context_switches;
 static uint64_t scheduler_blocks;
+static uint64_t copy_on_write_faults;
+static uint64_t copy_on_write_copies;
 static uint8_t executable_buffer[PROCESS_EXECUTABLE_MAX];
 static struct process_replacement exec_replacement;
 static char startup_string_buffer[PAGE_SIZE];
@@ -247,7 +249,7 @@ static void shared_memory_object_destroy(struct shared_memory_object *object) {
                 if (object->pages[index] == NULL) {
                         panic("Shared-memory page ownership mismatch");
                 }
-                page_free(object->pages[index]);
+                page_release(object->pages[index]);
         }
         bytes_zero(object, sizeof(*object));
 }
@@ -574,14 +576,16 @@ static void process_free_heap_pages(struct page_table *root, uintptr_t start,
                 if (!page_table_translate(root, address, &physical_address,
                                           &flags) ||
                     (physical_address & (PAGE_SIZE - 1U)) != 0U ||
-                    (flags & (VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE)) !=
-                        (VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE) ||
+                    (flags & (VM_PAGE_USER | VM_PAGE_READ)) !=
+                        (VM_PAGE_USER | VM_PAGE_READ) ||
+                    ((flags & VM_PAGE_WRITE) != 0U) ==
+                        ((flags & VM_PAGE_COPY_ON_WRITE) != 0U) ||
                     (flags & VM_PAGE_EXECUTE) != 0U ||
                     !page_table_unmap(root, address)) {
                         panic("User heap ownership mismatch");
                 }
 
-                page_free((void *)physical_address);
+                page_release((void *)physical_address);
         }
 }
 
@@ -624,7 +628,7 @@ static void process_release_image(struct page_table **address_space,
                 *address_space = NULL;
         }
         if (*stack_page != NULL) {
-                page_free(*stack_page);
+                page_release(*stack_page);
                 *stack_page = NULL;
         }
         *heap_start = 0U;
@@ -644,7 +648,7 @@ static void process_release_resources(struct process *process) {
                               &process->heap_break);
 
         if (process->kernel_trap_stack != NULL) {
-                page_free(process->kernel_trap_stack);
+                page_release(process->kernel_trap_stack);
                 process->kernel_trap_stack = NULL;
         }
 }
@@ -814,8 +818,15 @@ static void process_verify_address_space(const struct page_table *root,
         }
 
         verify_user_mapping(root, USER_STACK_ADDRESS, (uintptr_t)stack_page,
-                            VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE,
-                            VM_PAGE_EXECUTE);
+                            VM_PAGE_USER | VM_PAGE_READ, VM_PAGE_EXECUTE);
+        uintptr_t stack_physical;
+        uint64_t stack_flags;
+        if (!page_table_translate(root, USER_STACK_ADDRESS, &stack_physical,
+                                  &stack_flags) ||
+            ((stack_flags & VM_PAGE_WRITE) != 0U) ==
+                ((stack_flags & VM_PAGE_COPY_ON_WRITE) != 0U)) {
+                panic("User stack is neither writable nor copy-on-write");
+        }
 
         /* Kernel text is mapped in every process but remains supervisor-only.
          */
@@ -945,35 +956,128 @@ static void page_copy(void *destination, const void *source) {
         }
 }
 
-/* Copy the ELF-owned leaves and reproduce their exact permissions. Each page
- * is recorded before mapping so the ordinary image teardown also handles a
- * partially constructed fork child. */
+/* Update the one ownership record which names a privately replaced page. Heap
+ * ownership is implicit in its virtual-address interval; ELF and stack pages
+ * additionally retain their physical addresses for exact teardown checks. */
+static void process_replace_owned_page(struct process *process,
+                                       uintptr_t virtual_address,
+                                       void *old_page, void *new_page) {
+        if (virtual_address == USER_STACK_ADDRESS) {
+                if (process->stack_page != old_page) {
+                        panic("Copy-on-write stack ownership mismatch");
+                }
+                process->stack_page = new_page;
+                return;
+        }
+
+        for (size_t index = 0U; index < process->loaded_image.page_count;
+             index++) {
+                struct elf_loaded_page *page =
+                    &process->loaded_image.pages[index];
+                if (page->virtual_address != virtual_address) {
+                        continue;
+                }
+                if (page->physical_page != old_page ||
+                    (page->flags & VM_PAGE_WRITE) == 0U) {
+                        panic("Copy-on-write ELF ownership mismatch");
+                }
+                page->physical_page = new_page;
+                return;
+        }
+
+        if (virtual_address >= process->heap_start &&
+            virtual_address < align_up_to_page(process->heap_break)) {
+                return;
+        }
+
+        panic("Copy-on-write page has no private owner");
+}
+
+/* Resolve one intentional COW mapping for either a U-mode store fault or a
+ * kernel copy into a userspace output buffer. A sole owner only needs its write
+ * permission restored; multiple owners require one new physical page. */
+static bool process_resolve_copy_on_write(struct process *process,
+                                          uintptr_t address) {
+        uintptr_t virtual_address = address & ~(PAGE_SIZE - 1U);
+        uintptr_t physical_address;
+        uint64_t flags;
+
+        if (process == NULL ||
+            !page_table_translate(process->address_space, virtual_address,
+                                  &physical_address, &flags) ||
+            (physical_address & (PAGE_SIZE - 1U)) != 0U ||
+            (flags & (VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_COPY_ON_WRITE)) !=
+                (VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_COPY_ON_WRITE) ||
+            (flags & (VM_PAGE_WRITE | VM_PAGE_EXECUTE)) != 0U) {
+                return false;
+        }
+
+        void *old_page = (void *)physical_address;
+        uint64_t writable_flags =
+            (flags & ~VM_PAGE_COPY_ON_WRITE) | VM_PAGE_WRITE;
+
+        if (page_reference_count(old_page) == 1U) {
+                return page_table_protect(process->address_space,
+                                          virtual_address, writable_flags);
+        }
+
+        void *new_page = page_alloc();
+        if (new_page == NULL) {
+                return false;
+        }
+        page_copy(new_page, old_page);
+        if (!page_table_replace(process->address_space, virtual_address,
+                                (uintptr_t)new_page, writable_flags)) {
+                page_release(new_page);
+                return false;
+        }
+
+        process_replace_owned_page(process, virtual_address, old_page,
+                                   new_page);
+        page_release(old_page);
+        copy_on_write_copies++;
+        return true;
+}
+
+static uint64_t copy_on_write_flags(uint64_t writable_flags) {
+        return (writable_flags & ~VM_PAGE_WRITE) | VM_PAGE_COPY_ON_WRITE;
+}
+
+/* Share ELF leaves with the child. Immutable pages keep their exact mapping;
+ * writable pages become read-only COW in both address spaces. Each child
+ * record is installed before mapping so ordinary teardown handles a partial
+ * fork without special rollback ownership. */
 static bool process_fork_loaded_image(struct process *child,
-                                      const struct process *parent) {
+                                      struct process *parent) {
         child->loaded_image.entry = parent->loaded_image.entry;
 
         for (size_t index = 0U; index < parent->loaded_image.page_count;
              index++) {
                 const struct elf_loaded_page *source_page =
                     &parent->loaded_image.pages[index];
-                void *physical_page = page_alloc();
-
-                if (physical_page == NULL) {
-                        return false;
+                uint64_t mapping_flags = source_page->flags;
+                if ((mapping_flags & VM_PAGE_WRITE) != 0U) {
+                        mapping_flags = copy_on_write_flags(mapping_flags);
                 }
-
-                page_copy(physical_page, source_page->physical_page);
+                page_retain(source_page->physical_page);
                 struct elf_loaded_page *destination_page =
                     &child->loaded_image
                          .pages[child->loaded_image.page_count++];
                 destination_page->virtual_address =
                     source_page->virtual_address;
-                destination_page->physical_page = physical_page;
+                destination_page->physical_page = source_page->physical_page;
                 destination_page->flags = source_page->flags;
 
-                if (!page_table_map(
-                        child->address_space, destination_page->virtual_address,
-                        (uintptr_t)physical_page, destination_page->flags)) {
+                if (!page_table_map(child->address_space,
+                                    destination_page->virtual_address,
+                                    (uintptr_t)destination_page->physical_page,
+                                    mapping_flags)) {
+                        return false;
+                }
+                if ((source_page->flags & VM_PAGE_WRITE) != 0U &&
+                    !page_table_protect(parent->address_space,
+                                        source_page->virtual_address,
+                                        mapping_flags)) {
                         return false;
                 }
         }
@@ -981,11 +1085,9 @@ static bool process_fork_loaded_image(struct process *child,
         return true;
 }
 
-/* Heap pages are not part of ELF ownership metadata, so advance the candidate
- * break after every mapping. That makes process_release_heap exact on any
- * allocation failure. */
-static bool process_fork_heap(struct process *child,
-                              const struct process *parent) {
+/* Share every materialized heap page and advance the candidate break after
+ * each child mapping so process_release_heap remains exact on failure. */
+static bool process_fork_heap(struct process *child, struct process *parent) {
         uintptr_t mapped_end = align_up_to_page(parent->heap_break);
 
         for (uintptr_t address = parent->heap_start; address < mapped_end;
@@ -996,33 +1098,65 @@ static bool process_fork_heap(struct process *child,
                 if (!page_table_translate(parent->address_space, address,
                                           &source_physical_address, &flags) ||
                     (source_physical_address & (PAGE_SIZE - 1U)) != 0U ||
-                    (flags & (VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE)) !=
-                        (VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE) ||
+                    (flags & (VM_PAGE_USER | VM_PAGE_READ)) !=
+                        (VM_PAGE_USER | VM_PAGE_READ) ||
+                    ((flags & VM_PAGE_WRITE) != 0U) ==
+                        ((flags & VM_PAGE_COPY_ON_WRITE) != 0U) ||
                     (flags & VM_PAGE_EXECUTE) != 0U) {
                         panic("Fork source heap ownership mismatch");
                 }
 
-                void *physical_page = page_alloc();
-                if (physical_page == NULL) {
-                        return false;
-                }
-                page_copy(physical_page, (void *)source_physical_address);
-
+                uint64_t mapping_flags = (flags & VM_PAGE_COPY_ON_WRITE) != 0U
+                                             ? flags
+                                             : copy_on_write_flags(flags);
+                page_retain((void *)source_physical_address);
                 if (!page_table_map(child->address_space, address,
-                                    (uintptr_t)physical_page, flags)) {
-                        page_free(physical_page);
+                                    source_physical_address, mapping_flags)) {
+                        page_release((void *)source_physical_address);
                         return false;
                 }
                 child->heap_break = address + PAGE_SIZE;
+                if (!page_table_protect(parent->address_space, address,
+                                        mapping_flags)) {
+                        return false;
+                }
         }
 
         child->heap_break = parent->heap_break;
         return true;
 }
 
-/* Eagerly clone the caller's complete user image. ROSE does not yet have page
- * faults for copy-on-write, so fork pays the copy cost up front and produces
- * fully private ELF, heap, and stack pages before the child becomes READY. */
+static bool process_fork_stack(struct process *child, struct process *parent) {
+        uintptr_t physical_address;
+        uint64_t flags;
+
+        if (!page_table_translate(parent->address_space, USER_STACK_ADDRESS,
+                                  &physical_address, &flags) ||
+            physical_address != (uintptr_t)parent->stack_page ||
+            (flags & (VM_PAGE_USER | VM_PAGE_READ)) !=
+                (VM_PAGE_USER | VM_PAGE_READ) ||
+            ((flags & VM_PAGE_WRITE) != 0U) ==
+                ((flags & VM_PAGE_COPY_ON_WRITE) != 0U) ||
+            (flags & VM_PAGE_EXECUTE) != 0U) {
+                panic("Fork source stack ownership mismatch");
+        }
+
+        uint64_t mapping_flags = (flags & VM_PAGE_COPY_ON_WRITE) != 0U
+                                     ? flags
+                                     : copy_on_write_flags(flags);
+        page_retain(parent->stack_page);
+        child->stack_page = parent->stack_page;
+        if (!page_table_map(child->address_space, USER_STACK_ADDRESS,
+                            (uintptr_t)child->stack_page, mapping_flags)) {
+                return false;
+        }
+        return page_table_protect(parent->address_space, USER_STACK_ADDRESS,
+                                  mapping_flags);
+}
+
+/* Clone page tables and ownership records while sharing user leaves. Only the
+ * child's page-table hierarchy and trusted trap stack are allocated eagerly;
+ * private writable data is materialized on its first write. */
 static uint64_t syscall_fork(const struct trap_frame *frame) {
         struct process *parent = active_process;
         struct process *child = process_find_available_slot();
@@ -1057,18 +1191,13 @@ static uint64_t syscall_fork(const struct trap_frame *frame) {
         }
 
         child->address_space = virtual_memory_create_address_space();
-        child->stack_page = page_alloc();
         child->kernel_trap_stack = page_alloc();
 
-        if (child->address_space == NULL || child->stack_page == NULL ||
-            child->kernel_trap_stack == NULL) {
+        if (child->address_space == NULL || child->kernel_trap_stack == NULL) {
                 goto out_of_memory;
         }
 
-        page_copy(child->stack_page, parent->stack_page);
-        if (!page_table_map(child->address_space, USER_STACK_ADDRESS,
-                            (uintptr_t)child->stack_page,
-                            VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE) ||
+        if (!process_fork_stack(child, parent) ||
             !process_fork_loaded_image(child, parent) ||
             !process_fork_heap(child, parent)) {
                 goto out_of_memory;
@@ -1101,16 +1230,28 @@ static bool user_range_is_valid(uintptr_t user_buffer, size_t length,
                 return false;
         }
 
-        const struct page_table *root = active_process->address_space;
+        struct page_table *root = active_process->address_space;
 
         for (size_t offset = 0U; offset < length;) {
                 uintptr_t physical_address;
                 uint64_t flags;
 
                 if (!page_table_translate(root, user_buffer + offset,
-                                          &physical_address, &flags) ||
-                    (flags & (VM_PAGE_USER | required_flags)) !=
-                        (VM_PAGE_USER | required_flags)) {
+                                          &physical_address, &flags)) {
+                        return false;
+                }
+                if ((required_flags & VM_PAGE_WRITE) != 0U &&
+                    (flags & VM_PAGE_WRITE) == 0U &&
+                    (flags & VM_PAGE_COPY_ON_WRITE) != 0U) {
+                        if (!process_resolve_copy_on_write(
+                                active_process, user_buffer + offset) ||
+                            !page_table_translate(root, user_buffer + offset,
+                                                  &physical_address, &flags)) {
+                                return false;
+                        }
+                }
+                if ((flags & (VM_PAGE_USER | required_flags)) !=
+                    (VM_PAGE_USER | required_flags)) {
                         return false;
                 }
 
@@ -2567,7 +2708,7 @@ static uint64_t syscall_brk(uintptr_t requested_break) {
                                             mapped_end, (uintptr_t)page,
                                             VM_PAGE_USER | VM_PAGE_READ |
                                                 VM_PAGE_WRITE)) {
-                                page_free(page);
+                                page_release(page);
                                 process_free_heap_pages(
                                     active_process->address_space,
                                     old_mapped_end, mapped_end);
@@ -2775,7 +2916,7 @@ static uint64_t syscall_shared_memory_create(size_t size,
                 if (page == NULL) {
                         while (object->page_count != 0U) {
                                 object->page_count--;
-                                page_free(object->pages[object->page_count]);
+                                page_release(object->pages[object->page_count]);
                         }
                         bytes_zero(object, sizeof(*object));
                         return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
@@ -2786,7 +2927,7 @@ static uint64_t syscall_shared_memory_create(size_t size,
         if (!process_shared_memory_map_object(object, slot)) {
                 while (object->page_count != 0U) {
                         object->page_count--;
-                        page_free(object->pages[object->page_count]);
+                        page_release(object->pages[object->page_count]);
                 }
                 bytes_zero(object, sizeof(*object));
                 return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
@@ -2916,6 +3057,8 @@ static uint64_t syscall_system_info(uintptr_t user_information) {
         information.context_switches = scheduler_context_switches;
         information.scheduler_preemptions = scheduler_preemptions;
         information.scheduler_blocks = scheduler_blocks;
+        information.copy_on_write_faults = copy_on_write_faults;
+        information.copy_on_write_copies = copy_on_write_copies;
         for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
                 if (process_table[index].state != PROCESS_UNUSED &&
                     process_table[index].state != PROCESS_EXITED) {
@@ -3867,9 +4010,17 @@ void user_process_handle_syscall(struct trap_frame *frame) {
         }
 }
 
-/* A synchronous U-mode fault terminates only that process; kernel faults remain
- * fatal and are handled by the generic trap path. */
+/* A store fault on a software-marked COW leaf installs writable private memory
+ * and retries the instruction. Other U-mode faults still terminate only that
+ * process; supervisor faults remain fatal in the generic trap path. */
 void user_process_handle_fault(struct trap_frame *frame, uint64_t cause) {
+        if (cause == SCAUSE_STORE_PAGE_FAULT &&
+            process_resolve_copy_on_write(active_process,
+                                          (uintptr_t)frame->stval)) {
+                copy_on_write_faults++;
+                return;
+        }
+
         uart_puts("Process ");
         uart_put_uint64(active_process->pid);
         uart_puts(" terminated by exception ");

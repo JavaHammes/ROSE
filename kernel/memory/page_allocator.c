@@ -45,6 +45,9 @@ extern char kernel_end[];
  */
 /* The fixed maximum avoids bootstrapping an allocator for its own bitmap. */
 static uint8_t page_bitmap[PAGE_BITMAP_SIZE];
+/* Reference counts cover the maximum supported RAM layout. Reserved and free
+ * pages retain a zero count; each ordinary allocation starts at one. */
+static uint16_t page_reference_counts[MAX_PHYSICAL_PAGE_COUNT];
 
 static size_t first_usable_page;
 static size_t usable_page_count;
@@ -159,6 +162,34 @@ static bool page_is_permanently_reserved(size_t page_index) {
         return false;
 }
 
+/* Validate an exact allocated, non-reserved page and return its bitmap index. */
+static size_t allocated_page_index(const void *page) {
+        uintptr_t address = (uintptr_t)page;
+
+        if (!allocator_initialized) {
+                panic("Physical page allocator used before initialization");
+        }
+        if ((address & (PAGE_SIZE - 1U)) != 0U) {
+                panic("Attempted to reference an unaligned physical page");
+        }
+        if (address < ram_start || address >= ram_end) {
+                panic("Attempted to reference a page outside physical RAM");
+        }
+
+        size_t page_index = (size_t)((address - ram_start) / PAGE_SIZE);
+
+        if (page_index < first_usable_page ||
+            page_is_permanently_reserved(page_index)) {
+                panic("Attempted to reference a reserved physical page");
+        }
+        if (!bitmap_page_is_used(page_index) ||
+            page_reference_counts[page_index] == 0U) {
+                panic("Attempted to reference a free physical page");
+        }
+
+        return page_index;
+}
+
 /*
  * Initialize the bitmap after platform discovery but before virtual memory.
  *
@@ -188,6 +219,9 @@ void page_allocator_init(void) {
          */
         for (size_t index = 0U; index < PAGE_BITMAP_SIZE; index++) {
                 page_bitmap[index] = UINT8_MAX;
+        }
+        for (size_t index = 0U; index < MAX_PHYSICAL_PAGE_COUNT; index++) {
+                page_reference_counts[index] = 0U;
         }
 
         uintptr_t first_free_address =
@@ -243,6 +277,7 @@ void *page_alloc(void) {
                 }
 
                 bitmap_mark_page_used(page_index);
+                page_reference_counts[page_index] = 1U;
                 free_pages--;
                 next_free_hint = page_index + 1U;
 
@@ -259,38 +294,23 @@ void *page_alloc(void) {
         panic("Physical page allocator bitmap is inconsistent");
 }
 
-/*
- * Return an owned page to the allocator. Alignment, RAM bounds, permanent
- * reservations, and double frees are fatal because accepting any of them would
- * corrupt allocator ownership and produce much harder failures later.
- */
-void page_free(void *page) {
-        if (!allocator_initialized) {
-                panic("Physical page allocator used before initialization");
+/* Retain or release an owned page. Invalid ownership and count misuse are fatal
+ * because accepting either would corrupt allocator bookkeeping. */
+void page_retain(void *page) {
+        size_t page_index = allocated_page_index(page);
+
+        if (page_reference_counts[page_index] == UINT16_MAX) {
+                panic("Physical page reference count overflow");
         }
+        page_reference_counts[page_index]++;
+}
 
-        uintptr_t address = (uintptr_t)page;
+void page_release(void *page) {
+        size_t page_index = allocated_page_index(page);
 
-        if ((address & (PAGE_SIZE - 1U)) != 0U) {
-                panic("Attempted to free an unaligned physical page");
-        }
-
-        if (address < ram_start || address >= ram_end) {
-                panic("Attempted to free a page outside physical RAM");
-        }
-
-        size_t page_index = (size_t)((address - ram_start) / PAGE_SIZE);
-
-        if (page_index < first_usable_page) {
-                panic("Attempted to free a reserved physical page");
-        }
-
-        if (page_is_permanently_reserved(page_index)) {
-                panic("Attempted to free permanently reserved memory");
-        }
-
-        if (!bitmap_page_is_used(page_index)) {
-                panic("Physical page freed twice");
+        page_reference_counts[page_index]--;
+        if (page_reference_counts[page_index] != 0U) {
+                return;
         }
 
         bitmap_mark_page_free(page_index);
@@ -299,6 +319,12 @@ void page_free(void *page) {
         if (page_index < next_free_hint) {
                 next_free_hint = page_index;
         }
+}
+
+size_t page_reference_count(const void *page) {
+        size_t page_index = allocated_page_index(page);
+
+        return page_reference_counts[page_index];
 }
 
 size_t page_total_count(void) {
@@ -350,7 +376,12 @@ void page_allocator_self_test(void) {
         }
 
         first_bytes[0] = UINT8_C(0xa5);
-        page_free(first);
+        page_retain(first);
+        page_release(first);
+        if (page_reference_count(first) != 1U) {
+                panic("Physical page allocator retain self-test failed");
+        }
+        page_release(first);
 
         void *reused = page_alloc();
 
@@ -358,8 +389,8 @@ void page_allocator_self_test(void) {
                 panic("Physical page allocator reuse self-test failed");
         }
 
-        page_free(reused);
-        page_free(second);
+        page_release(reused);
+        page_release(second);
 
         if (page_free_count() != initial_free_pages) {
                 panic("Physical page allocator leaked pages during self-test");

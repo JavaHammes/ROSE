@@ -10,9 +10,13 @@
 void page_allocator_init(void);
 void page_allocator_self_test(void);
 
-/* Allocate a zero-filled page or return NULL. Freeing requires exact ownership. */
+/* Allocated pages begin with one reference. Retain/release permit user pages to
+ * be shared by copy-on-write address spaces without changing page-table
+ * ownership rules. */
 void *page_alloc(void);
-void page_free(void *page);
+void page_retain(void *page);
+void page_release(void *page);
+size_t page_reference_count(const void *page);
 
 /* Counts cover allocatable RAM after kernel and firmware reservations. */
 size_t page_total_count(void);

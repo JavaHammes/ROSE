@@ -326,7 +326,7 @@ void elf_unload_image(struct page_table *root,
                         }
                 }
 
-                page_free(page->physical_page);
+                page_release(page->physical_page);
         }
 
         bytes_zero(loaded_image, sizeof(*loaded_image));

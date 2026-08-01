@@ -246,6 +246,8 @@ struct user_system_info {
         uint64_t context_switches;
         uint64_t scheduler_preemptions;
         uint64_t scheduler_blocks;
+        uint64_t copy_on_write_faults;
+        uint64_t copy_on_write_copies;
         uint32_t process_count;
         uint32_t reserved;
 };

@@ -269,9 +269,9 @@ static int run_syscall_test(void) {
                 return 36;
         }
 
-        /* fork returns in both processes with private ELF, heap, and stack
-         * pages. Descriptor entries retain a shared open-file description, so
-         * the child advances the offset observed later by the parent. */
+        /* fork returns in both processes with isolated COW-backed ELF, heap,
+         * and stack pages. Descriptor entries retain a shared open-file
+         * description, so the child advances the parent's observed offset. */
         descriptor = rose_open("/etc/motd", USER_OPEN_READ);
         char fork_character;
         volatile uint64_t stack_cookie = UINT64_C(0x1020304050607080);
@@ -317,6 +317,52 @@ static int run_syscall_test(void) {
             rose_read((int)descriptor, &fork_character, 1U) != 1 ||
             fork_character != 'l' || rose_close((int)descriptor) != 0) {
                 return 56;
+        }
+
+        /* Keep more simultaneous children alive than the former eight-slot
+         * process table allowed. Their inherited address spaces remain mostly
+         * shared while each child blocks on the same pipe. */
+        enum { FORK_STRESS_CHILDREN = 10 };
+        int fork_stress_pipe[2];
+        long fork_stress_children[FORK_STRESS_CHILDREN];
+        size_t fork_stress_created = 0U;
+        if (rose_pipe(fork_stress_pipe) != 0) {
+                return 57;
+        }
+        for (size_t index = 0U; index < FORK_STRESS_CHILDREN; index++) {
+                long child = rose_fork();
+                if (child == 0) {
+                        char byte;
+                        bool passed =
+                            rose_close(fork_stress_pipe[1]) == 0 &&
+                            rose_read(fork_stress_pipe[0], &byte, 1U) == 0 &&
+                            rose_close(fork_stress_pipe[0]) == 0;
+                        rose_exit(passed ? 0U : 57U);
+                }
+                if (child < 0) {
+                        (void)rose_close(fork_stress_pipe[0]);
+                        (void)rose_close(fork_stress_pipe[1]);
+                        for (size_t created = 0U; created < fork_stress_created;
+                             created++) {
+                                (void)rose_waitpid(
+                                    fork_stress_children[created], NULL, 0U);
+                        }
+                        return 57;
+                }
+                fork_stress_children[fork_stress_created++] = child;
+        }
+        if (rose_close(fork_stress_pipe[0]) != 0 ||
+            rose_close(fork_stress_pipe[1]) != 0) {
+                return 58;
+        }
+        for (size_t index = 0U; index < fork_stress_created; index++) {
+                fork_status = -1;
+                if (rose_waitpid(fork_stress_children[index], &fork_status,
+                                 0U) != fork_stress_children[index] ||
+                    !USER_WAIT_STATUS_EXITED(fork_status) ||
+                    USER_WAIT_STATUS_EXIT_CODE(fork_status) != 0U) {
+                        return 58;
+                }
         }
 
         struct user_signal_action signal_action = {
@@ -626,10 +672,13 @@ static int run_syscall_test(void) {
                 -USER_ERROR_BAD_ADDRESS ||
             rose_system_info(&system_information) != 0 ||
             system_information.total_pages == 0U ||
-            system_information.used_pages == 0U) {
+            system_information.used_pages == 0U ||
+            system_information.copy_on_write_faults == 0U ||
+            system_information.copy_on_write_copies == 0U) {
                 return 81;
         }
         print("System telemetry passed\n");
+        print("Copy-on-write passed\n");
 
         print("Process hierarchy passed\n");
         print("Fork semantics passed\n");

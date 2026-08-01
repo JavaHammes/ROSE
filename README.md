@@ -33,7 +33,8 @@ scheduling, and automated emulator tests.
   focus and z-order, title-bar dragging, close controls, input routing, and
   damage-tracked composition. Page-backed shared-memory objects carry client
   pixels and event rings. Separate graphical terminal, Files, and live system
-  monitor processes render through a compact client UI library. Screen/input
+  monitor processes render through a compact client UI library and expose
+  copy-on-write activity alongside scheduler and memory counters. Screen/input
   ownership and shared mappings are reclaimed automatically on exit, fault,
   or `execve`, restoring the graphical console.
 - Generic sector-device interface, modern VirtIO-MMIO block driver, and a
@@ -67,8 +68,8 @@ scheduling, and automated emulator tests.
   between the ELF image and stack guard; shrinking or process teardown returns
   its physical pages. A successful `execve` atomically replaces the user image
   while preserving the process identity, working directory, and descriptors
-  not marked close-on-exec. `fork` eagerly copies the caller's ELF, heap, and
-  stack pages into an isolated child address space, returns in both processes,
+  not marked close-on-exec. `fork` shares immutable pages directly and marks
+  writable ELF, heap, and stack pages copy-on-write, returns in both processes,
   and preserves shared open-file descriptions and descriptor flags. `spawn`
   creates a child with copied arguments,
   environment, working directory, and inheritable descriptors; `waitpid`
@@ -93,7 +94,7 @@ scheduling, and automated emulator tests.
   background pipelines of up to six commands, and `jobs`/`fg` job management.
   Practical `/bin` utilities include `ls`, `cat`, `echo`, `pwd`, `env`,
   `mkdir`, and `rm`. Command syntax and dispatch do not run in supervisor mode.
-- Eight-slot round-robin process scheduler with timer preemption, guarded user
+- Sixteen-slot round-robin process scheduler with timer preemption, guarded user
   stacks, per-process kernel trap stacks, process creation, termination,
   parent/child ownership, orphan adoption by PID 0, waiting, reaping, typed
   block/wake channels, and an interruptible idle path with an atomic
@@ -240,16 +241,16 @@ user/kernel isolation, syscall validation, working-directory resolution,
 shared descriptor offsets across aliases and processes, close-on-exec and
 nonblocking inheritance, shared-memory visibility and cleanup,
 pseudo-terminal duplex I/O, system telemetry, userspace heap growth and
-shrinkage, eager `fork` address-space
-isolation, caught/ignored/default signal delivery, signal wakeup of blocked
-processes, fork inheritance and exec reset of dispositions, blocking UART and
-pipe I/O, process-group signal delivery, stop/continue wait events, Ctrl-C and
-Ctrl-Z foreground handling, background commands, `jobs`/`fg`, child creation
-and waiting, memory reclamation, fallback-ramfs shell boot, graphical transport
-discovery, userspace framebuffer mapping and flushing, automatic graphical
-console restoration, and clean shutdown. The graphical smoke test boots and
-closes the full three-client desktop; the terminal path was also verified with
-a shell command entered through its pseudo-terminal.
+shrinkage, copy-on-write `fork` address-space isolation and concurrent
+process-capacity stress, caught/ignored/default signal delivery, signal wakeup
+of blocked processes, fork inheritance and exec reset of dispositions,
+blocking UART and pipe I/O, process-group signal delivery, stop/continue wait
+events, Ctrl-C and Ctrl-Z foreground handling, background commands, `jobs`/`fg`,
+child creation and waiting, memory reclamation, fallback-ramfs shell boot,
+graphical transport discovery, userspace framebuffer mapping and flushing,
+automatic graphical console restoration, and clean shutdown. The graphical
+smoke test boots and closes the full three-client desktop; the terminal path
+was also verified with a shell command entered through its pseudo-terminal.
 
 The host-side image tests additionally validate filesystem metadata, output
 determinism, atomic replacement, guest path constraints, and malformed tree
@@ -295,8 +296,7 @@ implementation is synchronous,
 write-through, limited to one block group and direct plus singly indirect block
 addressing (268 KiB files), and does not yet provide journaling or crash
 recovery. The VirtIO queue is polled synchronously; it is not yet connected to
-a scheduler completion channel. `fork` currently copies pages eagerly rather
-than using copy-on-write. Signals do not yet have masks, alternate stacks,
+a scheduler completion channel. Signals do not yet have masks, alternate stacks,
 sessions, or realtime queues. There are no
 general-purpose kernel threads, ASIDs, networking, users, or permissions
 enforcement.
