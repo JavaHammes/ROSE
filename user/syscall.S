@@ -404,6 +404,16 @@ rose_mmap:
     ret
 .size rose_mmap, . - rose_mmap
 
+.section .text.rose_mprotect,"ax",@progbits
+.align 2
+.globl rose_mprotect
+.type rose_mprotect, @function
+rose_mprotect:
+    li a7, USER_SYSCALL_MPROTECT
+    ecall
+    ret
+.size rose_mprotect, . - rose_mprotect
+
 .section .text.rose_munmap,"ax",@progbits
 .align 2
 .globl rose_munmap

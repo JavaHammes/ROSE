@@ -268,6 +268,134 @@ static int run_anonymous_mapping_test(void) {
                 return 99;
         }
 
+        if (rose_mprotect(UINT64_C(0x04000001), page_size,
+                          USER_MEMORY_PROTECTION_READ) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_mprotect(UINT64_C(0x04000000), 0U,
+                          USER_MEMORY_PROTECTION_READ) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_mprotect(UINT64_C(0x04000000), page_size,
+                          USER_MEMORY_PROTECTION_WRITE) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_mprotect(UINT64_C(0x04000000), page_size,
+                          USER_MEMORY_PROTECTION_READ |
+                              USER_MEMORY_PROTECTION_WRITE |
+                              USER_MEMORY_PROTECTION_EXECUTE) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_mprotect(UINT64_C(0x04000000), page_size,
+                          UINT32_C(0x80000000)) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_mprotect(UINT64_C(0x04000000), page_size,
+                          USER_MEMORY_PROTECTION_READ) !=
+                -USER_ERROR_INVALID_ARGUMENT) {
+                return 107;
+        }
+
+        long protected_result = rose_mmap(page_size * 3U, read_write);
+        if (protected_result <= 0) {
+                return 108;
+        }
+        uintptr_t protected_address = (uintptr_t)protected_result;
+        volatile uint8_t *protected_mapping =
+            (volatile uint8_t *)protected_address;
+        protected_mapping[0] = UINT8_C(0x41);
+        protected_mapping[page_size] = UINT8_C(0x42);
+        protected_mapping[2U * page_size] = UINT8_C(0x43);
+
+        if (rose_mprotect(protected_address + page_size, page_size,
+                          USER_MEMORY_PROTECTION_NONE) != 0) {
+                return 109;
+        }
+        child_pid = rose_fork();
+        if (child_pid < 0) {
+                return 110;
+        }
+        if (child_pid == 0) {
+                uint8_t inaccessible = protected_mapping[page_size];
+                (void)inaccessible;
+                rose_exit(111U);
+        }
+        wait_status = -1;
+        if (rose_waitpid(child_pid, &wait_status, 0U) != child_pid ||
+            !USER_WAIT_STATUS_EXITED(wait_status) ||
+            USER_WAIT_STATUS_EXIT_CODE(wait_status) != 1U ||
+            rose_mprotect(protected_address + page_size, page_size,
+                          USER_MEMORY_PROTECTION_READ) != 0 ||
+            protected_mapping[page_size] != UINT8_C(0x42)) {
+                return 112;
+        }
+
+        child_pid = rose_fork();
+        if (child_pid < 0) {
+                return 113;
+        }
+        if (child_pid == 0) {
+                protected_mapping[page_size] = UINT8_C(0x52);
+                rose_exit(114U);
+        }
+        wait_status = -1;
+        if (rose_waitpid(child_pid, &wait_status, 0U) != child_pid ||
+            !USER_WAIT_STATUS_EXITED(wait_status) ||
+            USER_WAIT_STATUS_EXIT_CODE(wait_status) != 1U ||
+            rose_mprotect(protected_address, page_size * 3U, read_write) != 0) {
+                return 115;
+        }
+
+        protected_mapping[page_size] = UINT8_C(0x52);
+        child_pid = rose_fork();
+        if (child_pid < 0) {
+                return 116;
+        }
+        if (child_pid == 0) {
+                if (rose_mprotect(protected_address, page_size * 3U,
+                                  USER_MEMORY_PROTECTION_READ) != 0 ||
+                    rose_mprotect(protected_address, page_size * 3U,
+                                  read_write) != 0) {
+                        rose_exit(117U);
+                }
+                protected_mapping[0] = UINT8_C(0x61);
+                protected_mapping[page_size] = UINT8_C(0x62);
+                protected_mapping[2U * page_size] = UINT8_C(0x63);
+                rose_exit(0U);
+        }
+        wait_status = -1;
+        if (rose_waitpid(child_pid, &wait_status, 0U) != child_pid ||
+            !USER_WAIT_STATUS_EXITED(wait_status) ||
+            USER_WAIT_STATUS_EXIT_CODE(wait_status) != 0U ||
+            protected_mapping[0] != UINT8_C(0x41) ||
+            protected_mapping[page_size] != UINT8_C(0x52) ||
+            protected_mapping[2U * page_size] != UINT8_C(0x43) ||
+            rose_munmap(protected_address, page_size * 3U) != 0) {
+                return 118;
+        }
+
+        struct user_system_info before_untouched_protection;
+        long protected_untouched =
+            rose_mmap(page_size, USER_MEMORY_PROTECTION_NONE);
+        if (protected_untouched <= 0 ||
+            rose_system_info(&before_untouched_protection) != 0 ||
+            rose_mprotect((uintptr_t)protected_untouched, page_size,
+                          read_write) != 0) {
+                return 119;
+        }
+        struct user_system_info after_untouched_protection;
+        if (rose_system_info(&after_untouched_protection) != 0 ||
+            after_untouched_protection.used_pages !=
+                before_untouched_protection.used_pages) {
+                return 120;
+        }
+        volatile uint8_t *protected_untouched_mapping =
+            (volatile uint8_t *)(uintptr_t)protected_untouched;
+        protected_untouched_mapping[0] = UINT8_C(0x71);
+        if (rose_mprotect((uintptr_t)protected_untouched, page_size,
+                          USER_MEMORY_PROTECTION_NONE) != 0 ||
+            rose_mprotect((uintptr_t)protected_untouched, page_size,
+                          USER_MEMORY_PROTECTION_READ) != 0 ||
+            protected_untouched_mapping[0] != UINT8_C(0x71) ||
+            rose_munmap((uintptr_t)protected_untouched, page_size) != 0) {
+                return 121;
+        }
+
         struct user_system_info released;
         if (rose_system_info(&released) != 0 ||
             released.used_pages != baseline.used_pages) {

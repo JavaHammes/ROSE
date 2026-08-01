@@ -561,8 +561,27 @@ static uintptr_t align_up_to_page(uintptr_t address) {
         return (address + PAGE_SIZE - 1U) & ~(PAGE_SIZE - 1U);
 }
 
+static bool anonymous_mapping_protection_is_valid(uint32_t protection) {
+        const uint32_t valid_protection = USER_MEMORY_PROTECTION_READ |
+                                          USER_MEMORY_PROTECTION_WRITE |
+                                          USER_MEMORY_PROTECTION_EXECUTE;
+
+        return (protection & ~valid_protection) == 0U &&
+               ((protection & USER_MEMORY_PROTECTION_WRITE) == 0U ||
+                (protection & USER_MEMORY_PROTECTION_READ) != 0U) &&
+               (protection & (USER_MEMORY_PROTECTION_WRITE |
+                              USER_MEMORY_PROTECTION_EXECUTE)) !=
+                   (USER_MEMORY_PROTECTION_WRITE |
+                    USER_MEMORY_PROTECTION_EXECUTE);
+}
+
 static uint64_t anonymous_mapping_page_flags(uint32_t protection) {
-        uint64_t flags = VM_PAGE_USER;
+        /* A valid RISC-V leaf needs at least one R/W/X bit. Keep resident
+         * PROT_NONE pages supervisor-readable so their contents and ownership
+         * survive while U-mode has no access to them. */
+        uint64_t flags = protection == USER_MEMORY_PROTECTION_NONE
+                             ? VM_PAGE_READ
+                             : VM_PAGE_USER;
 
         if ((protection & USER_MEMORY_PROTECTION_READ) != 0U) {
                 flags |= VM_PAGE_READ;
@@ -616,6 +635,9 @@ anonymous_mapping_allows(const struct process_anonymous_mapping *mapping,
         return true;
 }
 
+static bool anonymous_mapping_flags_are_valid(
+    const struct process_anonymous_mapping *mapping, uint64_t flags);
+
 /* Install a zero-filled page for a reserved anonymous address. page_alloc
  * supplies the zeroing guarantee, while the VMA retains ownership implicitly
  * through its virtual-address interval. */
@@ -660,13 +682,15 @@ static void process_release_anonymous_page(struct process *process,
                                            uintptr_t virtual_address) {
         uintptr_t physical_address;
         uint64_t flags;
+        struct process_anonymous_mapping *mapping =
+            process_find_anonymous_mapping(process, virtual_address);
 
         if (!page_table_translate(process->address_space, virtual_address,
                                   &physical_address, &flags)) {
                 return;
         }
         if ((physical_address & (PAGE_SIZE - 1U)) != 0U ||
-            (flags & VM_PAGE_USER) == 0U ||
+            !anonymous_mapping_flags_are_valid(mapping, flags) ||
             !page_table_unmap(process->address_space, virtual_address)) {
                 panic("Anonymous mapping ownership mismatch");
         }
@@ -2926,18 +2950,8 @@ static bool address_ranges_overlap(uintptr_t first_start, uintptr_t first_end,
 /* Reserve the first fitting address interval without allocating page-table or
  * physical pages. Fault handling materializes each page independently. */
 static uint64_t syscall_mmap(size_t length, uint32_t protection) {
-        const uint32_t valid_protection = USER_MEMORY_PROTECTION_READ |
-                                          USER_MEMORY_PROTECTION_WRITE |
-                                          USER_MEMORY_PROTECTION_EXECUTE;
-
         if (length == 0U || length > UINTPTR_MAX - (PAGE_SIZE - 1U) ||
-            (protection & ~valid_protection) != 0U ||
-            ((protection & USER_MEMORY_PROTECTION_WRITE) != 0U &&
-             (protection & USER_MEMORY_PROTECTION_READ) == 0U) ||
-            (protection &
-             (USER_MEMORY_PROTECTION_WRITE | USER_MEMORY_PROTECTION_EXECUTE)) ==
-                (USER_MEMORY_PROTECTION_WRITE |
-                 USER_MEMORY_PROTECTION_EXECUTE)) {
+            !anonymous_mapping_protection_is_valid(protection)) {
                 return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
         }
 
@@ -2984,6 +2998,171 @@ static uint64_t syscall_mmap(size_t length, uint32_t protection) {
         }
 
         return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
+}
+
+static void anonymous_mapping_sort(struct process_anonymous_mapping *mappings,
+                                   size_t count) {
+        for (size_t index = 1U; index < count; index++) {
+                struct process_anonymous_mapping value = mappings[index];
+                size_t destination = index;
+
+                while (destination != 0U &&
+                       mappings[destination - 1U].start > value.start) {
+                        mappings[destination] = mappings[destination - 1U];
+                        destination--;
+                }
+                mappings[destination] = value;
+        }
+}
+
+static bool anonymous_mapping_append(struct process_anonymous_mapping *mappings,
+                                     size_t capacity, size_t *count,
+                                     uintptr_t start, uintptr_t end,
+                                     uint32_t protection) {
+        if (start == end) {
+                return true;
+        }
+        if (*count != 0U) {
+                struct process_anonymous_mapping *previous =
+                    &mappings[*count - 1U];
+                if (previous->end == start &&
+                    previous->protection == protection) {
+                        previous->end = end;
+                        return true;
+                }
+        }
+        if (*count == capacity) {
+                return false;
+        }
+        mappings[*count] = (struct process_anonymous_mapping){
+            .used = true,
+            .start = start,
+            .end = end,
+            .protection = protection,
+        };
+        (*count)++;
+        return true;
+}
+
+/* Change permissions only across completely reserved anonymous ranges. A
+ * candidate VMA set is assembled before any live state changes, so exhausting
+ * the fixed metadata table leaves both records and PTEs untouched. */
+static uint64_t syscall_mprotect(uintptr_t address, size_t length,
+                                 uint32_t protection) {
+        if ((address & (PAGE_SIZE - 1U)) != 0U || length == 0U ||
+            length > UINTPTR_MAX - (PAGE_SIZE - 1U) ||
+            !anonymous_mapping_protection_is_valid(protection)) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+
+        size_t rounded_length = (size_t)align_up_to_page(length);
+        if (address < USER_MMAP_BASE || address > USER_MMAP_END ||
+            rounded_length > USER_MMAP_END - address) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+        uintptr_t end = address + rounded_length;
+
+        struct process_anonymous_mapping
+            ordered[PROCESS_ANONYMOUS_MAPPING_LIMIT];
+        size_t ordered_count = 0U;
+        for (size_t index = 0U; index < PROCESS_ANONYMOUS_MAPPING_LIMIT;
+             index++) {
+                if (active_process->anonymous_mappings[index].used) {
+                        ordered[ordered_count++] =
+                            active_process->anonymous_mappings[index];
+                }
+        }
+        anonymous_mapping_sort(ordered, ordered_count);
+
+        uintptr_t covered = address;
+        for (size_t index = 0U; index < ordered_count && covered < end;
+             index++) {
+                const struct process_anonymous_mapping *mapping =
+                    &ordered[index];
+                if (mapping->end <= covered) {
+                        continue;
+                }
+                if (mapping->start > covered) {
+                        break;
+                }
+                if (mapping->end > covered) {
+                        covered = mapping->end < end ? mapping->end : end;
+                }
+        }
+        if (covered != end) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+
+        struct process_anonymous_mapping
+            candidate[PROCESS_ANONYMOUS_MAPPING_LIMIT];
+        size_t candidate_count = 0U;
+        for (size_t index = 0U; index < ordered_count; index++) {
+                const struct process_anonymous_mapping *mapping =
+                    &ordered[index];
+                uintptr_t overlap_start =
+                    address > mapping->start ? address : mapping->start;
+                uintptr_t overlap_end = end < mapping->end ? end : mapping->end;
+
+                if (!address_ranges_overlap(address, end, mapping->start,
+                                            mapping->end)) {
+                        if (!anonymous_mapping_append(
+                                candidate, PROCESS_ANONYMOUS_MAPPING_LIMIT,
+                                &candidate_count, mapping->start, mapping->end,
+                                mapping->protection)) {
+                                return (uint64_t)-(
+                                    int64_t)USER_ERROR_OUT_OF_MEMORY;
+                        }
+                        continue;
+                }
+
+                if (!anonymous_mapping_append(
+                        candidate, PROCESS_ANONYMOUS_MAPPING_LIMIT,
+                        &candidate_count, mapping->start, overlap_start,
+                        mapping->protection) ||
+                    !anonymous_mapping_append(candidate,
+                                              PROCESS_ANONYMOUS_MAPPING_LIMIT,
+                                              &candidate_count, overlap_start,
+                                              overlap_end, protection) ||
+                    !anonymous_mapping_append(
+                        candidate, PROCESS_ANONYMOUS_MAPPING_LIMIT,
+                        &candidate_count, overlap_end, mapping->end,
+                        mapping->protection)) {
+                        return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
+                }
+        }
+
+        for (uintptr_t page = address; page < end; page += PAGE_SIZE) {
+                uintptr_t physical_address;
+                uint64_t flags;
+                struct process_anonymous_mapping *mapping =
+                    process_find_anonymous_mapping(active_process, page);
+
+                if (!page_table_translate(active_process->address_space, page,
+                                          &physical_address, &flags)) {
+                        continue;
+                }
+                if ((physical_address & (PAGE_SIZE - 1U)) != 0U ||
+                    !anonymous_mapping_flags_are_valid(mapping, flags)) {
+                        panic("mprotect source anonymous mapping mismatch");
+                }
+
+                uint64_t new_flags = anonymous_mapping_page_flags(protection);
+                if ((protection & USER_MEMORY_PROTECTION_WRITE) != 0U &&
+                    page_reference_count((void *)physical_address) > 1U) {
+                        new_flags = copy_on_write_flags(new_flags);
+                }
+                if (!page_table_protect(active_process->address_space, page,
+                                        new_flags)) {
+                        panic("mprotect page-table update failed");
+                }
+        }
+
+        bytes_zero(active_process->anonymous_mappings,
+                   sizeof(active_process->anonymous_mappings));
+        for (size_t index = 0U; index < candidate_count; index++) {
+                active_process->anonymous_mappings[index] = candidate[index];
+        }
+        return 0U;
 }
 
 /* Linux-compatible hole handling keeps munmap idempotent. Cutting the middle
@@ -4399,6 +4578,13 @@ void user_process_handle_syscall(struct trap_frame *frame) {
         case USER_SYSCALL_MUNMAP:
                 frame->a0 =
                     syscall_munmap((uintptr_t)frame->a0, (size_t)frame->a1);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_MPROTECT:
+                frame->a0 =
+                    syscall_mprotect((uintptr_t)frame->a0, (size_t)frame->a1,
+                                     (uint32_t)frame->a2);
                 frame->sepc += 4U;
                 return;
 

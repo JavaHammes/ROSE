@@ -45,6 +45,7 @@
 #define USER_SYSCALL_SYSTEM_INFO 39
 #define USER_SYSCALL_MMAP 40
 #define USER_SYSCALL_MUNMAP 41
+#define USER_SYSCALL_MPROTECT 42
 
 #else
 
@@ -91,6 +92,7 @@ enum user_syscall_number {
         USER_SYSCALL_SYSTEM_INFO = 39,
         USER_SYSCALL_MMAP = 40,
         USER_SYSCALL_MUNMAP = 41,
+        USER_SYSCALL_MPROTECT = 42,
 };
 
 /* Stable negative error values returned in a0 by failed system calls. */
@@ -141,9 +143,9 @@ enum user_seek_whence {
         USER_SEEK_END,
 };
 
-/* The first mmap ABI is intentionally anonymous and private. Writable mappings
- * must also be readable on RISC-V, and writable/executable mappings are
- * rejected to preserve W^X. */
+/* Mappings are currently anonymous and private. Writable mappings must also be
+ * readable on RISC-V, and writable/executable mappings are rejected to
+ * preserve W^X. */
 enum user_memory_protection {
         USER_MEMORY_PROTECTION_NONE = 0,
         USER_MEMORY_PROTECTION_READ = (1U << 0),

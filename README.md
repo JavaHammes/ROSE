@@ -62,7 +62,7 @@ scheduling, and automated emulator tests.
   `getcwd`, `pipe`, descriptor flags, `fork`, `spawn`, `execve`, `getpid`,
   `waitpid`, `sigaction`, `kill`, process-group and console foreground-group
   control, shared memory, pseudo-terminals, system telemetry, `brk`, `mmap`,
-  `munmap`, `exit`, and `yield`
+  `mprotect`, `munmap`, `exit`, and `yield`
   system calls. Relative paths resolve from a canonical per-process working
   directory. `brk` provides a private, zero-filled, growable userspace heap
   between the ELF image and stack guard; shrinking or process teardown returns
@@ -78,9 +78,11 @@ scheduling, and automated emulator tests.
   Programs start with conventional `argc`, `argv`, and `envp` values copied to
   their private stack.
   Private anonymous `mmap` reservations allocate zero-filled pages lazily on
-  first access. `munmap` releases complete or partial ranges, kernel writes into
-  untouched mapped buffers materialize them safely, and `fork` carries both
-  untouched reservations and resident pages forward while applying
+  first access. `mprotect` changes complete or partial ranges, including
+  no-access mappings, without losing resident contents and preserves W^X and
+  copy-on-write isolation. `munmap` releases complete or partial ranges, kernel
+  writes into untouched mapped buffers materialize them safely, and `fork`
+  carries both untouched reservations and resident pages forward while applying
   copy-on-write to writable pages.
   UART reads and writes block on scheduler wait channels and resume from device
   interrupts without polling in syscall traps.
@@ -246,11 +248,11 @@ user/kernel isolation, syscall validation, working-directory resolution,
 shared descriptor offsets across aliases and processes, close-on-exec and
 nonblocking inheritance, shared-memory visibility and cleanup,
 pseudo-terminal duplex I/O, system telemetry, userspace heap growth and
-shrinkage, lazy anonymous mappings, partial unmapping, mapping protection and
-reclamation, copy-on-write `fork` address-space isolation and concurrent
-process-capacity stress, caught/ignored/default signal delivery, signal wakeup
-of blocked processes, fork inheritance and exec reset of dispositions,
-blocking UART and pipe I/O, process-group signal delivery, stop/continue wait
+shrinkage, lazy anonymous mappings, partial protection and unmapping, mapping
+protection and reclamation, copy-on-write `fork` address-space isolation and
+concurrent process-capacity stress, caught/ignored/default signal delivery,
+signal wakeup of blocked processes, fork inheritance and exec reset of
+dispositions, blocking UART and pipe I/O, process-group signal delivery, stop/continue wait
 events, Ctrl-C and Ctrl-Z foreground handling, background commands, `jobs`/`fg`,
 child creation and waiting, memory reclamation, fallback-ramfs shell boot,
 graphical transport discovery, userspace framebuffer mapping and flushing,
@@ -297,14 +299,12 @@ another. `make disassemble` writes an annotated disassembly to
 
 ROSE currently targets one hart and one QEMU `virt` platform. The shell has no
 append redirection, descriptor number syntax, expansion, `bg` command, session
-management, or scripting language. The ext2
-implementation is synchronous,
+management, or scripting language. The ext2 implementation is synchronous,
 write-through, limited to one block group and direct plus singly indirect block
 addressing (268 KiB files), and does not yet provide journaling or crash
 recovery. The VirtIO queue is polled synchronously; it is not yet connected to
-a scheduler completion channel. Signals do not yet have masks, alternate stacks,
-sessions, or realtime queues. Anonymous mappings use a fixed sixteen-entry VMA
-table and do not yet support file backing, shared mappings, fixed addresses, or
-`mprotect`. There are no
-general-purpose kernel threads, ASIDs, networking, users, or permissions
-enforcement.
+a scheduler completion channel. Signals do not yet have masks, alternate
+stacks, sessions, or realtime queues. Anonymous mappings use a fixed
+sixteen-entry VMA table and do not yet support file backing, shared mappings,
+or fixed addresses. There are no general-purpose kernel threads, ASIDs,
+networking, users, or permissions enforcement.
