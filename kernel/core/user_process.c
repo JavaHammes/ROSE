@@ -35,7 +35,7 @@ enum {
         USER_IO_MAX = 1024,
         USER_WRITE_TRANSMIT_MAX = USER_IO_MAX * 2,
         USER_PATH_MAX = 64,
-        PROCESS_EXECUTABLE_MAX = 16 * 1024,
+        PROCESS_EXECUTABLE_MAX = 64 * 1024,
         PROCESS_DESCRIPTOR_LIMIT = 8,
         PROCESS_FIRST_OPEN_DESCRIPTOR = 3,
         PROCESS_LIMIT = 8,
@@ -44,6 +44,9 @@ enum {
         PIPE_BUFFER_SIZE = USER_IO_MAX,
         PROCESS_ARGUMENT_LIMIT = 16,
         PROCESS_ENVIRONMENT_LIMIT = 16,
+        SHARED_MEMORY_OBJECT_LIMIT = 12,
+        SHARED_MEMORY_PROCESS_LIMIT = 4,
+        SHARED_MEMORY_PAGE_LIMIT = 256,
 };
 
 enum descriptor_access {
@@ -86,6 +89,9 @@ _Static_assert((uint32_t)USER_OPEN_READ == (uint32_t)VFS_OPEN_READ &&
 #define USER_STACK_ADDRESS UINT64_C(0x00800000)
 #define USER_STACK_TOP (USER_STACK_ADDRESS + PAGE_SIZE)
 #define USER_GRAPHICS_ADDRESS UINT64_C(0x01000000)
+#define USER_SHARED_MEMORY_BASE UINT64_C(0x02000000)
+#define USER_SHARED_MEMORY_STRIDE                                             \
+        (SHARED_MEMORY_PAGE_LIMIT * PAGE_SIZE)
 
 extern char text_start[];
 
@@ -100,7 +106,9 @@ struct process_open_file {
         uint8_t access;
         size_t references;
         uint64_t offset;
-        struct process_pipe *pipe;
+        struct process_pipe *read_pipe;
+        struct process_pipe *write_pipe;
+        bool pseudo_terminal;
         struct vfs_file file;
 };
 
@@ -117,11 +125,26 @@ struct process_pipe {
 struct process_descriptor {
         struct process_open_file *open_file;
         bool close_on_exec;
+        bool nonblocking;
 };
 
 struct process_signal_disposition {
         uintptr_t handler;
         uintptr_t restorer;
+};
+
+struct shared_memory_object {
+        bool used;
+        uint32_t identifier;
+        size_t size;
+        size_t page_count;
+        size_t references;
+        void *pages[SHARED_MEMORY_PAGE_LIMIT];
+};
+
+struct process_shared_memory_mapping {
+        struct shared_memory_object *object;
+        uintptr_t address;
 };
 
 struct process {
@@ -146,6 +169,8 @@ struct process {
         bool exit_reported;
         char current_directory[USER_PATH_MAX];
         struct process_descriptor descriptors[PROCESS_DESCRIPTOR_LIMIT];
+        struct process_shared_memory_mapping
+            shared_memory[SHARED_MEMORY_PROCESS_LIMIT];
 
         /* Dispositions survive fork. Caught handlers reset on exec, while an
          * ignored disposition remains ignored. Only one handler can be active
@@ -188,10 +213,13 @@ struct process_replacement {
 static struct process process_table[PROCESS_LIMIT];
 static struct process_pipe pipe_table[PIPE_LIMIT];
 static struct process_open_file open_file_table[PROCESS_OPEN_FILE_LIMIT];
+static struct shared_memory_object
+    shared_memory_objects[SHARED_MEMORY_OBJECT_LIMIT];
 static struct process *active_process;
 static struct process *uart_write_owner;
 static uint64_t next_pid = 1U;
 static uint64_t graphics_owner_pid;
+static uint32_t next_shared_memory_identifier = 1U;
 static uint64_t terminal_foreground_process_group;
 static uint64_t scheduler_preemptions;
 static uint64_t scheduler_context_switches;
@@ -208,6 +236,52 @@ static void bytes_zero(void *destination, size_t size) {
 
         for (size_t index = 0U; index < size; index++) {
                 bytes[index] = 0U;
+        }
+}
+
+static void shared_memory_object_destroy(struct shared_memory_object *object) {
+        if (object == NULL || !object->used || object->references != 0U) {
+                panic("Invalid shared-memory destruction");
+        }
+        for (size_t index = 0U; index < object->page_count; index++) {
+                if (object->pages[index] == NULL) {
+                        panic("Shared-memory page ownership mismatch");
+                }
+                page_free(object->pages[index]);
+        }
+        bytes_zero(object, sizeof(*object));
+}
+
+static void process_shared_memory_unmap_slot(struct process *process,
+                                             size_t slot) {
+        struct process_shared_memory_mapping *mapping =
+            &process->shared_memory[slot];
+        struct shared_memory_object *object = mapping->object;
+
+        if (object == NULL) {
+                return;
+        }
+        if (!object->used || object->references == 0U ||
+            process->address_space == NULL) {
+                panic("Invalid shared-memory mapping release");
+        }
+
+        for (size_t index = 0U; index < object->page_count; index++) {
+                if (!page_table_unmap(process->address_space,
+                                      mapping->address + index * PAGE_SIZE)) {
+                        panic("Shared-memory unmap ownership mismatch");
+                }
+        }
+        object->references--;
+        bytes_zero(mapping, sizeof(*mapping));
+        if (object->references == 0U) {
+                shared_memory_object_destroy(object);
+        }
+}
+
+static void process_release_shared_memory(struct process *process) {
+        for (size_t slot = 0U; slot < SHARED_MEMORY_PROCESS_LIMIT; slot++) {
+                process_shared_memory_unmap_slot(process, slot);
         }
 }
 
@@ -311,6 +385,7 @@ static void process_descriptor_install(struct process_descriptor *descriptor,
 
         descriptor->open_file = open_file;
         descriptor->close_on_exec = false;
+        descriptor->nonblocking = false;
         open_file->references++;
 }
 
@@ -324,11 +399,16 @@ static void process_descriptor_close(struct process_descriptor *descriptor) {
 
         descriptor->open_file = NULL;
         descriptor->close_on_exec = false;
+        descriptor->nonblocking = false;
         open_file->references--;
         if (open_file->references == 0U) {
-                if (open_file->pipe != NULL) {
-                        process_pipe_release(open_file->pipe,
-                                             open_file->access);
+                if (open_file->read_pipe != NULL) {
+                        process_pipe_release(open_file->read_pipe,
+                                             DESCRIPTOR_READ);
+                }
+                if (open_file->write_pipe != NULL) {
+                        process_pipe_release(open_file->write_pipe,
+                                             DESCRIPTOR_WRITE);
                 }
                 bytes_zero(open_file, sizeof(*open_file));
         }
@@ -381,6 +461,8 @@ static bool process_descriptors_clone(struct process *destination,
 
                 process_descriptor_install(
                     &destination->descriptors[descriptor], source_open_file);
+                destination->descriptors[descriptor].nonblocking =
+                    source->descriptors[descriptor].nonblocking;
         }
 
         return true;
@@ -404,6 +486,8 @@ static void process_descriptors_fork(struct process *destination,
                     source_descriptor->open_file);
                 destination->descriptors[descriptor].close_on_exec =
                     source_descriptor->close_on_exec;
+                destination->descriptors[descriptor].nonblocking =
+                    source_descriptor->nonblocking;
         }
 }
 
@@ -554,6 +638,7 @@ static void process_release_image(struct page_table **address_space,
  */
 static void process_release_resources(struct process *process) {
         process_descriptors_close_all(process);
+        process_release_shared_memory(process);
         process_release_image(&process->address_space, &process->loaded_image,
                               &process->stack_page, &process->heap_start,
                               &process->heap_break);
@@ -1103,16 +1188,16 @@ static bool signal_number_is_valid(int64_t signal) {
 
 static uint64_t signal_bit(uint32_t signal) { return UINT64_C(1) << signal; }
 
+/* Job-control setup may race a very short-lived child. Its zombie still owns
+ * a PID and group identity until waitpid, so the parent may finish assigning
+ * that identity even after the child has released its execution resources. */
 static struct process *process_find_pid(uint64_t pid) {
         for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
                 struct process *process = &process_table[index];
-
-                if (process->state != PROCESS_UNUSED &&
-                    process->state != PROCESS_EXITED && process->pid == pid) {
+                if (process->state != PROCESS_UNUSED && process->pid == pid) {
                         return process;
                 }
         }
-
         return NULL;
 }
 
@@ -1312,8 +1397,9 @@ static bool process_descriptor_is_console(uint64_t descriptor) {
         const struct process_open_file *open_file =
             active_process->descriptors[(size_t)descriptor].open_file;
         return open_file != NULL &&
-               open_file->file.type == VFS_NODE_CHARACTER_DEVICE &&
-               open_file->file.device == VFS_DEVICE_CONSOLE;
+               (open_file->pseudo_terminal ||
+                (open_file->file.type == VFS_NODE_CHARACTER_DEVICE &&
+                 open_file->file.device == VFS_DEVICE_CONSOLE));
 }
 
 static uint64_t syscall_terminal_set_foreground_group(uint64_t descriptor,
@@ -1671,6 +1757,7 @@ static void process_commit_replacement(struct trap_frame *frame) {
         uintptr_t old_heap_break = active_process->heap_break;
 
         graphics_release_if_owned(active_process->pid);
+        process_release_shared_memory(active_process);
         page_table_activate(new_address_space);
         process_release_image(&old_address_space, &active_process->loaded_image,
                               &old_stack_page, &old_heap_start,
@@ -1937,7 +2024,7 @@ static uint64_t syscall_write_begin(uint64_t descriptor, uintptr_t user_buffer,
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
         }
 
-        if (open_file->pipe != NULL) {
+        if (open_file->write_pipe != NULL) {
                 user_copy_from((uint8_t *)active_process->write_buffer,
                                user_buffer, length);
                 active_process->pending_write = length != 0U;
@@ -2083,7 +2170,7 @@ static uint64_t syscall_read_begin(uint64_t descriptor, uintptr_t user_buffer,
                 return 0U;
         }
 
-        if (open_file->pipe != NULL) {
+        if (open_file->read_pipe != NULL) {
                 active_process->pending_read = true;
                 active_process->read_descriptor = (size_t)descriptor;
                 active_process->read_buffer = user_buffer;
@@ -2168,11 +2255,13 @@ static uint64_t syscall_fstat(uint64_t descriptor, uintptr_t user_status) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
         }
 
-        if (open_file->pipe != NULL) {
+        if (open_file->read_pipe != NULL || open_file->write_pipe != NULL) {
                 struct user_file_status pipe_status;
 
                 bytes_zero(&pipe_status, sizeof(pipe_status));
-                pipe_status.size = open_file->pipe->count;
+                pipe_status.size = open_file->read_pipe == NULL
+                                       ? open_file->write_pipe->count
+                                       : open_file->read_pipe->count;
                 pipe_status.type = USER_FILE_PIPE;
                 user_copy_to(user_status, (const uint8_t *)&pipe_status,
                              sizeof(pipe_status));
@@ -2193,7 +2282,7 @@ static uint64_t syscall_lseek(uint64_t descriptor, int64_t adjustment,
         }
         struct process_open_file *open_file =
             active_process->descriptors[(size_t)descriptor].open_file;
-        if (open_file->pipe != NULL ||
+        if (open_file->read_pipe != NULL || open_file->write_pipe != NULL ||
             open_file->file.type != VFS_NODE_REGULAR) {
                 return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
         }
@@ -2241,7 +2330,7 @@ static uint64_t syscall_read_directory(uint64_t descriptor,
         if (directory == NULL || (directory->access & DESCRIPTOR_READ) == 0U) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
         }
-        if (directory->pipe != NULL) {
+        if (directory->read_pipe != NULL || directory->write_pipe != NULL) {
                 return (uint64_t)-(int64_t)USER_ERROR_NOT_DIRECTORY;
         }
         if (!user_range_is_valid(user_entry,
@@ -2407,10 +2496,10 @@ static uint64_t syscall_pipe(uintptr_t user_descriptors) {
         }
 
         read_end->access = DESCRIPTOR_READ;
-        read_end->pipe = pipe;
+        read_end->read_pipe = pipe;
         process_pipe_retain(pipe, read_end->access);
         write_end->access = DESCRIPTOR_WRITE;
-        write_end->pipe = pipe;
+        write_end->write_pipe = pipe;
         process_pipe_retain(pipe, write_end->access);
         process_descriptor_install(
             &active_process->descriptors[descriptor_pair[0]], read_end);
@@ -2428,12 +2517,15 @@ static uint64_t syscall_set_descriptor_flags(uint64_t descriptor,
             active_process->descriptors[(size_t)descriptor].open_file == NULL) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
         }
-        if ((flags & ~(uint32_t)USER_DESCRIPTOR_CLOSE_ON_EXEC) != 0U) {
+        if ((flags & ~((uint32_t)USER_DESCRIPTOR_CLOSE_ON_EXEC |
+                       (uint32_t)USER_DESCRIPTOR_NONBLOCK)) != 0U) {
                 return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
         }
 
         active_process->descriptors[(size_t)descriptor].close_on_exec =
             (flags & USER_DESCRIPTOR_CLOSE_ON_EXEC) != 0U;
+        active_process->descriptors[(size_t)descriptor].nonblocking =
+            (flags & USER_DESCRIPTOR_NONBLOCK) != 0U;
         return 0U;
 }
 
@@ -2565,6 +2657,276 @@ static uint64_t syscall_input_read(uintptr_t user_event) {
         return 1U;
 }
 
+static struct shared_memory_object *
+shared_memory_find(uint32_t identifier) {
+        if (identifier == 0U) {
+                return NULL;
+        }
+        for (size_t index = 0U; index < SHARED_MEMORY_OBJECT_LIMIT; index++) {
+                if (shared_memory_objects[index].used &&
+                    shared_memory_objects[index].identifier == identifier) {
+                        return &shared_memory_objects[index];
+                }
+        }
+        return NULL;
+}
+
+static uint32_t shared_memory_allocate_identifier(void) {
+        for (size_t attempt = 0U; attempt <= SHARED_MEMORY_OBJECT_LIMIT;
+             attempt++) {
+                uint32_t candidate = next_shared_memory_identifier++;
+                if (next_shared_memory_identifier == 0U) {
+                        next_shared_memory_identifier = 1U;
+                }
+                if (candidate != 0U && shared_memory_find(candidate) == NULL) {
+                        return candidate;
+                }
+        }
+        panic("Unable to allocate shared-memory identifier");
+}
+
+static size_t process_shared_memory_free_slot(void) {
+        for (size_t slot = 0U; slot < SHARED_MEMORY_PROCESS_LIMIT; slot++) {
+                if (active_process->shared_memory[slot].object == NULL) {
+                        return slot;
+                }
+        }
+        return SHARED_MEMORY_PROCESS_LIMIT;
+}
+
+static bool process_shared_memory_map_object(struct shared_memory_object *object,
+                                             size_t slot) {
+        uintptr_t address =
+            USER_SHARED_MEMORY_BASE + slot * USER_SHARED_MEMORY_STRIDE;
+        size_t mapped = 0U;
+
+        while (mapped < object->page_count) {
+                if (!page_table_map(active_process->address_space,
+                                    address + mapped * PAGE_SIZE,
+                                    (uintptr_t)object->pages[mapped],
+                                    VM_PAGE_USER | VM_PAGE_READ |
+                                        VM_PAGE_WRITE)) {
+                        while (mapped != 0U) {
+                                mapped--;
+                                if (!page_table_unmap(
+                                        active_process->address_space,
+                                        address + mapped * PAGE_SIZE)) {
+                                        panic("Shared-memory map rollback failed");
+                                }
+                        }
+                        return false;
+                }
+                mapped++;
+        }
+
+        active_process->shared_memory[slot].object = object;
+        active_process->shared_memory[slot].address = address;
+        object->references++;
+        return true;
+}
+
+static uint64_t shared_memory_copy_information(
+    const struct process_shared_memory_mapping *mapping,
+    uintptr_t user_information) {
+        struct user_shared_memory_info information;
+
+        bytes_zero(&information, sizeof(information));
+        information.identifier = mapping->object->identifier;
+        information.address = mapping->address;
+        information.size = mapping->object->size;
+        user_copy_to(user_information, (const uint8_t *)&information,
+                     sizeof(information));
+        return 0U;
+}
+
+static uint64_t syscall_shared_memory_create(size_t size,
+                                             uintptr_t user_information) {
+        if (!user_range_is_valid(user_information,
+                                 sizeof(struct user_shared_memory_info),
+                                 VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        if (size == 0U || size > SHARED_MEMORY_PAGE_LIMIT * PAGE_SIZE) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+
+        size_t slot = process_shared_memory_free_slot();
+        if (slot == SHARED_MEMORY_PROCESS_LIMIT) {
+                return (uint64_t)-(int64_t)USER_ERROR_TOO_MANY_FILES;
+        }
+        struct shared_memory_object *object = NULL;
+        for (size_t index = 0U; index < SHARED_MEMORY_OBJECT_LIMIT; index++) {
+                if (!shared_memory_objects[index].used) {
+                        object = &shared_memory_objects[index];
+                        break;
+                }
+        }
+        if (object == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_NO_SPACE;
+        }
+
+        bytes_zero(object, sizeof(*object));
+        object->used = true;
+        object->identifier = shared_memory_allocate_identifier();
+        object->size = size;
+        size_t page_count = (size + PAGE_SIZE - 1U) / PAGE_SIZE;
+        while (object->page_count < page_count) {
+                void *page = page_alloc();
+                if (page == NULL) {
+                        while (object->page_count != 0U) {
+                                object->page_count--;
+                                page_free(object->pages[object->page_count]);
+                        }
+                        bytes_zero(object, sizeof(*object));
+                        return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
+                }
+                object->pages[object->page_count++] = page;
+        }
+
+        if (!process_shared_memory_map_object(object, slot)) {
+                while (object->page_count != 0U) {
+                        object->page_count--;
+                        page_free(object->pages[object->page_count]);
+                }
+                bytes_zero(object, sizeof(*object));
+                return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
+        }
+        return shared_memory_copy_information(
+            &active_process->shared_memory[slot], user_information);
+}
+
+static uint64_t syscall_shared_memory_map(uint32_t identifier,
+                                          uintptr_t user_information) {
+        if (!user_range_is_valid(user_information,
+                                 sizeof(struct user_shared_memory_info),
+                                 VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        struct shared_memory_object *object = shared_memory_find(identifier);
+        if (object == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_NO_ENTRY;
+        }
+        for (size_t slot = 0U; slot < SHARED_MEMORY_PROCESS_LIMIT; slot++) {
+                if (active_process->shared_memory[slot].object == object) {
+                        return shared_memory_copy_information(
+                            &active_process->shared_memory[slot],
+                            user_information);
+                }
+        }
+        size_t slot = process_shared_memory_free_slot();
+        if (slot == SHARED_MEMORY_PROCESS_LIMIT) {
+                return (uint64_t)-(int64_t)USER_ERROR_TOO_MANY_FILES;
+        }
+        if (!process_shared_memory_map_object(object, slot)) {
+                return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
+        }
+        return shared_memory_copy_information(
+            &active_process->shared_memory[slot], user_information);
+}
+
+static uint64_t syscall_shared_memory_unmap(uint32_t identifier) {
+        for (size_t slot = 0U; slot < SHARED_MEMORY_PROCESS_LIMIT; slot++) {
+                struct shared_memory_object *object =
+                    active_process->shared_memory[slot].object;
+                if (object != NULL && object->identifier == identifier) {
+                        process_shared_memory_unmap_slot(active_process, slot);
+                        return 0U;
+                }
+        }
+        return (uint64_t)-(int64_t)USER_ERROR_NO_ENTRY;
+}
+
+static uint64_t syscall_open_pseudo_terminal(uintptr_t user_descriptors) {
+        if (!user_range_is_valid(user_descriptors, 2U * sizeof(int),
+                                 VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+
+        size_t descriptor_pair[2];
+        size_t descriptor_count = 0U;
+        for (size_t index = 0U; index < PROCESS_DESCRIPTOR_LIMIT; index++) {
+                if (active_process->descriptors[index].open_file == NULL &&
+                    descriptor_count < 2U) {
+                        descriptor_pair[descriptor_count++] = index;
+                }
+        }
+        if (descriptor_count != 2U) {
+                return (uint64_t)-(int64_t)USER_ERROR_TOO_MANY_FILES;
+        }
+        size_t free_open_files = 0U;
+        for (size_t index = 0U; index < PROCESS_OPEN_FILE_LIMIT; index++) {
+                if (!open_file_table[index].used) {
+                        free_open_files++;
+                }
+        }
+        if (free_open_files < 2U) {
+                return (uint64_t)-(int64_t)USER_ERROR_FILE_TABLE_OVERFLOW;
+        }
+
+        struct process_pipe *to_slave = process_pipe_allocate();
+        struct process_pipe *to_master = process_pipe_allocate();
+        if (to_slave == NULL || to_master == NULL) {
+                if (to_slave != NULL) {
+                        bytes_zero(to_slave, sizeof(*to_slave));
+                }
+                if (to_master != NULL) {
+                        bytes_zero(to_master, sizeof(*to_master));
+                }
+                return (uint64_t)-(int64_t)USER_ERROR_FILE_TABLE_OVERFLOW;
+        }
+
+        struct process_open_file *master = process_open_file_allocate();
+        struct process_open_file *slave = process_open_file_allocate();
+        if (master == NULL || slave == NULL) {
+                panic("Reserved pseudo-terminal records disappeared");
+        }
+        master->access = DESCRIPTOR_READ | DESCRIPTOR_WRITE;
+        master->read_pipe = to_master;
+        master->write_pipe = to_slave;
+        master->pseudo_terminal = true;
+        slave->access = DESCRIPTOR_READ | DESCRIPTOR_WRITE;
+        slave->read_pipe = to_slave;
+        slave->write_pipe = to_master;
+        slave->pseudo_terminal = true;
+        process_pipe_retain(to_master, DESCRIPTOR_READ);
+        process_pipe_retain(to_master, DESCRIPTOR_WRITE);
+        process_pipe_retain(to_slave, DESCRIPTOR_READ);
+        process_pipe_retain(to_slave, DESCRIPTOR_WRITE);
+        process_descriptor_install(
+            &active_process->descriptors[descriptor_pair[0]], master);
+        process_descriptor_install(
+            &active_process->descriptors[descriptor_pair[1]], slave);
+
+        int result[2] = {(int)descriptor_pair[0], (int)descriptor_pair[1]};
+        user_copy_to(user_descriptors, (const uint8_t *)result, sizeof(result));
+        return 0U;
+}
+
+static uint64_t syscall_system_info(uintptr_t user_information) {
+        if (!user_range_is_valid(user_information,
+                                 sizeof(struct user_system_info),
+                                 VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        struct user_system_info information;
+        bytes_zero(&information, sizeof(information));
+        information.total_pages = page_total_count();
+        information.free_pages = page_free_count();
+        information.used_pages = page_used_count();
+        information.context_switches = scheduler_context_switches;
+        information.scheduler_preemptions = scheduler_preemptions;
+        information.scheduler_blocks = scheduler_blocks;
+        for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
+                if (process_table[index].state != PROCESS_UNUSED &&
+                    process_table[index].state != PROCESS_EXITED) {
+                        information.process_count++;
+                }
+        }
+        user_copy_to(user_information, (const uint8_t *)&information,
+                     sizeof(information));
+        return 0U;
+}
+
 /* Select the first READY slot after the current process, wrapping once. */
 static struct process *scheduler_find_next_ready(void) {
         size_t start_index = 0U;
@@ -2689,8 +3051,8 @@ static void process_continue_write(struct trap_frame *frame) {
                 panic_trap("Pending write descriptor was closed", frame);
         }
 
-        if (open_file->pipe != NULL) {
-                struct process_pipe *pipe = open_file->pipe;
+        if (open_file->write_pipe != NULL) {
+                struct process_pipe *pipe = open_file->write_pipe;
 
                 if (pipe->readers == 0U) {
                         process->pending_write = false;
@@ -2699,6 +3061,14 @@ static void process_continue_write(struct trap_frame *frame) {
                         return;
                 }
                 if (process->write_length > PIPE_BUFFER_SIZE - pipe->count) {
+                        if (process->descriptors[process->write_descriptor]
+                                .nonblocking) {
+                                process->pending_write = false;
+                                frame->a0 =
+                                    (uint64_t)-(int64_t)USER_ERROR_TRY_AGAIN;
+                                frame->sepc += 4U;
+                                return;
+                        }
                         scheduler_block_current(frame,
                                                 SCHEDULER_WAIT_PIPE_WRITE);
                         return;
@@ -2765,13 +3135,22 @@ static void process_continue_read(struct trap_frame *frame) {
                 panic_trap("Pending read descriptor was closed", frame);
         }
 
-        if (open_file->pipe != NULL) {
-                struct process_pipe *pipe = open_file->pipe;
+        if (open_file->read_pipe != NULL) {
+                struct process_pipe *pipe = open_file->read_pipe;
 
                 if (pipe->count == 0U) {
                         if (pipe->writers == 0U) {
                                 process->pending_read = false;
                                 frame->a0 = 0U;
+                                frame->sepc += 4U;
+                                return;
+                        }
+
+                        if (process->descriptors[process->read_descriptor]
+                                .nonblocking) {
+                                process->pending_read = false;
+                                frame->a0 =
+                                    (uint64_t)-(int64_t)USER_ERROR_TRY_AGAIN;
                                 frame->sepc += 4U;
                                 return;
                         }
@@ -3434,6 +3813,35 @@ void user_process_handle_syscall(struct trap_frame *frame) {
 
         case USER_SYSCALL_INPUT_READ:
                 frame->a0 = syscall_input_read((uintptr_t)frame->a0);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_SHARED_MEMORY_CREATE:
+                frame->a0 = syscall_shared_memory_create(
+                    (size_t)frame->a0, (uintptr_t)frame->a1);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_SHARED_MEMORY_MAP:
+                frame->a0 = syscall_shared_memory_map(
+                    (uint32_t)frame->a0, (uintptr_t)frame->a1);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_SHARED_MEMORY_UNMAP:
+                frame->a0 =
+                    syscall_shared_memory_unmap((uint32_t)frame->a0);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_OPEN_PSEUDO_TERMINAL:
+                frame->a0 =
+                    syscall_open_pseudo_terminal((uintptr_t)frame->a0);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_SYSTEM_INFO:
+                frame->a0 = syscall_system_info((uintptr_t)frame->a0);
                 frame->sepc += 4U;
                 return;
 

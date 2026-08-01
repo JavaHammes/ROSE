@@ -45,7 +45,7 @@ USER_COMMON_OBJECTS := \
 # Each userspace path is a distinct ELF. Demonstrations share a build-time
 # selected source, while /bin/sh adds its own implementation object. The disk
 # receives every image; the diagnostic ramfs retains its programs and shell.
-USER_PROGRAMS := hello fault process_a process_b syscall_test cat console_read init fs_test args_env execve execve_target pipe_test pipe_writer sh ls echo pwd env mkdir rm descriptor_test signal_exec_test desktop
+USER_PROGRAMS := hello fault process_a process_b syscall_test cat console_read init fs_test args_env execve execve_target pipe_test pipe_writer sh ls echo pwd env mkdir rm descriptor_test signal_exec_test desktop gui_terminal gui_files gui_monitor
 # Use the ABI enum names directly so adding or reordering an enum cannot
 # silently build a program with the wrong implementation.
 USER_PROGRAM_hello := USER_PROGRAM_HELLO
@@ -72,6 +72,9 @@ USER_PROGRAM_rm := USER_PROGRAM_RM
 USER_PROGRAM_descriptor_test := USER_PROGRAM_DESCRIPTOR_TEST
 USER_PROGRAM_signal_exec_test := USER_PROGRAM_SIGNAL_EXEC_TEST
 USER_PROGRAM_desktop := USER_PROGRAM_DESKTOP
+USER_PROGRAM_gui_terminal := USER_PROGRAM_GUI_TERMINAL
+USER_PROGRAM_gui_files := USER_PROGRAM_GUI_FILES
+USER_PROGRAM_gui_monitor := USER_PROGRAM_GUI_SYSTEM_MONITOR
 USER_ELFS := $(foreach program,$(USER_PROGRAMS),$(BUILD_DIR)/user/$(program)/program.elf)
 USER_LOAD_ELFS := $(USER_ELFS:.elf=.load.elf)
 USER_FALLBACK_PROGRAMS := hello fault process_a process_b syscall_test cat console_read sh ls echo pwd env mkdir rm descriptor_test signal_exec_test
@@ -80,6 +83,9 @@ USER_IMAGE_OBJECT := $(BUILD_DIR)/kernel/arch/riscv64/user_image.o
 
 USER_EXTRA_OBJECTS_sh := $(BUILD_DIR)/user/sh.o
 USER_EXTRA_OBJECTS_desktop := $(BUILD_DIR)/user/desktop.o
+USER_EXTRA_OBJECTS_gui_terminal := $(BUILD_DIR)/user/gui_terminal.o $(BUILD_DIR)/user/gui.o
+USER_EXTRA_OBJECTS_gui_files := $(BUILD_DIR)/user/gui_files.o $(BUILD_DIR)/user/gui.o
+USER_EXTRA_OBJECTS_gui_monitor := $(BUILD_DIR)/user/gui_monitor.o $(BUILD_DIR)/user/gui.o
 
 # Compiler-generated dependency files keep incremental header rebuilds correct.
 DEPS := \
@@ -87,6 +93,10 @@ DEPS := \
 	$(USER_COMMON_OBJECTS:.o=.d) \
 	$(BUILD_DIR)/user/sh.d \
 	$(BUILD_DIR)/user/desktop.d \
+	$(BUILD_DIR)/user/gui.d \
+	$(BUILD_DIR)/user/gui_terminal.d \
+	$(BUILD_DIR)/user/gui_files.d \
+	$(BUILD_DIR)/user/gui_monitor.d \
 	$(foreach program,$(USER_PROGRAMS),$(BUILD_DIR)/user/$(program)/main.d)
 
 ARCH_FLAGS := \
@@ -199,6 +209,9 @@ $(ROOT_IMAGE): tools/mkrosefs.py $(USER_LOAD_ELFS) Makefile
 		--file /bin/descriptor-test=$(BUILD_DIR)/user/descriptor_test/program.load.elf \
 		--file /bin/signal-exec-test=$(BUILD_DIR)/user/signal_exec_test/program.load.elf \
 		--file /bin/desktop=$(BUILD_DIR)/user/desktop/program.load.elf \
+		--file /bin/gui-terminal=$(BUILD_DIR)/user/gui_terminal/program.load.elf \
+		--file /bin/gui-files=$(BUILD_DIR)/user/gui_files/program.load.elf \
+		--file /bin/gui-monitor=$(BUILD_DIR)/user/gui_monitor/program.load.elf \
 		--file /sbin/init=$(BUILD_DIR)/user/init/program.load.elf
 
 

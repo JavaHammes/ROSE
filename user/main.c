@@ -32,6 +32,9 @@ static void signal_test_handler(int signal) {
  * from every other independently linked user image. */
 int rose_shell_main(char **environment);
 int rose_desktop_main(int argc, char **argv);
+int rose_gui_terminal_main(int argc, char **argv);
+int rose_gui_files_main(int argc, char **argv);
+int rose_gui_monitor_main(int argc, char **argv);
 
 /* Small libc replacements keep the user executable completely freestanding. */
 static size_t string_length(const char *text) {
@@ -553,6 +556,80 @@ static int run_syscall_test(void) {
             rose_close((int)descriptor) != 0) {
                 return 51;
         }
+
+        struct user_shared_memory_info shared;
+        if (rose_shared_memory_create(0U, &shared) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_shared_memory_create(4096U,
+                                      (struct user_shared_memory_info *)
+                                          kernel_address) !=
+                -USER_ERROR_BAD_ADDRESS ||
+            rose_shared_memory_create(4096U, &shared) != 0 ||
+            shared.identifier == 0U || shared.size != 4096U) {
+                return 76;
+        }
+        volatile uint64_t *shared_value =
+            (volatile uint64_t *)shared.address;
+        *shared_value = UINT64_C(0x524f534553484d31);
+        child_pid = rose_fork();
+        if (child_pid == 0) {
+                struct user_shared_memory_info child_mapping;
+                if (rose_shared_memory_map(shared.identifier,
+                                           &child_mapping) != 0 ||
+                    *(volatile uint64_t *)child_mapping.address !=
+                        UINT64_C(0x524f534553484d31)) {
+                        rose_exit(77U);
+                }
+                *(volatile uint64_t *)child_mapping.address =
+                    UINT64_C(0x524f534553484d32);
+                if (rose_shared_memory_unmap(shared.identifier) != 0) {
+                        rose_exit(78U);
+                }
+                rose_exit(0U);
+        }
+        wait_status = -1;
+        if (child_pid <= 0 ||
+            rose_waitpid(child_pid, &wait_status, 0U) != child_pid ||
+            !USER_WAIT_STATUS_EXITED(wait_status) ||
+            USER_WAIT_STATUS_EXIT_CODE(wait_status) != 0U ||
+            *shared_value != UINT64_C(0x524f534553484d32) ||
+            rose_shared_memory_unmap(shared.identifier) != 0 ||
+            rose_shared_memory_unmap(shared.identifier) !=
+                -USER_ERROR_NO_ENTRY) {
+                return 79;
+        }
+        print("Shared memory passed\n");
+
+        int terminals[2];
+        char terminal_byte = 0;
+        if (rose_openpty((int *)kernel_address) != -USER_ERROR_BAD_ADDRESS ||
+            rose_openpty(terminals) != 0 || terminals[0] != 3 ||
+            terminals[1] != 4 ||
+            rose_set_descriptor_flags(terminals[0],
+                                      USER_DESCRIPTOR_NONBLOCK) != 0 ||
+            rose_read(terminals[0], &terminal_byte, 1U) !=
+                -USER_ERROR_TRY_AGAIN ||
+            rose_write(terminals[0], "m", 1U) != 1 ||
+            rose_read(terminals[1], &terminal_byte, 1U) != 1 ||
+            terminal_byte != 'm' || rose_write(terminals[1], "s", 1U) != 1 ||
+            rose_read(terminals[0], &terminal_byte, 1U) != 1 ||
+            terminal_byte != 's' ||
+            rose_fstat(terminals[0], &descriptor_status) != 0 ||
+            descriptor_status.type != USER_FILE_PIPE ||
+            rose_close(terminals[0]) != 0 || rose_close(terminals[1]) != 0) {
+                return 80;
+        }
+        print("Pseudo-terminal passed\n");
+
+        struct user_system_info system_information;
+        if (rose_system_info((struct user_system_info *)kernel_address) !=
+                -USER_ERROR_BAD_ADDRESS ||
+            rose_system_info(&system_information) != 0 ||
+            system_information.total_pages == 0U ||
+            system_information.used_pages == 0U) {
+                return 81;
+        }
+        print("System telemetry passed\n");
 
         print("Process hierarchy passed\n");
         print("Fork semantics passed\n");
@@ -1211,6 +1288,15 @@ int user_main(int argc, char **argv,
 
         case USER_PROGRAM_DESKTOP:
                 return rose_desktop_main(argc, argv);
+
+        case USER_PROGRAM_GUI_TERMINAL:
+                return rose_gui_terminal_main(argc, argv);
+
+        case USER_PROGRAM_GUI_FILES:
+                return rose_gui_files_main(argc, argv);
+
+        case USER_PROGRAM_GUI_SYSTEM_MONITOR:
+                return rose_gui_monitor_main(argc, argv);
 
         default:
                 return 2;

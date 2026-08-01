@@ -28,10 +28,14 @@ scheduling, and automated emulator tests.
   flushes. A graphical console mirrors `/dev/console` output while UART remains
   available for diagnostics and headless automation.
 - A userspace graphics ABI maps the framebuffer into one owning process and
-  exposes validated flush and nonblocking input-event calls. `/bin/desktop` is
-  a small userspace compositor with a panel, movable window, status card, and
-  pointer. Screen/input ownership is reclaimed automatically on exit, fault,
-  or `execve`, restoring the graphical terminal.
+  exposes validated dirty-rectangle flushes and nonblocking input events.
+  `/bin/desktop` is a multi-process window server with overlapping surfaces,
+  focus and z-order, title-bar dragging, close controls, input routing, and
+  damage-tracked composition. Page-backed shared-memory objects carry client
+  pixels and event rings. Separate graphical terminal, Files, and live system
+  monitor processes render through a compact client UI library. Screen/input
+  ownership and shared mappings are reclaimed automatically on exit, fault,
+  or `execve`, restoring the graphical console.
 - Generic sector-device interface, modern VirtIO-MMIO block driver, and a
   sixteen-entry write-through cache for 1 KiB filesystem blocks.
 - Writable ext2 root filesystem containing `/sbin/init`, `/bin/sh`, programs,
@@ -48,12 +52,16 @@ scheduling, and automated emulator tests.
   pipes provide buffered interprocess byte streams, blocking reads and writes,
   EOF and broken-pipe handling, descriptor inheritance across `spawn`, and endpoint
   lifetime tracking across descriptor aliases. Per-descriptor close-on-exec
-  flags keep shell-private pipe ends and saved descriptors out of child images.
+  and nonblocking flags keep shell-private pipe ends and saved descriptors out
+  of child images. Bidirectional pseudo-terminal pairs connect the graphical
+  terminal to the existing shell without moving command parsing into the
+  window server.
 - U-mode C runtime with descriptor I/O, `open`, `close`, `stat`, `fstat`,
   `lseek`, `dup`, `dup2`, directory iteration, `mkdir`, `unlink`, `chdir`,
   `getcwd`, `pipe`, descriptor flags, `fork`, `spawn`, `execve`, `getpid`,
   `waitpid`, `sigaction`, `kill`, process-group and console foreground-group
-  control, `brk`, `exit`, and `yield`
+  control, shared memory, pseudo-terminals, system telemetry, `brk`, `exit`,
+  and `yield`
   system calls. Relative paths resolve from a canonical per-process working
   directory. `brk` provides a private, zero-filled, growable userspace heap
   between the ELF image and stack guard; shrinking or process teardown returns
@@ -146,8 +154,10 @@ make run-gui
 ```
 
 The shell is visible in both the QEMU window and the serial terminal. Run
-`desktop` to enter the userspace desktop; drag its title bar with the tablet
-and press `Q` or Escape to return to the shell.
+`desktop` to enter the userspace desktop. Its Terminal runs the same shell over
+a pseudo-terminal, Files browses directories, and System Monitor reads live
+kernel counters. Click a window to focus it, drag its title bar, use the red
+control to close it, and press Escape to return to the serial shell.
 
 After `/sbin/init` launches `/bin/sh` and waits for it, the shell starts at
 `rose>`.
@@ -170,7 +180,7 @@ Useful commands are:
 | `console-read` | Block a child until one byte arrives on standard input. |
 | `fs-test` | Exercise writable files, directories, stat, and seek. |
 | `pipe-test` | Exercise inherited descriptors and blocking anonymous pipes. |
-| `desktop` | Enter the graphical userspace desktop (`Q` or Escape returns). |
+| `desktop` | Enter the multi-application desktop (Escape returns). |
 | `env` | Show environment variables inherited by new programs. |
 | `setenv NAME VALUE` | Set an inherited environment variable. |
 | `unsetenv NAME` | Remove an inherited environment variable. |
@@ -227,15 +237,19 @@ The smoke tests cover disk-root boot through `/sbin/init` into `/bin/sh`,
 userspace line parsing and built-ins, `PATH` execution, VirtIO-backed ext2
 mutation, directory utilities, input/output redirection, multi-stage pipelines,
 user/kernel isolation, syscall validation, working-directory resolution,
-shared descriptor offsets across aliases and processes, close-on-exec
-inheritance, userspace heap growth and shrinkage, eager `fork` address-space
+shared descriptor offsets across aliases and processes, close-on-exec and
+nonblocking inheritance, shared-memory visibility and cleanup,
+pseudo-terminal duplex I/O, system telemetry, userspace heap growth and
+shrinkage, eager `fork` address-space
 isolation, caught/ignored/default signal delivery, signal wakeup of blocked
 processes, fork inheritance and exec reset of dispositions, blocking UART and
 pipe I/O, process-group signal delivery, stop/continue wait events, Ctrl-C and
 Ctrl-Z foreground handling, background commands, `jobs`/`fg`, child creation
 and waiting, memory reclamation, fallback-ramfs shell boot, graphical transport
 discovery, userspace framebuffer mapping and flushing, automatic graphical
-console restoration, and clean shutdown.
+console restoration, and clean shutdown. The graphical smoke test boots and
+closes the full three-client desktop; the terminal path was also verified with
+a shell command entered through its pseudo-terminal.
 
 The host-side image tests additionally validate filesystem metadata, output
 determinism, atomic replacement, guest path constraints, and malformed tree

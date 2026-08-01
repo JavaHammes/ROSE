@@ -38,6 +38,11 @@
 #define USER_SYSCALL_GRAPHICS_MAP 32
 #define USER_SYSCALL_GRAPHICS_FLUSH 33
 #define USER_SYSCALL_INPUT_READ 34
+#define USER_SYSCALL_SHARED_MEMORY_CREATE 35
+#define USER_SYSCALL_SHARED_MEMORY_MAP 36
+#define USER_SYSCALL_SHARED_MEMORY_UNMAP 37
+#define USER_SYSCALL_OPEN_PSEUDO_TERMINAL 38
+#define USER_SYSCALL_SYSTEM_INFO 39
 
 #else
 
@@ -77,6 +82,11 @@ enum user_syscall_number {
         USER_SYSCALL_GRAPHICS_MAP = 32,
         USER_SYSCALL_GRAPHICS_FLUSH = 33,
         USER_SYSCALL_INPUT_READ = 34,
+        USER_SYSCALL_SHARED_MEMORY_CREATE = 35,
+        USER_SYSCALL_SHARED_MEMORY_MAP = 36,
+        USER_SYSCALL_SHARED_MEMORY_UNMAP = 37,
+        USER_SYSCALL_OPEN_PSEUDO_TERMINAL = 38,
+        USER_SYSCALL_SYSTEM_INFO = 39,
 };
 
 /* Stable negative error values returned in a0 by failed system calls. */
@@ -118,6 +128,7 @@ enum user_open_flags {
 
 enum user_descriptor_flags {
         USER_DESCRIPTOR_CLOSE_ON_EXEC = (1U << 0),
+        USER_DESCRIPTOR_NONBLOCK = (1U << 1),
 };
 
 enum user_seek_whence {
@@ -221,6 +232,24 @@ struct user_input_event {
         uint32_t buttons;
 };
 
+struct user_shared_memory_info {
+        uint32_t identifier;
+        uint32_t reserved;
+        uintptr_t address;
+        uint64_t size;
+};
+
+struct user_system_info {
+        uint64_t total_pages;
+        uint64_t free_pages;
+        uint64_t used_pages;
+        uint64_t context_switches;
+        uint64_t scheduler_preemptions;
+        uint64_t scheduler_blocks;
+        uint32_t process_count;
+        uint32_t reserved;
+};
+
 enum user_standard_file_descriptor {
         USER_STDIN_FILENO = 0,
         USER_STDOUT_FILENO = 1,
@@ -253,6 +282,9 @@ enum user_program {
         USER_PROGRAM_DESCRIPTOR_TEST,
         USER_PROGRAM_SIGNAL_EXEC_TEST,
         USER_PROGRAM_DESKTOP,
+        USER_PROGRAM_GUI_TERMINAL,
+        USER_PROGRAM_GUI_FILES,
+        USER_PROGRAM_GUI_SYSTEM_MONITOR,
 };
 
 #endif

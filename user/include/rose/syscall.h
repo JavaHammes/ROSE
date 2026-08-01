@@ -57,6 +57,19 @@ long rose_graphics_flush(uint32_t x, uint32_t y, uint32_t width,
                          uint32_t height);
 long rose_input_read(struct user_input_event *event);
 
+/* Page-backed memory objects can be mapped by multiple processes. */
+long rose_shared_memory_create(size_t size,
+                               struct user_shared_memory_info *information);
+long rose_shared_memory_map(uint32_t identifier,
+                            struct user_shared_memory_info *information);
+long rose_shared_memory_unmap(uint32_t identifier);
+
+/* Return a bidirectional master/slave descriptor pair. */
+long rose_openpty(int descriptors[2]);
+
+/* Snapshot memory, process, and scheduler activity for system monitors. */
+long rose_system_info(struct user_system_info *information);
+
 /* Terminate the calling process or voluntarily give another process a turn. */
 _Noreturn void rose_exit(uint64_t status);
 void rose_yield(void);

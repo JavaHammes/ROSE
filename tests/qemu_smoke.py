@@ -84,7 +84,7 @@ class QemuSession:
         self.process.stdin.write(b"\x01c")
         self.process.stdin.flush()
         output = self.read_until(b"(qemu) ", 5.0)
-        self.process.stdin.write(b"sendkey q\n")
+        self.process.stdin.write(b"sendkey esc\n")
         self.process.stdin.flush()
         output += self.read_until(b"rose> ", 5.0)
         self.process.stdin.write(b"\x01c")
@@ -271,6 +271,9 @@ def main() -> int:
             "Job control passed",
             "Process hierarchy passed",
             "Userspace heap passed",
+            "Shared memory passed",
+            "Pseudo-terminal passed",
+            "System telemetry passed",
             "Syscall validation passed",
         )
         require(
@@ -404,6 +407,9 @@ def main() -> int:
             "Fork semantics passed",
             "Signal delivery passed",
             "Job control passed",
+            "Shared memory passed",
+            "Pseudo-terminal passed",
+            "System telemetry passed",
             "Syscall validation passed",
         )
         fallback.shutdown()

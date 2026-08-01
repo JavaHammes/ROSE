@@ -344,6 +344,56 @@ rose_input_read:
     ret
 .size rose_input_read, . - rose_input_read
 
+.section .text.rose_shared_memory_create,"ax",@progbits
+.align 2
+.globl rose_shared_memory_create
+.type rose_shared_memory_create, @function
+rose_shared_memory_create:
+    li a7, USER_SYSCALL_SHARED_MEMORY_CREATE
+    ecall
+    ret
+.size rose_shared_memory_create, . - rose_shared_memory_create
+
+.section .text.rose_shared_memory_map,"ax",@progbits
+.align 2
+.globl rose_shared_memory_map
+.type rose_shared_memory_map, @function
+rose_shared_memory_map:
+    li a7, USER_SYSCALL_SHARED_MEMORY_MAP
+    ecall
+    ret
+.size rose_shared_memory_map, . - rose_shared_memory_map
+
+.section .text.rose_shared_memory_unmap,"ax",@progbits
+.align 2
+.globl rose_shared_memory_unmap
+.type rose_shared_memory_unmap, @function
+rose_shared_memory_unmap:
+    li a7, USER_SYSCALL_SHARED_MEMORY_UNMAP
+    ecall
+    ret
+.size rose_shared_memory_unmap, . - rose_shared_memory_unmap
+
+.section .text.rose_openpty,"ax",@progbits
+.align 2
+.globl rose_openpty
+.type rose_openpty, @function
+rose_openpty:
+    li a7, USER_SYSCALL_OPEN_PSEUDO_TERMINAL
+    ecall
+    ret
+.size rose_openpty, . - rose_openpty
+
+.section .text.rose_system_info,"ax",@progbits
+.align 2
+.globl rose_system_info
+.type rose_system_info, @function
+rose_system_info:
+    li a7, USER_SYSCALL_SYSTEM_INFO
+    ecall
+    ret
+.size rose_system_info, . - rose_system_info
+
 .section .text.rose_exit,"ax",@progbits
 .align 2
 .globl rose_exit
