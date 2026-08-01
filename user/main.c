@@ -44,6 +44,8 @@ static void preemption_delay(void) {
         }
 }
 
+static bool strings_equal(const char *left, const char *right);
+
 static int run_multi_demo(const char *message) {
         preemption_delay();
 
@@ -74,6 +76,69 @@ static int run_syscall_test(void) {
             rose_close(99) != -USER_ERROR_BAD_FILE_DESCRIPTOR) {
                 return 7;
         }
+
+        char current_directory[64];
+        if (rose_getcwd(current_directory, sizeof(current_directory)) != 2 ||
+            !strings_equal(current_directory, "/") ||
+            rose_getcwd(current_directory, 1U) != -USER_ERROR_RANGE ||
+            rose_getcwd((char *)kernel_address,
+                        sizeof(current_directory)) !=
+                -USER_ERROR_BAD_ADDRESS ||
+            rose_chdir((const char *)kernel_address) !=
+                -USER_ERROR_BAD_ADDRESS ||
+            rose_chdir("/missing") != -USER_ERROR_NO_ENTRY ||
+            rose_chdir("/etc/motd") != -USER_ERROR_NOT_DIRECTORY ||
+            rose_chdir("/dev/console") != -USER_ERROR_NOT_DIRECTORY ||
+            rose_chdir("/etc//./") != 0 ||
+            rose_getcwd(current_directory, sizeof(current_directory)) != 5 ||
+            !strings_equal(current_directory, "/etc")) {
+                return 39;
+        }
+
+        struct user_file_status descriptor_status;
+        long original = rose_open("motd", USER_OPEN_READ);
+        long duplicate = rose_dup((int)original);
+        long replacement = rose_open("./motd", USER_OPEN_READ);
+        char characters[5];
+
+        if (original != 3 || duplicate != 4 || replacement != 5 ||
+            rose_stat("motd", &descriptor_status) != 0 ||
+            descriptor_status.type != USER_FILE_REGULAR ||
+            rose_fstat((int)original, &descriptor_status) != 0 ||
+            descriptor_status.type != USER_FILE_REGULAR ||
+            descriptor_status.size == 0U ||
+            rose_fstat(99, &descriptor_status) !=
+                -USER_ERROR_BAD_FILE_DESCRIPTOR ||
+            rose_fstat((int)original,
+                       (struct user_file_status *)kernel_address) !=
+                -USER_ERROR_BAD_ADDRESS ||
+            rose_read((int)replacement, &characters[0], 1U) != 1 ||
+            characters[0] != 'W' ||
+            rose_dup2((int)original, (int)replacement) != replacement ||
+            rose_dup2((int)original, 7) != 7 ||
+            rose_dup2((int)original, (int)original) != original ||
+            rose_dup(99) != -USER_ERROR_BAD_FILE_DESCRIPTOR ||
+            rose_dup2(99, 6) != -USER_ERROR_BAD_FILE_DESCRIPTOR ||
+            rose_dup2((int)original, 8) !=
+                -USER_ERROR_BAD_FILE_DESCRIPTOR ||
+            rose_read((int)original, &characters[0], 1U) != 1 ||
+            rose_read((int)duplicate, &characters[1], 1U) != 1 ||
+            rose_read((int)replacement, &characters[2], 1U) != 1 ||
+            rose_read(7, &characters[3], 1U) != 1 ||
+            characters[0] != 'W' || characters[1] != 'e' ||
+            characters[2] != 'l' || characters[3] != 'c' ||
+            rose_close((int)original) != 0 ||
+            rose_read((int)duplicate, &characters[4], 1U) != 1 ||
+            characters[4] != 'o' || rose_close((int)duplicate) != 0 ||
+            rose_close((int)replacement) != 0 || rose_close(7) != 0 ||
+            rose_chdir("..") != 0 ||
+            rose_getcwd(current_directory, sizeof(current_directory)) != 2 ||
+            !strings_equal(current_directory, "/")) {
+                return 40;
+        }
+
+        print("Working directory passed\n");
+        print("Descriptor duplication passed\n");
 
         long descriptors[5];
 
@@ -319,10 +384,14 @@ static int run_execve_test(void) {
                 return 37;
         }
 
-        /* Success cannot return; the target verifies the copied vectors and
-         * the descriptor and offset inherited from this image. */
+        /* Success cannot return; the target verifies the copied vectors,
+         * descriptor offset, and working directory inherited from this image.
+         */
+        if (rose_chdir("/bin") != 0) {
+                return 41;
+        }
         long result =
-            rose_execve("/bin/execve-target", arguments, environment);
+            rose_execve("execve-target", arguments, environment);
         return result < 0 ? 27 : 28;
 }
 
@@ -330,6 +399,7 @@ static int run_execve_target(int argc, char **argv, char **environment) {
         const char *test_value =
             find_environment_value(environment, "EXECVE_TEST");
         char second_character;
+        char current_directory[64];
         long heap_query = rose_brk(0U);
 
         if (argc != 2 || argv == NULL ||
@@ -338,6 +408,8 @@ static int run_execve_target(int argc, char **argv, char **environment) {
             environment == NULL || environment[0] == NULL ||
             environment[1] != NULL || test_value == NULL ||
             !strings_equal(test_value, "passed") ||
+            rose_getcwd(current_directory, sizeof(current_directory)) != 5 ||
+            !strings_equal(current_directory, "/bin") ||
             rose_read(3, &second_character, 1U) != 1 ||
             second_character != 'e' || heap_query <= 0 ||
             rose_brk((uintptr_t)heap_query + 1U) != heap_query + 1) {

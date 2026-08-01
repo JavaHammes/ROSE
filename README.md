@@ -28,18 +28,21 @@ scheduling, and automated emulator tests.
   The supported ext2 profile uses one block group, direct blocks, 1 KiB blocks,
   128-byte inodes, and file-type directory entries. A linker-embedded ramfs is
   retained as a boot-diagnostic fallback.
-- VFS regular files, directories, and character devices with absolute-path
+- VFS regular files, directories, and character devices with canonical path
   lookup, create/truncate, stat, seek, directory iteration, mkdir, and unlink.
 - Eight-entry per-process descriptor tables with standard input, output, and
-  error attached to `/dev/console`; ramfs files retain independent offsets.
-- U-mode C runtime with descriptor I/O, `open`, `close`, `stat`, `lseek`,
-  directory iteration, `mkdir`, `unlink`, `spawn`, `execve`, `getpid`,
-  `waitpid`, `brk`, `exit`, and `yield` system calls. `brk` provides a private,
-  zero-filled, growable userspace heap between the ELF image and stack guard;
-  shrinking or process teardown returns its physical pages. A successful
-  `execve` atomically replaces the user image while preserving the process
-  identity and open descriptors. `spawn` creates a child with copied arguments
-  and environment; `waitpid` supports a specific child or any child and
+  error attached to `/dev/console`; `dup` and `dup2` aliases share their file
+  offset and remain usable until the final alias is closed.
+- U-mode C runtime with descriptor I/O, `open`, `close`, `stat`, `fstat`,
+  `lseek`, `dup`, `dup2`, directory iteration, `mkdir`, `unlink`, `chdir`,
+  `getcwd`, `spawn`, `execve`, `getpid`, `waitpid`, `brk`, `exit`, and `yield`
+  system calls. Relative paths resolve from a canonical per-process working
+  directory. `brk` provides a private, zero-filled, growable userspace heap
+  between the ELF image and stack guard; shrinking or process teardown returns
+  its physical pages. A successful `execve` atomically replaces the user image
+  while preserving the process identity, working directory, and open
+  descriptors. `spawn` creates a child with copied arguments, environment, and
+  working directory; `waitpid` supports a specific child or any child and
   optional nonblocking polling.
   Programs start with conventional `argc`, `argv`, and `envp` values copied to
   their private stack.
@@ -144,9 +147,10 @@ make check
 
 The smoke test covers disk-root boot through `/sbin/init`, VirtIO discovery,
 ext2 mutation, ELF execution from disk, user/kernel isolation, syscall
-validation, userspace heap growth and shrinkage, blocking UART I/O, child
-creation and waiting, preemption, process lifecycle commands, memory
-reclamation, and clean shutdown.
+validation, working-directory resolution, shared duplicate-descriptor offsets,
+userspace heap growth and shrinkage, blocking UART I/O, child creation and
+waiting, preemption, process lifecycle commands, memory reclamation, and clean
+shutdown.
 
 For source-level debugging, use `make debug` in one terminal and `make gdb` in
 another. `make disassemble` writes an annotated disassembly to
@@ -181,6 +185,5 @@ exited states between shell commands. The ext2 implementation is synchronous,
 write-through, limited to one block group and twelve direct blocks per inode
 (12 KiB files), and does not yet provide journaling or crash recovery. The
 VirtIO queue is polled synchronously; it is not yet connected to a scheduler
-completion channel. There is no descriptor duplication, pipes, `fork`, signals,
-general-purpose kernel threads, ASIDs, networking, users, or permissions
-enforcement.
+completion channel. There are no pipes, `fork`, signals, general-purpose kernel
+threads, ASIDs, networking, users, or permissions enforcement.

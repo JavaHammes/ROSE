@@ -86,11 +86,16 @@ extern void user_mode_enter(const struct trap_frame *context,
 extern void user_mode_resume(void);
 extern uintptr_t user_saved_kernel_context_sp;
 
-struct process_descriptor {
-        bool open;
+struct process_open_file {
+        bool used;
         uint8_t access;
+        size_t references;
         uint64_t offset;
         struct vfs_file file;
+};
+
+struct process_descriptor {
+        struct process_open_file *open_file;
 };
 
 struct process {
@@ -108,7 +113,9 @@ struct process {
         uintptr_t heap_break;
         uint64_t exit_status;
         bool exit_reported;
+        char current_directory[USER_PATH_MAX];
         struct process_descriptor descriptors[PROCESS_DESCRIPTOR_LIMIT];
+        struct process_open_file open_files[PROCESS_DESCRIPTOR_LIMIT];
 
         /* Blocking syscall continuation state. A process never returns to
          * U-mode while either pending flag is true. */
@@ -174,6 +181,50 @@ static void trap_frame_copy(struct trap_frame *destination,
         }
 }
 
+static struct process_open_file *process_open_file_allocate(
+    struct process *process) {
+        for (size_t index = 0U; index < PROCESS_DESCRIPTOR_LIMIT; index++) {
+                if (!process->open_files[index].used) {
+                        struct process_open_file *open_file =
+                            &process->open_files[index];
+
+                        bytes_zero(open_file, sizeof(*open_file));
+                        open_file->used = true;
+                        return open_file;
+                }
+        }
+
+        return NULL;
+}
+
+static void process_descriptor_install(
+    struct process_descriptor *descriptor,
+    struct process_open_file *open_file) {
+        if (descriptor->open_file != NULL || open_file == NULL ||
+            !open_file->used ||
+            open_file->references >= PROCESS_DESCRIPTOR_LIMIT) {
+                panic("Invalid descriptor installation");
+        }
+
+        descriptor->open_file = open_file;
+        open_file->references++;
+}
+
+static void process_descriptor_close(struct process_descriptor *descriptor) {
+        struct process_open_file *open_file = descriptor->open_file;
+
+        if (open_file == NULL || !open_file->used ||
+            open_file->references == 0U) {
+                panic("Invalid descriptor close");
+        }
+
+        descriptor->open_file = NULL;
+        open_file->references--;
+        if (open_file->references == 0U) {
+                bytes_zero(open_file, sizeof(*open_file));
+        }
+}
+
 static bool process_descriptors_initialize(struct process *process) {
         struct vfs_file console;
 
@@ -184,29 +235,30 @@ static bool process_descriptors_initialize(struct process *process) {
                 return false;
         }
 
-        process->descriptors[USER_STDIN_FILENO] =
-            (struct process_descriptor){
-                .open = true,
-                .access = DESCRIPTOR_READ,
-                .file = console,
-            };
-        process->descriptors[USER_STDOUT_FILENO] =
-            (struct process_descriptor){
-                .open = true,
-                .access = DESCRIPTOR_WRITE,
-                .file = console,
-            };
-        process->descriptors[USER_STDERR_FILENO] =
-            (struct process_descriptor){
-                .open = true,
-                .access = DESCRIPTOR_WRITE,
-                .file = console,
-            };
+        for (size_t descriptor = 0U;
+             descriptor <= USER_STDERR_FILENO; descriptor++) {
+                struct process_open_file *open_file =
+                    process_open_file_allocate(process);
+
+                if (open_file == NULL) {
+                        return false;
+                }
+                open_file->access = descriptor == USER_STDIN_FILENO
+                                        ? DESCRIPTOR_READ
+                                        : DESCRIPTOR_WRITE;
+                open_file->file = console;
+                process_descriptor_install(&process->descriptors[descriptor],
+                                           open_file);
+        }
         return true;
 }
 
 static void process_descriptors_close_all(struct process *process) {
-        bytes_zero(process->descriptors, sizeof(process->descriptors));
+        for (size_t index = 0U; index < PROCESS_DESCRIPTOR_LIMIT; index++) {
+                if (process->descriptors[index].open_file != NULL) {
+                        process_descriptor_close(&process->descriptors[index]);
+                }
+        }
 }
 
 /* Assert an expected user mapping during process construction. */
@@ -567,6 +619,8 @@ static uint64_t process_create(struct process *process, const char *path,
         /* SPIE causes sret to enable supervisor interrupts while U-mode runs. */
         process->context.sstatus = SSTATUS_SPIE;
         process->exit_status = UINT64_MAX;
+        process->current_directory[0] = '/';
+        process->current_directory[1] = '\0';
         if (!process_descriptors_initialize(process)) {
                 panic("Initial console descriptors are unavailable");
         }
@@ -714,8 +768,8 @@ static void user_copy_from(uint8_t *destination, uintptr_t user_buffer,
 }
 
 /* Copy a bounded null-terminated path without dereferencing a user pointer. */
-static uint64_t user_copy_path(uintptr_t user_path,
-                               char path[USER_PATH_MAX]) {
+static uint64_t user_copy_raw_path(uintptr_t user_path,
+                                   char path[USER_PATH_MAX]) {
         for (size_t index = 0U; index < USER_PATH_MAX; index++) {
                 uintptr_t address;
 
@@ -734,6 +788,90 @@ static uint64_t user_copy_path(uintptr_t user_path,
         }
 
         return (uint64_t)-(int64_t)USER_ERROR_NAME_TOO_LONG;
+}
+
+/* Resolve '.', '..', and repeated separators against the process working
+ * directory. VFS implementations continue to receive one canonical absolute
+ * path, keeping mount routing independent of process state. */
+static uint64_t process_resolve_path(const char *path,
+                                     char resolved[USER_PATH_MAX]) {
+        if (path[0] == '\0') {
+                return (uint64_t)-(int64_t)USER_ERROR_NO_ENTRY;
+        }
+
+        size_t length = 1U;
+        const char *cursor = path;
+        bytes_zero(resolved, USER_PATH_MAX);
+        resolved[0] = '/';
+
+        if (path[0] == '/') {
+                cursor++;
+        } else {
+                length = string_length(active_process->current_directory);
+                for (size_t index = 0U; index < length; index++) {
+                        resolved[index] =
+                            active_process->current_directory[index];
+                }
+        }
+
+        while (*cursor != '\0') {
+                while (*cursor == '/') {
+                        cursor++;
+                }
+                if (*cursor == '\0') {
+                        break;
+                }
+
+                const char *segment = cursor;
+                size_t segment_length = 0U;
+                while (cursor[segment_length] != '\0' &&
+                       cursor[segment_length] != '/') {
+                        segment_length++;
+                }
+                cursor += segment_length;
+
+                if (segment_length == 1U && segment[0] == '.') {
+                        continue;
+                }
+                if (segment_length == 2U && segment[0] == '.' &&
+                    segment[1] == '.') {
+                        while (length > 1U &&
+                               resolved[length - 1U] != '/') {
+                                length--;
+                        }
+                        if (length > 1U) {
+                                length--;
+                        }
+                        continue;
+                }
+
+                size_t separator_length = length == 1U ? 0U : 1U;
+                if (length + separator_length >= USER_PATH_MAX ||
+                    segment_length > USER_PATH_MAX - length -
+                                         separator_length - 1U) {
+                        return (uint64_t)-(int64_t)
+                            USER_ERROR_NAME_TOO_LONG;
+                }
+                if (separator_length != 0U) {
+                        resolved[length] = '/';
+                        length++;
+                }
+                for (size_t index = 0U; index < segment_length; index++) {
+                        resolved[length + index] = segment[index];
+                }
+                length += segment_length;
+        }
+
+        resolved[length] = '\0';
+        return 0U;
+}
+
+static uint64_t user_copy_path(uintptr_t user_path,
+                               char path[USER_PATH_MAX]) {
+        char raw_path[USER_PATH_MAX];
+        uint64_t result = user_copy_raw_path(user_path, raw_path);
+
+        return result == 0U ? process_resolve_path(raw_path, path) : result;
 }
 
 /* Copy one startup string into the shared transaction buffer used by execve
@@ -1043,6 +1181,13 @@ static uint64_t syscall_spawn(uintptr_t user_path, uintptr_t user_arguments,
                 return result;
         }
 
+        size_t directory_length =
+            string_length(active_process->current_directory) + 1U;
+        for (size_t index = 0U; index < directory_length; index++) {
+                child->current_directory[index] =
+                    active_process->current_directory[index];
+        }
+
         return child->pid;
 }
 
@@ -1136,10 +1281,13 @@ static uint64_t syscall_write_begin(uint64_t descriptor, uintptr_t user_buffer,
         if (active_process == NULL) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
         }
-        if (descriptor >= PROCESS_DESCRIPTOR_LIMIT ||
-            !active_process->descriptors[(size_t)descriptor].open ||
-            (active_process->descriptors[(size_t)descriptor].access &
-             DESCRIPTOR_WRITE) == 0U) {
+        if (descriptor >= PROCESS_DESCRIPTOR_LIMIT) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        struct process_open_file *open_file =
+            active_process->descriptors[(size_t)descriptor].open_file;
+        if (open_file == NULL ||
+            (open_file->access & DESCRIPTOR_WRITE) == 0U) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
         }
         if (length > USER_IO_MAX) {
@@ -1149,8 +1297,6 @@ static uint64_t syscall_write_begin(uint64_t descriptor, uintptr_t user_buffer,
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
         }
 
-        struct process_descriptor *open_file =
-            &active_process->descriptors[(size_t)descriptor];
         if (open_file->file.type == VFS_NODE_REGULAR) {
                 user_copy_from((uint8_t *)active_process->write_buffer,
                                user_buffer, length);
@@ -1223,7 +1369,7 @@ static uint64_t syscall_open(uintptr_t user_path, uint32_t flags) {
         size_t descriptor = PROCESS_FIRST_OPEN_DESCRIPTOR;
 
         while (descriptor < PROCESS_DESCRIPTOR_LIMIT &&
-               active_process->descriptors[descriptor].open) {
+               active_process->descriptors[descriptor].open_file != NULL) {
                 descriptor++;
         }
         if (descriptor == PROCESS_DESCRIPTOR_LIMIT) {
@@ -1244,32 +1390,38 @@ static uint64_t syscall_open(uintptr_t user_path, uint32_t flags) {
                 access |= DESCRIPTOR_WRITE;
         }
 
-        active_process->descriptors[descriptor] =
-            (struct process_descriptor){
-                .open = true,
-                .access = access,
-                .file = file,
-            };
+        struct process_open_file *open_file =
+            process_open_file_allocate(active_process);
+        if (open_file == NULL) {
+                panic("Descriptor exists without open-file capacity");
+        }
+        open_file->access = access;
+        open_file->file = file;
+        process_descriptor_install(&active_process->descriptors[descriptor],
+                                   open_file);
         return descriptor;
 }
 
 static uint64_t syscall_close(uint64_t descriptor) {
         if (descriptor >= PROCESS_DESCRIPTOR_LIMIT ||
-            !active_process->descriptors[(size_t)descriptor].open) {
+            active_process->descriptors[(size_t)descriptor].open_file == NULL) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
         }
 
-        bytes_zero(&active_process->descriptors[(size_t)descriptor],
-                   sizeof(active_process->descriptors[(size_t)descriptor]));
+        process_descriptor_close(
+            &active_process->descriptors[(size_t)descriptor]);
         return 0U;
 }
 
 static uint64_t syscall_read_begin(uint64_t descriptor,
                                    uintptr_t user_buffer, size_t length) {
-        if (descriptor >= PROCESS_DESCRIPTOR_LIMIT ||
-            !active_process->descriptors[(size_t)descriptor].open ||
-            (active_process->descriptors[(size_t)descriptor].access &
-             DESCRIPTOR_READ) == 0U) {
+        if (descriptor >= PROCESS_DESCRIPTOR_LIMIT) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        struct process_open_file *open_file =
+            active_process->descriptors[(size_t)descriptor].open_file;
+        if (open_file == NULL ||
+            (open_file->access & DESCRIPTOR_READ) == 0U) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
         }
         if (length > USER_IO_MAX) {
@@ -1281,9 +1433,6 @@ static uint64_t syscall_read_begin(uint64_t descriptor,
         if (length == 0U) {
                 return 0U;
         }
-
-        struct process_descriptor *open_file =
-            &active_process->descriptors[(size_t)descriptor];
 
         if (open_file->file.type == VFS_NODE_REGULAR) {
                 long result = vfs_read(&open_file->file, open_file->offset,
@@ -1310,6 +1459,23 @@ static uint64_t syscall_read_begin(uint64_t descriptor,
         return 0U;
 }
 
+static uint64_t user_copy_file_status(const struct vfs_stat *status,
+                                      uintptr_t user_status) {
+        if (!user_range_is_valid(user_status, sizeof(struct user_file_status),
+                                 VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+
+        struct user_file_status user;
+        bytes_zero(&user, sizeof(user));
+        user.size = status->size;
+        user.inode = status->inode;
+        user.mode = status->mode;
+        user.type = (uint32_t)status->type;
+        user_copy_to(user_status, (const uint8_t *)&user, sizeof(user));
+        return 0U;
+}
+
 static uint64_t syscall_stat(uintptr_t user_path, uintptr_t user_status) {
         char path[USER_PATH_MAX];
         uint64_t copy_result = user_copy_path(user_path, path);
@@ -1322,27 +1488,40 @@ static uint64_t syscall_stat(uintptr_t user_path, uintptr_t user_status) {
         }
         struct vfs_stat status;
         int result = vfs_stat_path(path, &status);
-        if (result != 0) {
-                return (uint64_t)(int64_t)result;
+        return result == 0
+                   ? user_copy_file_status(&status, user_status)
+                   : (uint64_t)(int64_t)result;
+}
+
+static uint64_t syscall_fstat(uint64_t descriptor, uintptr_t user_status) {
+        if (descriptor >= PROCESS_DESCRIPTOR_LIMIT) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
         }
-        struct user_file_status user;
-        bytes_zero(&user, sizeof(user));
-        user.size = status.size;
-        user.inode = status.inode;
-        user.mode = status.mode;
-        user.type = (uint32_t)status.type;
-        user_copy_to(user_status, (const uint8_t *)&user, sizeof(user));
-        return 0U;
+        struct process_open_file *open_file =
+            active_process->descriptors[(size_t)descriptor].open_file;
+        if (open_file == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        if (!user_range_is_valid(user_status, sizeof(struct user_file_status),
+                                 VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+
+        struct vfs_stat status;
+        int result = vfs_stat_file(&open_file->file, &status);
+        return result == 0
+                   ? user_copy_file_status(&status, user_status)
+                   : (uint64_t)(int64_t)result;
 }
 
 static uint64_t syscall_lseek(uint64_t descriptor, int64_t adjustment,
                               uint32_t whence) {
         if (descriptor >= PROCESS_DESCRIPTOR_LIMIT ||
-            !active_process->descriptors[(size_t)descriptor].open) {
+            active_process->descriptors[(size_t)descriptor].open_file == NULL) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
         }
-        struct process_descriptor *open_file =
-            &active_process->descriptors[(size_t)descriptor];
+        struct process_open_file *open_file =
+            active_process->descriptors[(size_t)descriptor].open_file;
         if (open_file->file.type != VFS_NODE_REGULAR) {
                 return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
         }
@@ -1382,10 +1561,13 @@ static uint64_t syscall_lseek(uint64_t descriptor, int64_t adjustment,
 
 static uint64_t syscall_read_directory(uint64_t descriptor,
                                        uintptr_t user_entry) {
-        if (descriptor >= PROCESS_DESCRIPTOR_LIMIT ||
-            !active_process->descriptors[(size_t)descriptor].open ||
-            (active_process->descriptors[(size_t)descriptor].access &
-             DESCRIPTOR_READ) == 0U) {
+        if (descriptor >= PROCESS_DESCRIPTOR_LIMIT) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        struct process_open_file *directory =
+            active_process->descriptors[(size_t)descriptor].open_file;
+        if (directory == NULL ||
+            (directory->access & DESCRIPTOR_READ) == 0U) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
         }
         if (!user_range_is_valid(user_entry,
@@ -1393,8 +1575,6 @@ static uint64_t syscall_read_directory(uint64_t descriptor,
                                  VM_PAGE_WRITE)) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
         }
-        struct process_descriptor *directory =
-            &active_process->descriptors[(size_t)descriptor];
         struct vfs_directory_entry entry;
         bytes_zero(&entry, sizeof(entry));
         long next = vfs_read_directory(&directory->file, directory->offset,
@@ -1423,6 +1603,94 @@ static uint64_t syscall_path_operation(uintptr_t user_path, bool make_directory)
         int result = make_directory ? vfs_make_directory(path)
                                     : vfs_unlink(path);
         return (uint64_t)(int64_t)result;
+}
+
+static uint64_t syscall_chdir(uintptr_t user_path) {
+        char path[USER_PATH_MAX];
+        uint64_t copy_result = user_copy_path(user_path, path);
+        if (copy_result != 0U) {
+                return copy_result;
+        }
+
+        struct vfs_stat status;
+        int result = vfs_stat_path(path, &status);
+        if (result != 0) {
+                return (uint64_t)(int64_t)result;
+        }
+        if (status.type != VFS_NODE_DIRECTORY) {
+                return (uint64_t)-(int64_t)USER_ERROR_NOT_DIRECTORY;
+        }
+
+        size_t length = string_length(path) + 1U;
+        for (size_t index = 0U; index < length; index++) {
+                active_process->current_directory[index] = path[index];
+        }
+        return 0U;
+}
+
+/* Like Linux's raw getcwd syscall, success returns the byte count including
+ * the terminating null character. */
+static uint64_t syscall_getcwd(uintptr_t user_buffer, size_t size) {
+        size_t length =
+            string_length(active_process->current_directory) + 1U;
+        if (size < length) {
+                return (uint64_t)-(int64_t)USER_ERROR_RANGE;
+        }
+        if (!user_range_is_valid(user_buffer, length, VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+
+        user_copy_to(user_buffer,
+                     (const uint8_t *)active_process->current_directory,
+                     length);
+        return length;
+}
+
+static uint64_t syscall_dup(uint64_t old_descriptor) {
+        if (old_descriptor >= PROCESS_DESCRIPTOR_LIMIT) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        struct process_open_file *open_file =
+            active_process->descriptors[(size_t)old_descriptor].open_file;
+        if (open_file == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+
+        size_t new_descriptor = 0U;
+        while (new_descriptor < PROCESS_DESCRIPTOR_LIMIT &&
+               active_process->descriptors[new_descriptor].open_file != NULL) {
+                new_descriptor++;
+        }
+        if (new_descriptor == PROCESS_DESCRIPTOR_LIMIT) {
+                return (uint64_t)-(int64_t)USER_ERROR_TOO_MANY_FILES;
+        }
+
+        process_descriptor_install(
+            &active_process->descriptors[new_descriptor], open_file);
+        return new_descriptor;
+}
+
+static uint64_t syscall_dup2(uint64_t old_descriptor,
+                             uint64_t new_descriptor) {
+        if (old_descriptor >= PROCESS_DESCRIPTOR_LIMIT ||
+            active_process->descriptors[(size_t)old_descriptor].open_file ==
+                NULL ||
+            new_descriptor >= PROCESS_DESCRIPTOR_LIMIT) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        if (old_descriptor == new_descriptor) {
+                return new_descriptor;
+        }
+
+        struct process_descriptor *target =
+            &active_process->descriptors[(size_t)new_descriptor];
+        if (target->open_file != NULL) {
+                process_descriptor_close(target);
+        }
+        process_descriptor_install(
+            target,
+            active_process->descriptors[(size_t)old_descriptor].open_file);
+        return new_descriptor;
 }
 
 /* Move the end of the process data segment. Heap pages are materialized
@@ -1615,8 +1883,12 @@ static void process_continue_write(struct trap_frame *frame) {
                 return;
         }
 
-        const struct vfs_file *file =
-            &process->descriptors[process->write_descriptor].file;
+        const struct process_open_file *open_file =
+            process->descriptors[process->write_descriptor].open_file;
+        if (open_file == NULL) {
+                panic_trap("Pending write descriptor was closed", frame);
+        }
+        const struct vfs_file *file = &open_file->file;
 
         if (file->operations->write_byte(
                 process->write_buffer[process->write_offset])) {
@@ -1637,8 +1909,12 @@ static void process_continue_read(struct trap_frame *frame) {
         size_t count = 0U;
         char character;
 
-        const struct vfs_file *file =
-            &process->descriptors[process->read_descriptor].file;
+        const struct process_open_file *open_file =
+            process->descriptors[process->read_descriptor].open_file;
+        if (open_file == NULL) {
+                panic_trap("Pending read descriptor was closed", frame);
+        }
+        const struct vfs_file *file = &open_file->file;
 
         while (count < process->read_length &&
                file->operations->read_byte(&character)) {
@@ -2028,6 +2304,12 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 frame->sepc += 4U;
                 return;
 
+        case USER_SYSCALL_FSTAT:
+                frame->a0 = syscall_fstat(frame->a0,
+                                          (uintptr_t)frame->a1);
+                frame->sepc += 4U;
+                return;
+
         case USER_SYSCALL_LSEEK:
                 frame->a0 = syscall_lseek(frame->a0, (int64_t)frame->a1,
                                           (uint32_t)frame->a2);
@@ -2047,6 +2329,27 @@ void user_process_handle_syscall(struct trap_frame *frame) {
 
         case USER_SYSCALL_UNLINK:
                 frame->a0 = syscall_path_operation((uintptr_t)frame->a0, false);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_CHDIR:
+                frame->a0 = syscall_chdir((uintptr_t)frame->a0);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_GETCWD:
+                frame->a0 = syscall_getcwd((uintptr_t)frame->a0,
+                                           (size_t)frame->a1);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_DUP:
+                frame->a0 = syscall_dup(frame->a0);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_DUP2:
+                frame->a0 = syscall_dup2(frame->a0, frame->a1);
                 frame->sepc += 4U;
                 return;
 

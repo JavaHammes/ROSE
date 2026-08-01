@@ -53,6 +53,14 @@ rose_stat:
     ret
 .size rose_stat, . - rose_stat
 
+.globl rose_fstat
+.type rose_fstat, @function
+rose_fstat:
+    li a7, USER_SYSCALL_FSTAT
+    ecall
+    ret
+.size rose_fstat, . - rose_fstat
+
 .globl rose_lseek
 .type rose_lseek, @function
 rose_lseek:
@@ -84,6 +92,38 @@ rose_unlink:
     ecall
     ret
 .size rose_unlink, . - rose_unlink
+
+.globl rose_chdir
+.type rose_chdir, @function
+rose_chdir:
+    li a7, USER_SYSCALL_CHDIR
+    ecall
+    ret
+.size rose_chdir, . - rose_chdir
+
+.globl rose_getcwd
+.type rose_getcwd, @function
+rose_getcwd:
+    li a7, USER_SYSCALL_GETCWD
+    ecall
+    ret
+.size rose_getcwd, . - rose_getcwd
+
+.globl rose_dup
+.type rose_dup, @function
+rose_dup:
+    li a7, USER_SYSCALL_DUP
+    ecall
+    ret
+.size rose_dup, . - rose_dup
+
+.globl rose_dup2
+.type rose_dup2, @function
+rose_dup2:
+    li a7, USER_SYSCALL_DUP2
+    ecall
+    ret
+.size rose_dup2, . - rose_dup2
 
 .globl rose_execve
 .type rose_execve, @function

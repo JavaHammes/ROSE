@@ -20,6 +20,11 @@
 #define USER_SYSCALL_WAITPID 14
 #define USER_SYSCALL_SPAWN 15
 #define USER_SYSCALL_BRK 16
+#define USER_SYSCALL_CHDIR 17
+#define USER_SYSCALL_GETCWD 18
+#define USER_SYSCALL_FSTAT 19
+#define USER_SYSCALL_DUP 20
+#define USER_SYSCALL_DUP2 21
 
 #else
 
@@ -41,6 +46,11 @@ enum user_syscall_number {
         USER_SYSCALL_WAITPID = 14,
         USER_SYSCALL_SPAWN = 15,
         USER_SYSCALL_BRK = 16,
+        USER_SYSCALL_CHDIR = 17,
+        USER_SYSCALL_GETCWD = 18,
+        USER_SYSCALL_FSTAT = 19,
+        USER_SYSCALL_DUP = 20,
+        USER_SYSCALL_DUP2 = 21,
 };
 
 /* Stable negative error values returned in a0 by failed system calls. */
@@ -62,6 +72,7 @@ enum user_syscall_error {
         USER_ERROR_TOO_MANY_FILES = 24,
         USER_ERROR_NO_SPACE = 28,
         USER_ERROR_READ_ONLY = 30,
+        USER_ERROR_RANGE = 34,
         USER_ERROR_NAME_TOO_LONG = 36,
         USER_ERROR_NOT_IMPLEMENTED = 38,
         USER_ERROR_NOT_EMPTY = 39,

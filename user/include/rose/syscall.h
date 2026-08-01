@@ -12,10 +12,15 @@ long rose_write(int descriptor, const void *buffer, size_t length);
 long rose_open(const char *path, uint32_t flags);
 long rose_close(int descriptor);
 long rose_stat(const char *path, struct user_file_status *status);
+long rose_fstat(int descriptor, struct user_file_status *status);
 long rose_lseek(int descriptor, int64_t offset, uint32_t whence);
 long rose_read_directory(int descriptor, struct user_directory_entry *entry);
 long rose_mkdir(const char *path);
 long rose_unlink(const char *path);
+long rose_chdir(const char *path);
+long rose_getcwd(char *buffer, size_t size);
+long rose_dup(int descriptor);
+long rose_dup2(int old_descriptor, int new_descriptor);
 
 /* Replace the calling process image. Success does not return. */
 long rose_execve(const char *path, char *const arguments[],

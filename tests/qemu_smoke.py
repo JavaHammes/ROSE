@@ -194,6 +194,8 @@ def main() -> int:
         )
         require(
             session.command("run /bin/syscall-test"),
+            "Working directory passed",
+            "Descriptor duplication passed",
             "Process hierarchy passed",
             "Userspace heap passed",
             "Syscall validation passed",
