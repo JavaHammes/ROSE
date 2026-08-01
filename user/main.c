@@ -40,6 +40,32 @@ static void print(const char *text) {
         (void)rose_write(USER_STDOUT_FILENO, text, string_length(text));
 }
 
+/* PID 1 remains resident while the interactive shell runs. Keeping init as
+ * the shell's parent gives the process hierarchy a stable userspace root and
+ * lets init reap the shell before returning control to the kernel. */
+static int run_init(void) {
+        print("ROSE init: writable disk root online\n");
+
+        char *arguments[] = {"/bin/sh", NULL};
+        char *environment[] = {
+            "HOME=/", "PATH=/bin:/sbin", "TERM=rose", NULL};
+        long shell_pid = rose_spawn("/bin/sh", arguments, environment);
+
+        if (shell_pid < 0) {
+                print("ROSE init: unable to start /bin/sh\n");
+                return 1;
+        }
+
+        int status = 0;
+        if (rose_waitpid(shell_pid, &status, 0U) != shell_pid ||
+            !USER_WAIT_STATUS_EXITED(status)) {
+                print("ROSE init: unable to reap /bin/sh\n");
+                return 1;
+        }
+
+        return (int)USER_WAIT_STATUS_EXIT_CODE(status);
+}
+
 static void preemption_delay(void) {
         /* Busy work makes each process live long enough for the 1 ms timer to
          * interrupt it even on a fast host. volatile prevents optimization. */
@@ -650,17 +676,7 @@ int user_main(int argc, char **argv,
                 return run_console_read();
 
         case USER_PROGRAM_INIT:
-                print("ROSE init: writable disk root online\n");
-                {
-                        char *arguments[] = {"/bin/sh", NULL};
-                        char *shell_environment[] = {
-                            "HOME=/", "PATH=/bin:/sbin", "TERM=rose", NULL};
-                        long result = rose_execve("/bin/sh", arguments,
-                                                  shell_environment);
-
-                        print("ROSE init: unable to start /bin/sh\n");
-                        return result < 0 ? 1 : 0;
-                }
+                return run_init();
 
         case USER_PROGRAM_FS_TEST:
                 return run_filesystem_test();

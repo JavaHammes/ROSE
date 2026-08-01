@@ -60,7 +60,8 @@ scheduling, and automated emulator tests.
 - Eight-slot round-robin process scheduler with timer preemption, guarded user
   stacks, per-process kernel trap stacks, process creation, termination,
   parent/child ownership, orphan adoption by PID 0, waiting, reaping, typed
-  block/wake channels, and an interruptible idle path.
+  block/wake channels, and an interruptible idle path. On a disk-root boot,
+  `/sbin/init` remains PID 1 while its `/bin/sh` child is running.
 - Interrupt-driven UART input, PLIC external interrupts, SBI timers, panic
   diagnostics, and clean shutdown after the userspace shell exits.
 - Automated QEMU tests at two RAM sizes, including leak detection.
@@ -109,7 +110,8 @@ make -j4
 make run
 ```
 
-After `/sbin/init` replaces itself with `/bin/sh`, the shell starts at `rose>`.
+After `/sbin/init` launches `/bin/sh` and waits for it, the shell starts at
+`rose>`.
 Useful commands are:
 
 | Command | Purpose |
@@ -171,8 +173,8 @@ another. `make disassemble` writes an annotated disassembly to
 4. The kernel mounts its embedded diagnostic ramfs, negotiates the modern
    VirtIO-MMIO block device, validates ext2, and replaces the VFS root with the
    disk filesystem. `/dev/console` remains a VFS character-device overlay.
-5. `/sbin/init` is read from disk as the first user process and uses `execve`
-   to become `/bin/sh`; the fallback ramfs starts `/bin/sh` directly. A process
+5. `/sbin/init` is read from disk as the first user process, spawns `/bin/sh`,
+   and waits to reap it; the fallback ramfs starts `/bin/sh` directly. A process
    resolving any later executable receives a private Sv39 root, user stack,
    kernel trap stack, and pages populated from that ELF.
 6. Traps switch from the untrusted user stack to the process kernel stack.
@@ -182,8 +184,9 @@ another. `make disassemble` writes an annotated disassembly to
    pipe I/O, and `waitpid` retain their `ecall` and resume through a fresh trap
    after their wait channel is woken. If every process is blocked, the kernel
    scheduler waits in supervisor mode with `wfi`.
-8. Exiting `/bin/sh` returns to the kernel, which verifies that all user-owned
-   pages were reclaimed and requests SBI system shutdown.
+8. Exiting `/bin/sh` wakes `/sbin/init`, which reaps the shell and exits. The
+   kernel then verifies that all user-owned pages were reclaimed and requests
+   SBI system shutdown. The fallback shell returns to the kernel directly.
 
 ## Deliberate limitations
 

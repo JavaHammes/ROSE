@@ -46,9 +46,9 @@ void kernel_main(unsigned long hart_id, const void *dtb) {
 
         size_t idle_page_count = page_used_count();
 
-        /* A disk root enters its init image, which replaces itself with
-         * /bin/sh. The embedded ramfs starts the same shell directly as a
-         * diagnostic fallback when no valid disk mounts. */
+        /* A disk root enters its long-lived init image, which starts /bin/sh
+         * as a child and waits for it. The embedded ramfs starts the same shell
+         * directly as a diagnostic fallback when no valid disk mounts. */
         if (vfs_uses_disk_root()) {
                 user_process_run_path("/sbin/init", NULL);
         } else {
@@ -61,11 +61,12 @@ void kernel_main(unsigned long hart_id, const void *dtb) {
                 uart_puts("; current pages: ");
                 uart_put_uint64(page_used_count());
                 uart_putc('\n');
-                panic("User process page leak after shell exit");
+                panic("User process page leak after userspace exit");
         }
 
-        /* Returning from the long-lived shell is the userspace shutdown
-         * request. Keep a stopped machine quiescent if firmware rejects it. */
+        /* Returning from init after it reaps the shell is the disk-root
+         * shutdown request; the fallback shell returns here directly. Keep a
+         * stopped machine quiescent if firmware rejects the request. */
         if (sbi_shutdown() != 0) {
                 uart_puts("SBI shutdown request failed\n");
         }
