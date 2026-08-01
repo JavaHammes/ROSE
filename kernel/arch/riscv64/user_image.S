@@ -60,6 +60,55 @@ user_sh_elf_start:
 .globl user_sh_elf_end
 user_sh_elf_end:
 
+.balign 16
+.globl user_ls_elf_start
+user_ls_elf_start:
+    .incbin "kernel/build/user/ls/program.load.elf"
+.globl user_ls_elf_end
+user_ls_elf_end:
+
+.balign 16
+.globl user_echo_elf_start
+user_echo_elf_start:
+    .incbin "kernel/build/user/echo/program.load.elf"
+.globl user_echo_elf_end
+user_echo_elf_end:
+
+.balign 16
+.globl user_pwd_elf_start
+user_pwd_elf_start:
+    .incbin "kernel/build/user/pwd/program.load.elf"
+.globl user_pwd_elf_end
+user_pwd_elf_end:
+
+.balign 16
+.globl user_env_elf_start
+user_env_elf_start:
+    .incbin "kernel/build/user/env/program.load.elf"
+.globl user_env_elf_end
+user_env_elf_end:
+
+.balign 16
+.globl user_mkdir_elf_start
+user_mkdir_elf_start:
+    .incbin "kernel/build/user/mkdir/program.load.elf"
+.globl user_mkdir_elf_end
+user_mkdir_elf_end:
+
+.balign 16
+.globl user_rm_elf_start
+user_rm_elf_start:
+    .incbin "kernel/build/user/rm/program.load.elf"
+.globl user_rm_elf_end
+user_rm_elf_end:
+
+.balign 16
+.globl user_descriptor_test_elf_start
+user_descriptor_test_elf_start:
+    .incbin "kernel/build/user/descriptor_test/program.load.elf"
+.globl user_descriptor_test_elf_end
+user_descriptor_test_elf_end:
+
 .globl user_program_elf_end
 user_program_elf_end:
 

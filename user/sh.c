@@ -15,9 +15,28 @@
 enum {
         SHELL_LINE_SIZE = 128,
         SHELL_ARGUMENT_LIMIT = 16,
+        SHELL_PIPELINE_LIMIT = 6,
         SHELL_ENVIRONMENT_LIMIT = 16,
         SHELL_ENVIRONMENT_ENTRY_SIZE = 64,
         SHELL_PATH_SIZE = 64,
+};
+
+struct shell_command {
+        char *arguments[SHELL_ARGUMENT_LIMIT + 1U];
+        int argument_count;
+        char *input_path;
+        char *output_path;
+};
+
+struct shell_pipeline {
+        struct shell_command commands[SHELL_PIPELINE_LIMIT];
+        size_t command_count;
+        char storage[SHELL_LINE_SIZE];
+};
+
+struct shell_saved_descriptors {
+        int input;
+        int output;
 };
 
 static char shell_environment_storage[SHELL_ENVIRONMENT_LIMIT]
@@ -254,43 +273,90 @@ static bool shell_read_line(char line[SHELL_LINE_SIZE]) {
         }
 }
 
-/*
- * Tokenize in place. Spaces separate words outside quotes; quote delimiters
- * are removed, and a backslash quotes the following character. This remains a
- * deliberately small shell grammar without expansion or control operators.
- */
-static int shell_parse_arguments(char *line,
-                                 char *arguments[SHELL_ARGUMENT_LIMIT + 1U]) {
-        char *source = line;
-        char *destination = line;
-        size_t count = 0U;
+static bool shell_is_operator(char character) {
+        return character == '|' || character == '<' || character == '>';
+}
 
-        while (*source != '\0') {
+/* Tokenize words while quotes and escapes are still visible, then build a
+ * bounded pipeline description. Operators are special only outside quotes. */
+static bool shell_parse_pipeline(const char *line,
+                                 struct shell_pipeline *pipeline) {
+        for (size_t index = 0U; index < SHELL_PIPELINE_LIMIT; index++) {
+                pipeline->commands[index].argument_count = 0;
+                pipeline->commands[index].arguments[0] = NULL;
+                pipeline->commands[index].input_path = NULL;
+                pipeline->commands[index].output_path = NULL;
+        }
+        pipeline->command_count = 0U;
+
+        const char *source = line;
+        char *destination = pipeline->storage;
+        char *storage_end = &pipeline->storage[sizeof(pipeline->storage)];
+        struct shell_command *command = &pipeline->commands[0];
+        char pending_redirection = '\0';
+        bool saw_token = false;
+
+        while (true) {
                 while (*source == ' ' || *source == '\t') {
                         source++;
                 }
                 if (*source == '\0') {
                         break;
                 }
-                if (count == SHELL_ARGUMENT_LIMIT) {
-                        return -1;
+
+                if (shell_is_operator(*source)) {
+                        char operator = *source++;
+                        saw_token = true;
+
+                        if (operator == '|') {
+                                if (pending_redirection != '\0' ||
+                                    command->argument_count == 0 ||
+                                    pipeline->command_count + 1U >=
+                                        SHELL_PIPELINE_LIMIT) {
+                                        return false;
+                                }
+                                command->arguments[command->argument_count] =
+                                    NULL;
+                                pipeline->command_count++;
+                                command = &pipeline->commands
+                                               [pipeline->command_count];
+                                continue;
+                        }
+                        if (pending_redirection != '\0' ||
+                            (operator == '<' &&
+                             command->input_path != NULL) ||
+                            (operator == '>' &&
+                             command->output_path != NULL)) {
+                                return false;
+                        }
+                        pending_redirection = operator;
+                        continue;
                 }
 
-                arguments[count++] = destination;
-                char quote = '\0';
+                if (pending_redirection == '\0' &&
+                    command->argument_count == SHELL_ARGUMENT_LIMIT) {
+                        return false;
+                }
+                if (destination == storage_end) {
+                        return false;
+                }
 
+                char *word = destination;
+                char quote = '\0';
                 while (*source != '\0') {
                         char character = *source;
 
                         if (quote == '\0' &&
-                            (character == ' ' || character == '\t')) {
+                            (character == ' ' || character == '\t' ||
+                             shell_is_operator(character))) {
                                 break;
                         }
                         source++;
 
                         if (character == '\\' && quote != '\'') {
-                                if (*source == '\0') {
-                                        return -1;
+                                if (*source == '\0' ||
+                                    destination == storage_end) {
+                                        return false;
                                 }
                                 *destination++ = *source++;
                                 continue;
@@ -305,21 +371,38 @@ static int shell_parse_arguments(char *line,
                                         continue;
                                 }
                         }
-
+                        if (destination == storage_end) {
+                                return false;
+                        }
                         *destination++ = character;
                 }
 
-                if (quote != '\0') {
-                        return -1;
-                }
-                while (*source == ' ' || *source == '\t') {
-                        source++;
+                if (quote != '\0' || destination == storage_end) {
+                        return false;
                 }
                 *destination++ = '\0';
+                saw_token = true;
+
+                if (pending_redirection == '<') {
+                        command->input_path = word;
+                        pending_redirection = '\0';
+                } else if (pending_redirection == '>') {
+                        command->output_path = word;
+                        pending_redirection = '\0';
+                } else {
+                        command->arguments[command->argument_count++] = word;
+                }
         }
 
-        arguments[count] = NULL;
-        return (int)count;
+        if (!saw_token) {
+                return true;
+        }
+        if (pending_redirection != '\0' || command->argument_count == 0) {
+                return false;
+        }
+        command->arguments[command->argument_count] = NULL;
+        pipeline->command_count++;
+        return true;
 }
 
 static void print_exit_status(int status) {
@@ -426,18 +509,27 @@ static int run_foreground(char **arguments, bool report_status) {
 }
 
 static void shell_help(void) {
-        print("Built-ins: cd pwd echo env setenv unsetenv clear exit\n");
-        print("Programs are loaded from PATH and run in the foreground.\n");
+        print("Built-ins: cd pwd echo env setenv unsetenv clear help exit\n");
+        print("Commands: ls cat echo pwd env mkdir rm\n");
+        print("Syntax: command [ARG...] [< FILE] [> FILE] [| command...]\n");
 }
 
-static bool shell_execute(int count, char **arguments) {
-        if (count == 0) {
-                return true;
-        }
+static bool shell_is_builtin(const char *name) {
+        return strings_equal(name, "exit") || strings_equal(name, "help") ||
+               strings_equal(name, "echo") || strings_equal(name, "clear") ||
+               strings_equal(name, "pwd") || strings_equal(name, "cd") ||
+               strings_equal(name, "env") || strings_equal(name, "setenv") ||
+               strings_equal(name, "unsetenv") || strings_equal(name, "run");
+}
+
+static bool shell_execute_builtin(int count, char **arguments,
+                                  bool *keep_running) {
+        *keep_running = true;
 
         if (strings_equal(arguments[0], "exit")) {
                 print("Shutting down...\n");
-                return false;
+                *keep_running = false;
+                return true;
         }
         if (strings_equal(arguments[0], "help")) {
                 shell_help();
@@ -521,6 +613,234 @@ static bool shell_execute(int count, char **arguments) {
         }
 
         (void)run_foreground(arguments, false);
+        return false;
+}
+
+static bool shell_save_standard_descriptors(
+    struct shell_saved_descriptors *saved) {
+        saved->input = (int)rose_dup(USER_STDIN_FILENO);
+        if (saved->input < 0) {
+                return false;
+        }
+        saved->output = (int)rose_dup(USER_STDOUT_FILENO);
+        if (saved->output < 0) {
+                (void)rose_close(saved->input);
+                return false;
+        }
+        if (rose_set_descriptor_flags(saved->input,
+                                      USER_DESCRIPTOR_CLOSE_ON_EXEC) != 0 ||
+            rose_set_descriptor_flags(saved->output,
+                                      USER_DESCRIPTOR_CLOSE_ON_EXEC) != 0) {
+                (void)rose_close(saved->input);
+                (void)rose_close(saved->output);
+                return false;
+        }
+        return true;
+}
+
+static bool shell_restore_standard_descriptors(
+    const struct shell_saved_descriptors *saved) {
+        return rose_dup2(saved->input, USER_STDIN_FILENO) ==
+                   USER_STDIN_FILENO &&
+               rose_dup2(saved->output, USER_STDOUT_FILENO) ==
+                   USER_STDOUT_FILENO;
+}
+
+static void shell_release_standard_descriptors(
+    const struct shell_saved_descriptors *saved) {
+        (void)rose_close(saved->input);
+        (void)rose_close(saved->output);
+}
+
+static bool shell_apply_redirections(const struct shell_command *command) {
+        if (command->input_path != NULL) {
+                long descriptor =
+                    rose_open(command->input_path, USER_OPEN_READ);
+                if (descriptor < 0) {
+                        print("sh: unable to open input: ");
+                        print(command->input_path);
+                        print("\n");
+                        return false;
+                }
+                bool duplicated =
+                    rose_dup2((int)descriptor, USER_STDIN_FILENO) ==
+                    USER_STDIN_FILENO;
+                (void)rose_close((int)descriptor);
+                if (!duplicated) {
+                        print("sh: unable to redirect standard input\n");
+                        return false;
+                }
+        }
+
+        if (command->output_path != NULL) {
+                long descriptor = rose_open(
+                    command->output_path,
+                    USER_OPEN_WRITE | USER_OPEN_CREATE | USER_OPEN_TRUNCATE);
+                if (descriptor < 0) {
+                        print("sh: unable to open output: ");
+                        print(command->output_path);
+                        print("\n");
+                        return false;
+                }
+                bool duplicated =
+                    rose_dup2((int)descriptor, USER_STDOUT_FILENO) ==
+                    USER_STDOUT_FILENO;
+                (void)rose_close((int)descriptor);
+                if (!duplicated) {
+                        print("sh: unable to redirect standard output\n");
+                        return false;
+                }
+        }
+        return true;
+}
+
+static int shell_run_pipeline(struct shell_pipeline *pipeline) {
+        struct shell_saved_descriptors saved;
+        if (!shell_save_standard_descriptors(&saved)) {
+                print("sh: unable to save standard descriptors\n");
+                return 1;
+        }
+
+        long children[SHELL_PIPELINE_LIMIT];
+        size_t child_count = 0U;
+        int previous_read = -1;
+        int result_status = 0;
+
+        for (size_t index = 0U; index < pipeline->command_count; index++) {
+                struct shell_command *command = &pipeline->commands[index];
+                bool has_next = index + 1U < pipeline->command_count;
+                int next_read = -1;
+
+                if ((previous_read >= 0 && command->input_path != NULL) ||
+                    (has_next && command->output_path != NULL)) {
+                        result_status = 1;
+                        break;
+                }
+
+                if (previous_read >= 0) {
+                        if (rose_dup2(previous_read, USER_STDIN_FILENO) !=
+                            USER_STDIN_FILENO) {
+                                result_status = 1;
+                                break;
+                        }
+                        (void)rose_close(previous_read);
+                        previous_read = -1;
+                }
+                if (!shell_apply_redirections(command)) {
+                        result_status = 1;
+                        break;
+                }
+
+                if (has_next) {
+                        int descriptors[2] = {-1, -1};
+                        if (rose_pipe(descriptors) != 0 ||
+                            rose_set_descriptor_flags(
+                                descriptors[0],
+                                USER_DESCRIPTOR_CLOSE_ON_EXEC) != 0 ||
+                            rose_dup2(descriptors[1], USER_STDOUT_FILENO) !=
+                                USER_STDOUT_FILENO) {
+                                if (descriptors[0] >= 0) {
+                                        (void)rose_close(descriptors[0]);
+                                }
+                                if (descriptors[1] >= 0) {
+                                        (void)rose_close(descriptors[1]);
+                                }
+                                print("sh: unable to configure pipeline\n");
+                                result_status = 1;
+                                break;
+                        }
+                        next_read = descriptors[0];
+                        (void)rose_close(descriptors[1]);
+                }
+
+                long child = spawn_command(command->arguments);
+                if (!shell_restore_standard_descriptors(&saved)) {
+                        print("sh: unable to restore standard descriptors\n");
+                        result_status = 1;
+                        if (next_read >= 0) {
+                                (void)rose_close(next_read);
+                        }
+                        break;
+                }
+                if (child < 0) {
+                        print("sh: command not found: ");
+                        print(command->arguments[0]);
+                        print("\n");
+                        if (next_read >= 0) {
+                                (void)rose_close(next_read);
+                        }
+                        result_status = 127;
+                        break;
+                }
+
+                children[child_count++] = child;
+                previous_read = next_read;
+        }
+
+        if (!shell_restore_standard_descriptors(&saved)) {
+                result_status = 1;
+        }
+        if (previous_read >= 0) {
+                (void)rose_close(previous_read);
+        }
+        shell_release_standard_descriptors(&saved);
+
+        for (size_t index = 0U; index < child_count; index++) {
+                int status = 0;
+                if (rose_waitpid(children[index], &status, 0U) !=
+                    children[index]) {
+                        result_status = 1;
+                } else if (index + 1U == child_count && result_status == 0) {
+                        result_status =
+                            (int)USER_WAIT_STATUS_EXIT_CODE(status);
+                }
+        }
+        return result_status;
+}
+
+static bool shell_execute(struct shell_pipeline *pipeline) {
+        if (pipeline->command_count == 0U) {
+                return true;
+        }
+
+        struct shell_command *command = &pipeline->commands[0];
+        if (pipeline->command_count == 1U &&
+            shell_is_builtin(command->arguments[0])) {
+                struct shell_saved_descriptors saved;
+                if (!shell_save_standard_descriptors(&saved)) {
+                        print("sh: unable to save standard descriptors\n");
+                        return true;
+                }
+
+                bool keep_running = true;
+                if (!shell_apply_redirections(command)) {
+                        (void)shell_restore_standard_descriptors(&saved);
+                        print("sh: unable to redirect command\n");
+                } else {
+                        (void)shell_execute_builtin(command->argument_count,
+                                                    command->arguments,
+                                                    &keep_running);
+                        (void)shell_restore_standard_descriptors(&saved);
+                }
+                shell_release_standard_descriptors(&saved);
+                return keep_running;
+        }
+
+        if (pipeline->command_count > 1U) {
+                for (size_t index = 0U; index < pipeline->command_count;
+                     index++) {
+                        const struct shell_command *item =
+                            &pipeline->commands[index];
+                        if ((index != 0U && item->input_path != NULL) ||
+                            (index + 1U != pipeline->command_count &&
+                             item->output_path != NULL)) {
+                                print("sh: redirection conflicts with pipeline\n");
+                                return true;
+                        }
+                }
+        }
+
+        (void)shell_run_pipeline(pipeline);
         return true;
 }
 
@@ -530,19 +850,18 @@ int rose_shell_main(char **environment) { // NOLINT(misc-use-internal-linkage)
 
         while (true) {
                 char line[SHELL_LINE_SIZE];
-                char *arguments[SHELL_ARGUMENT_LIMIT + 1U];
+                struct shell_pipeline pipeline;
 
                 if (!shell_read_line(line)) {
                         print("Shutting down...\n");
                         return 0;
                 }
 
-                int count = shell_parse_arguments(line, arguments);
-                if (count < 0) {
+                if (!shell_parse_pipeline(line, &pipeline)) {
                         print("sh: invalid or too long command line\n");
                         continue;
                 }
-                if (!shell_execute(count, arguments)) {
+                if (!shell_execute(&pipeline)) {
                         return 0;
                 }
         }

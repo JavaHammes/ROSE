@@ -158,7 +158,8 @@ int vfs_open(const char *path, uint32_t flags, struct vfs_file *file) {
                                   .size = node->size,
                                   .data = node->data,
                                   .device = node->device,
-                                  .operations = node->operations};
+                                  .operations = node->operations,
+                                  .fallback_node = node};
         return 0;
 }
 
@@ -234,7 +235,22 @@ long vfs_read_directory(struct vfs_file *directory, uint64_t offset,
         }
         if (directory->filesystem_operations == NULL ||
             directory->filesystem_operations->read_directory == NULL) {
-                return -VFS_ERROR_READ_ONLY;
+                const struct vfs_node *node = directory->fallback_node;
+                if (node == NULL || offset >= node->child_count) {
+                        return 0;
+                }
+
+                const struct vfs_node *child = &node->children[offset];
+                entry->inode = 0U;
+                entry->type = child->type;
+                size_t index = 0U;
+                while (child->name[index] != '\0' &&
+                       index + 1U < sizeof(entry->name)) {
+                        entry->name[index] = child->name[index];
+                        index++;
+                }
+                entry->name[index] = '\0';
+                return (long)(offset + 1U);
         }
         return directory->filesystem_operations->read_directory(
             directory->filesystem_context, directory, offset, entry);

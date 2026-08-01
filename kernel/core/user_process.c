@@ -109,6 +109,7 @@ struct process_pipe {
 
 struct process_descriptor {
         struct process_open_file *open_file;
+        bool close_on_exec;
 };
 
 struct process {
@@ -273,6 +274,7 @@ static void process_descriptor_install(
         }
 
         descriptor->open_file = open_file;
+        descriptor->close_on_exec = false;
         open_file->references++;
 }
 
@@ -285,6 +287,7 @@ static void process_descriptor_close(struct process_descriptor *descriptor) {
         }
 
         descriptor->open_file = NULL;
+        descriptor->close_on_exec = false;
         open_file->references--;
         if (open_file->references == 0U) {
                 if (open_file->pipe != NULL) {
@@ -323,13 +326,16 @@ static bool process_descriptors_initialize(struct process *process) {
         return true;
 }
 
-/* Spawn inherits descriptors. Each child receives local open-file records so
- * its descriptor table remains self-contained, while aliases within a process
- * and the underlying pipe endpoint are still shared correctly. */
+/* Spawn inherits descriptors not marked close-on-exec. Each child receives
+ * local open-file records so its descriptor table remains self-contained,
+ * while aliases and underlying pipe endpoints are still shared correctly. */
 static bool process_descriptors_clone(struct process *destination,
                                       const struct process *source) {
         for (size_t descriptor = 0U; descriptor < PROCESS_DESCRIPTOR_LIMIT;
              descriptor++) {
+                if (source->descriptors[descriptor].close_on_exec) {
+                        continue;
+                }
                 struct process_open_file *source_open_file =
                     source->descriptors[descriptor].open_file;
 
@@ -340,7 +346,9 @@ static bool process_descriptors_clone(struct process *destination,
                 struct process_open_file *destination_open_file = NULL;
                 for (size_t previous = 0U; previous < descriptor; previous++) {
                         if (source->descriptors[previous].open_file ==
-                            source_open_file) {
+                            source_open_file &&
+                            destination->descriptors[previous].open_file !=
+                                NULL) {
                                 destination_open_file =
                                     destination->descriptors[previous]
                                         .open_file;
@@ -379,6 +387,15 @@ static bool process_descriptors_clone(struct process *destination,
 static void process_descriptors_close_all(struct process *process) {
         for (size_t index = 0U; index < PROCESS_DESCRIPTOR_LIMIT; index++) {
                 if (process->descriptors[index].open_file != NULL) {
+                        process_descriptor_close(&process->descriptors[index]);
+                }
+        }
+}
+
+static void process_descriptors_close_on_exec(struct process *process) {
+        for (size_t index = 0U; index < PROCESS_DESCRIPTOR_LIMIT; index++) {
+                if (process->descriptors[index].open_file != NULL &&
+                    process->descriptors[index].close_on_exec) {
                         process_descriptor_close(&process->descriptors[index]);
                 }
         }
@@ -1246,6 +1263,7 @@ static uint64_t syscall_execve(struct trap_frame *frame, uintptr_t user_path,
                 return result;
         }
 
+        process_descriptors_close_on_exec(active_process);
         process_commit_replacement(frame);
         return 0U;
 }
@@ -1896,6 +1914,21 @@ static uint64_t syscall_pipe(uintptr_t user_descriptors) {
                          (int)descriptor_pair[1]};
         user_copy_to(user_descriptors, (const uint8_t *)result,
                      sizeof(result));
+        return 0U;
+}
+
+static uint64_t syscall_set_descriptor_flags(uint64_t descriptor,
+                                             uint32_t flags) {
+        if (descriptor >= PROCESS_DESCRIPTOR_LIMIT ||
+            active_process->descriptors[(size_t)descriptor].open_file == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        if ((flags & ~(uint32_t)USER_DESCRIPTOR_CLOSE_ON_EXEC) != 0U) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+
+        active_process->descriptors[(size_t)descriptor].close_on_exec =
+            (flags & USER_DESCRIPTOR_CLOSE_ON_EXEC) != 0U;
         return 0U;
 }
 
@@ -2577,6 +2610,12 @@ void user_process_handle_syscall(struct trap_frame *frame) {
 
         case USER_SYSCALL_PIPE:
                 frame->a0 = syscall_pipe((uintptr_t)frame->a0);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_SET_DESCRIPTOR_FLAGS:
+                frame->a0 = syscall_set_descriptor_flags(
+                    frame->a0, (uint32_t)frame->a1);
                 frame->sepc += 4U;
                 return;
 

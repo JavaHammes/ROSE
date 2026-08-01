@@ -156,7 +156,27 @@ def main() -> int:
         require(
             session.command("help"),
             "Built-ins:",
-            "Programs are loaded from PATH",
+            "Commands: ls cat echo pwd env mkdir rm",
+            "Syntax: command",
+        )
+
+        require(
+            session.command("ls /"),
+            "bin/",
+            "dev/",
+            "etc/",
+            "sbin/",
+        )
+        require(
+            session.command("ls /bin"),
+            "cat",
+            "echo",
+            "env",
+            "ls",
+            "mkdir",
+            "pwd",
+            "rm",
+            "sh",
         )
 
         require(
@@ -171,6 +191,7 @@ def main() -> int:
             session.command("syscall-test"),
             "Working directory passed",
             "Descriptor duplication passed",
+            "Descriptor inheritance passed",
             "Process hierarchy passed",
             "Userspace heap passed",
             "Syscall validation passed",
@@ -181,7 +202,21 @@ def main() -> int:
         )
 
         motd = "Welcome to ROSE. This message was read from writable ext2."
-        require(session.command("cat"), motd)
+        require(session.command("cat /etc/motd"), motd)
+
+        require(session.command("mkdir /tmp"), "rose> ")
+        session.command("echo redirection works > /tmp/message")
+        require(session.command("ls /tmp"), "message")
+        require(session.command("cat < /tmp/message"), "redirection works")
+        session.command("echo two-stage-data | cat > /tmp/two-stage")
+        require(session.command("cat /tmp/two-stage"), "two-stage-data")
+        session.command("echo three-stage-data | cat | cat > /tmp/three-stage")
+        require(session.command("cat /tmp/three-stage"), "three-stage-data")
+        require(session.command("pwd | cat"), "\n/\n")
+        session.command("rm /tmp/message")
+        session.command("rm /tmp/two-stage")
+        session.command("rm /tmp/three-stage")
+        session.command("rm /tmp")
 
         require(
             session.command("fs-test"),
@@ -198,6 +233,12 @@ def main() -> int:
             "HOME=/",
             "PATH=/bin:/sbin",
             "TERM=rose",
+            "ROSE_TEST=passed",
+        )
+        require(
+            session.command("env | cat"),
+            "HOME=/",
+            "PATH=/bin:/sbin",
             "ROSE_TEST=passed",
         )
 
@@ -241,6 +282,16 @@ def main() -> int:
         require(
             fallback.command("hello"),
             "Hello from U-mode C",
+        )
+        require(fallback.command("ls /bin"), "cat", "echo", "ls", "sh")
+        require(
+            fallback.command("cat /etc/motd | cat"),
+            "Welcome to ROSE",
+        )
+        require(
+            fallback.command("syscall-test"),
+            "Descriptor inheritance passed",
+            "Syscall validation passed",
         )
         fallback.shutdown()
     finally:

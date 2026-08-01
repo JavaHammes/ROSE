@@ -163,6 +163,17 @@ rose_pipe:
     ret
 .size rose_pipe, . - rose_pipe
 
+.section .text.rose_set_descriptor_flags,"ax",@progbits
+.align 2
+.globl rose_set_descriptor_flags
+.type rose_set_descriptor_flags, @function
+rose_set_descriptor_flags:
+    /* a0 is a descriptor and a1 is a user_descriptor_flags mask. */
+    li a7, USER_SYSCALL_SET_DESCRIPTOR_FLAGS
+    ecall
+    ret
+.size rose_set_descriptor_flags, . - rose_set_descriptor_flags
+
 .section .text.rose_execve,"ax",@progbits
 .align 2
 .globl rose_execve

@@ -26,6 +26,7 @@
 #define USER_SYSCALL_DUP 20
 #define USER_SYSCALL_DUP2 21
 #define USER_SYSCALL_PIPE 22
+#define USER_SYSCALL_SET_DESCRIPTOR_FLAGS 23
 
 #else
 
@@ -53,6 +54,7 @@ enum user_syscall_number {
         USER_SYSCALL_DUP = 20,
         USER_SYSCALL_DUP2 = 21,
         USER_SYSCALL_PIPE = 22,
+        USER_SYSCALL_SET_DESCRIPTOR_FLAGS = 23,
 };
 
 /* Stable negative error values returned in a0 by failed system calls. */
@@ -88,6 +90,10 @@ enum user_open_flags {
         USER_OPEN_CREATE = (1U << 2),
         USER_OPEN_TRUNCATE = (1U << 3),
         USER_OPEN_DIRECTORY = (1U << 4),
+};
+
+enum user_descriptor_flags {
+        USER_DESCRIPTOR_CLOSE_ON_EXEC = (1U << 0),
 };
 
 enum user_seek_whence {
@@ -150,6 +156,13 @@ enum user_program {
         USER_PROGRAM_PIPE_TEST,
         USER_PROGRAM_PIPE_WRITER,
         USER_PROGRAM_SH,
+        USER_PROGRAM_LS,
+        USER_PROGRAM_ECHO,
+        USER_PROGRAM_PWD,
+        USER_PROGRAM_ENV,
+        USER_PROGRAM_MKDIR,
+        USER_PROGRAM_RM,
+        USER_PROGRAM_DESCRIPTOR_TEST,
 };
 
 #endif

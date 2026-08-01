@@ -22,8 +22,22 @@ extern uint8_t user_console_read_elf_start[];
 extern uint8_t user_console_read_elf_end[];
 extern uint8_t user_sh_elf_start[];
 extern uint8_t user_sh_elf_end[];
+extern uint8_t user_ls_elf_start[];
+extern uint8_t user_ls_elf_end[];
+extern uint8_t user_echo_elf_start[];
+extern uint8_t user_echo_elf_end[];
+extern uint8_t user_pwd_elf_start[];
+extern uint8_t user_pwd_elf_end[];
+extern uint8_t user_env_elf_start[];
+extern uint8_t user_env_elf_end[];
+extern uint8_t user_mkdir_elf_start[];
+extern uint8_t user_mkdir_elf_end[];
+extern uint8_t user_rm_elf_start[];
+extern uint8_t user_rm_elf_end[];
+extern uint8_t user_descriptor_test_elf_start[];
+extern uint8_t user_descriptor_test_elf_end[];
 
-enum { RAMFS_PROGRAM_COUNT = 8 };
+enum { RAMFS_PROGRAM_COUNT = 15 };
 
 static const uint8_t motd_data[] =
     "Welcome to ROSE. Files now have descriptors and independent offsets.\n";
@@ -37,6 +51,13 @@ static struct vfs_node bin_nodes[RAMFS_PROGRAM_COUNT] = {
     {.name = "cat", .type = VFS_NODE_REGULAR},
     {.name = "console-read", .type = VFS_NODE_REGULAR},
     {.name = "sh", .type = VFS_NODE_REGULAR},
+    {.name = "ls", .type = VFS_NODE_REGULAR},
+    {.name = "echo", .type = VFS_NODE_REGULAR},
+    {.name = "pwd", .type = VFS_NODE_REGULAR},
+    {.name = "env", .type = VFS_NODE_REGULAR},
+    {.name = "mkdir", .type = VFS_NODE_REGULAR},
+    {.name = "rm", .type = VFS_NODE_REGULAR},
+    {.name = "descriptor-test", .type = VFS_NODE_REGULAR},
 };
 
 static const struct vfs_node etc_nodes[] = {
@@ -93,6 +114,14 @@ void ramfs_init(void) {
         ramfs_set_file(6U, user_console_read_elf_start,
                        user_console_read_elf_end);
         ramfs_set_file(7U, user_sh_elf_start, user_sh_elf_end);
+        ramfs_set_file(8U, user_ls_elf_start, user_ls_elf_end);
+        ramfs_set_file(9U, user_echo_elf_start, user_echo_elf_end);
+        ramfs_set_file(10U, user_pwd_elf_start, user_pwd_elf_end);
+        ramfs_set_file(11U, user_env_elf_start, user_env_elf_end);
+        ramfs_set_file(12U, user_mkdir_elf_start, user_mkdir_elf_end);
+        ramfs_set_file(13U, user_rm_elf_start, user_rm_elf_end);
+        ramfs_set_file(14U, user_descriptor_test_elf_start,
+                       user_descriptor_test_elf_end);
 
         if (!vfs_mount_root(&ramfs_root)) {
                 panic("Failed to mount initial ramfs");

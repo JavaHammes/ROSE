@@ -36,27 +36,30 @@ scheduling, and automated emulator tests.
   offset and remain usable until the final alias is closed. Anonymous pipes
   provide buffered interprocess byte streams, blocking reads and writes, EOF
   and broken-pipe handling, descriptor inheritance across `spawn`, and endpoint
-  lifetime tracking across descriptor aliases.
+  lifetime tracking across descriptor aliases. Per-descriptor close-on-exec
+  flags keep shell-private pipe ends and saved descriptors out of child images.
 - U-mode C runtime with descriptor I/O, `open`, `close`, `stat`, `fstat`,
   `lseek`, `dup`, `dup2`, directory iteration, `mkdir`, `unlink`, `chdir`,
-  `getcwd`, `pipe`, `spawn`, `execve`, `getpid`, `waitpid`, `brk`, `exit`, and
-  `yield`
+  `getcwd`, `pipe`, descriptor flags, `spawn`, `execve`, `getpid`, `waitpid`,
+  `brk`, `exit`, and `yield`
   system calls. Relative paths resolve from a canonical per-process working
   directory. `brk` provides a private, zero-filled, growable userspace heap
   between the ELF image and stack guard; shrinking or process teardown returns
   its physical pages. A successful `execve` atomically replaces the user image
-  while preserving the process identity, working directory, and open
-  descriptors. `spawn` creates a child with copied arguments, environment, and
-  working directory; `waitpid` supports a specific child or any child and
-  optional nonblocking polling.
+  while preserving the process identity, working directory, and descriptors
+  not marked close-on-exec. `spawn` creates a child with copied arguments,
+  environment, working directory, and inheritable descriptors; `waitpid`
+  supports a specific child or any child and optional nonblocking polling.
   Programs start with conventional `argc`, `argv`, and `envp` values copied to
   their private stack.
   UART reads and writes block on scheduler wait channels and resume from device
   interrupts without polling in syscall traps.
 - Interactive `/bin/sh` process with console line editing, quoted and escaped
   argument parsing, mutable environment variables, `PATH` lookup, working
-  directory built-ins, and foreground child execution through `spawn` and
-  `waitpid`. Command syntax and dispatch do not run in supervisor mode.
+  directory built-ins, `<` and truncating `>` redirection, and foreground
+  pipelines of up to six commands. Practical `/bin` utilities include `ls`,
+  `cat`, `echo`, `pwd`, `env`, `mkdir`, and `rm`. Command syntax and dispatch do
+  not run in supervisor mode.
 - Eight-slot round-robin process scheduler with timer preemption, guarded user
   stacks, per-process kernel trap stacks, process creation, termination,
   parent/child ownership, orphan adoption by PID 0, waiting, reaping, typed
@@ -119,10 +122,15 @@ Useful commands are:
 | `help` | List shell built-ins and command lookup behavior. |
 | `echo "hello world"` | Parse quotes and print arguments. |
 | `pwd` / `cd [DIR]` | Inspect or change the shell working directory. |
+| `ls [DIR]` | List a directory, marking child directories with `/`. |
+| `cat [FILE...]` | Copy files, or standard input, to standard output. |
+| `mkdir DIR...` / `rm PATH...` | Create or remove filesystem entries. |
+| `echo hello > /tmp/message` | Create or truncate a file using redirection. |
+| `cat < /tmp/message` | Feed a file to a command as standard input. |
+| `echo hello \| cat \| cat` | Run a multi-stage foreground pipeline. |
 | `hello` | Resolve `/bin/hello` through `PATH` and run it. |
 | `fault` | Verify that U-mode cannot read supervisor kernel text. |
 | `syscall-test` | Verify invalid pointers and unknown syscall handling. |
-| `cat` | Read `/etc/motd` through a regular-file descriptor. |
 | `console-read` | Block a child until one byte arrives on standard input. |
 | `fs-test` | Exercise writable files, directories, stat, and seek. |
 | `pipe-test` | Exercise inherited descriptors and blocking anonymous pipes. |
@@ -155,10 +163,11 @@ make check
 
 The smoke test covers disk-root boot through `/sbin/init` into `/bin/sh`,
 userspace line parsing and built-ins, `PATH` execution, VirtIO-backed ext2
-mutation, user/kernel isolation, syscall validation, working-directory
-resolution, shared duplicate-descriptor offsets, userspace heap growth and
-shrinkage, blocking UART and pipe I/O, child creation and waiting, memory
-reclamation, fallback-ramfs shell boot, and clean shutdown.
+mutation, directory utilities, input/output redirection, multi-stage pipelines,
+user/kernel isolation, syscall validation, working-directory resolution,
+shared duplicate-descriptor offsets, close-on-exec inheritance, userspace heap
+growth and shrinkage, blocking UART and pipe I/O, child creation and waiting,
+memory reclamation, fallback-ramfs shell boot, and clean shutdown.
 
 For source-level debugging, use `make debug` in one terminal and `make gdb` in
 another. `make disassemble` writes an annotated disassembly to
@@ -179,11 +188,12 @@ another. `make disassemble` writes an annotated disassembly to
    kernel trap stack, and pages populated from that ELF.
 6. Traps switch from the untrusted user stack to the process kernel stack.
    Syscalls, faults, yields, and timer ticks may update the saved trap frame.
-7. `/bin/sh` reads and edits console input, parses the line, handles built-ins,
-   or spawns a `PATH`-resolved child and waits for it. Blocking console I/O,
-   pipe I/O, and `waitpid` retain their `ecall` and resume through a fresh trap
-   after their wait channel is woken. If every process is blocked, the kernel
-   scheduler waits in supervisor mode with `wfi`.
+7. `/bin/sh` reads and edits console input, parses commands and redirections,
+   handles built-ins, or connects `PATH`-resolved children into a pipeline and
+   waits for them. Blocking console I/O, pipe I/O, and `waitpid` retain their
+   `ecall` and resume through a fresh trap after their wait channel is woken. If
+   every process is blocked, the kernel scheduler waits in supervisor mode with
+   `wfi`.
 8. Exiting `/bin/sh` wakes `/sbin/init`, which reaps the shell and exits. The
    kernel then verifies that all user-owned pages were reclaimed and requests
    SBI system shutdown. The fallback shell returns to the kernel directly.
@@ -191,8 +201,9 @@ another. `make disassemble` writes an annotated disassembly to
 ## Deliberate limitations
 
 ROSE currently targets one hart and one QEMU `virt` platform. The shell runs
-one foreground command at a time and has no pipelines, redirection, expansion,
-job control, or scripting language. The ext2 implementation is synchronous,
+one foreground pipeline at a time and has no append redirection, descriptor
+number syntax, expansion, job control, or scripting language. The ext2
+implementation is synchronous,
 write-through, limited to one block group and twelve direct blocks per inode
 (12 KiB files), and does not yet provide journaling or crash recovery. The
 VirtIO queue is polled synchronously; it is not yet connected to a scheduler

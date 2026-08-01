@@ -98,6 +98,7 @@ struct vfs_file {
         const struct vfs_character_device_operations *operations;
         void *filesystem_context;
         const struct vfs_filesystem_operations *filesystem_operations;
+        const struct vfs_node *fallback_node;
 };
 
 /* Mount the immutable fallback first, then optionally replace it with disk. */

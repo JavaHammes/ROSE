@@ -40,6 +40,20 @@ static void print(const char *text) {
         (void)rose_write(USER_STDOUT_FILENO, text, string_length(text));
 }
 
+static bool write_all(int descriptor, const char *buffer, size_t length) {
+        size_t written = 0U;
+
+        while (written < length) {
+                long count =
+                    rose_write(descriptor, &buffer[written], length - written);
+                if (count <= 0) {
+                        return false;
+                }
+                written += (size_t)count;
+        }
+        return true;
+}
+
 /* PID 1 remains resident while the interactive shell runs. Keeping init as
  * the shell's parent gives the process hierarchy a stable userspace root and
  * lets init reap the shell before returning control to the kernel. */
@@ -283,39 +297,203 @@ static int run_syscall_test(void) {
                 return 32;
         }
 
+        descriptor = rose_open("/etc/motd", USER_OPEN_READ);
+        char *descriptor_arguments[] = {"/bin/descriptor-test", NULL};
+        if (descriptor != 3 ||
+            rose_set_descriptor_flags(99, 0U) !=
+                -USER_ERROR_BAD_FILE_DESCRIPTOR ||
+            rose_set_descriptor_flags((int)descriptor, UINT32_C(0x80000000)) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_set_descriptor_flags((int)descriptor,
+                                      USER_DESCRIPTOR_CLOSE_ON_EXEC) != 0) {
+                return 50;
+        }
+
+        child_pid = rose_spawn("/bin/descriptor-test", descriptor_arguments,
+                               child_environment);
+        wait_status = -1;
+        if (child_pid <= 0 ||
+            rose_waitpid(child_pid, &wait_status, 0U) != child_pid ||
+            !USER_WAIT_STATUS_EXITED(wait_status) ||
+            USER_WAIT_STATUS_EXIT_CODE(wait_status) != 0U ||
+            rose_close((int)descriptor) != 0) {
+                return 51;
+        }
+
         print("Process hierarchy passed\n");
+        print("Descriptor inheritance passed\n");
         print("Userspace heap passed\n");
         print("Syscall validation passed\n");
         return 0;
 }
 
-static int run_cat(void) {
-        long descriptor = rose_open("/etc/motd", USER_OPEN_READ);
-
-        if (descriptor < 0) {
-                return 8;
-        }
-
-        char buffer[24];
-
+static int copy_descriptor_to_stdout(int descriptor) {
+        char buffer[128];
         while (true) {
-                long count = rose_read((int)descriptor, buffer, sizeof(buffer));
+                long count = rose_read(descriptor, buffer, sizeof(buffer));
 
                 if (count < 0) {
-                        (void)rose_close((int)descriptor);
-                        return 9;
+                        return 1;
                 }
                 if (count == 0) {
-                        break;
+                        return 0;
                 }
-                if (rose_write(USER_STDOUT_FILENO, buffer, (size_t)count) !=
-                    count) {
-                        (void)rose_close((int)descriptor);
-                        return 10;
+                if (!write_all(USER_STDOUT_FILENO, buffer, (size_t)count)) {
+                        return 1;
+                }
+        }
+}
+
+static int run_cat(int argc, char **argv) {
+        if (argc == 1) {
+                return copy_descriptor_to_stdout(USER_STDIN_FILENO);
+        }
+
+        int status = 0;
+        for (int index = 1; index < argc; index++) {
+                long descriptor = rose_open(argv[index], USER_OPEN_READ);
+
+                if (descriptor < 0) {
+                        print("cat: unable to open: ");
+                        print(argv[index]);
+                        print("\n");
+                        status = 1;
+                        continue;
+                }
+                if (copy_descriptor_to_stdout((int)descriptor) != 0) {
+                        print("cat: read failed: ");
+                        print(argv[index]);
+                        print("\n");
+                        status = 1;
+                }
+                if (rose_close((int)descriptor) != 0) {
+                        status = 1;
                 }
         }
 
-        return rose_close((int)descriptor) == 0 ? 0 : 11;
+        return status;
+}
+
+static int run_ls(int argc, char **argv) {
+        if (argc > 2) {
+                print("Usage: ls [DIR]\n");
+                return 1;
+        }
+
+        const char *path = argc == 2 ? argv[1] : ".";
+        long descriptor =
+            rose_open(path, USER_OPEN_READ | USER_OPEN_DIRECTORY);
+        if (descriptor < 0) {
+                print("ls: unable to open directory: ");
+                print(path);
+                print("\n");
+                return 1;
+        }
+
+        struct user_directory_entry entry;
+        long result;
+        while ((result = rose_read_directory((int)descriptor, &entry)) > 0) {
+                if (strings_equal(entry.name, ".") ||
+                    strings_equal(entry.name, "..")) {
+                        continue;
+                }
+                print(entry.name);
+                if (entry.type == USER_FILE_DIRECTORY) {
+                        print("/");
+                }
+                print("\n");
+        }
+
+        int status = result == 0 ? 0 : 1;
+        if (result < 0) {
+                print("ls: unable to read directory: ");
+                print(path);
+                print("\n");
+        }
+        return rose_close((int)descriptor) == 0 ? status : 1;
+}
+
+static int run_echo(int argc, char **argv) {
+        for (int index = 1; index < argc; index++) {
+                print(argv[index]);
+                if (index + 1 < argc) {
+                        print(" ");
+                }
+        }
+        print("\n");
+        return 0;
+}
+
+static int run_pwd(int argc) {
+        if (argc != 1) {
+                print("Usage: pwd\n");
+                return 1;
+        }
+        char directory[64];
+        if (rose_getcwd(directory, sizeof(directory)) < 0) {
+                print("pwd: unable to read the working directory\n");
+                return 1;
+        }
+        print(directory);
+        print("\n");
+        return 0;
+}
+
+static int run_env(int argc, char **environment) {
+        if (argc != 1) {
+                print("Usage: env\n");
+                return 1;
+        }
+        for (size_t index = 0U; environment[index] != NULL; index++) {
+                print(environment[index]);
+                print("\n");
+        }
+        return 0;
+}
+
+static int run_mkdir(int argc, char **argv) {
+        if (argc < 2) {
+                print("Usage: mkdir DIR...\n");
+                return 1;
+        }
+
+        int status = 0;
+        for (int index = 1; index < argc; index++) {
+                if (rose_mkdir(argv[index]) < 0) {
+                        print("mkdir: unable to create: ");
+                        print(argv[index]);
+                        print("\n");
+                        status = 1;
+                }
+        }
+        return status;
+}
+
+static int run_rm(int argc, char **argv) {
+        if (argc < 2) {
+                print("Usage: rm PATH...\n");
+                return 1;
+        }
+
+        int status = 0;
+        for (int index = 1; index < argc; index++) {
+                if (rose_unlink(argv[index]) < 0) {
+                        print("rm: unable to remove: ");
+                        print(argv[index]);
+                        print("\n");
+                        status = 1;
+                }
+        }
+        return status;
+}
+
+static int run_descriptor_test(void) {
+        struct user_file_status status;
+
+        if (rose_fstat(3, &status) != -USER_ERROR_BAD_FILE_DESCRIPTOR) {
+                return 1;
+        }
+        return 0;
 }
 
 static bool strings_equal(const char *left, const char *right) {
@@ -375,10 +553,15 @@ static int run_execve_test(void) {
         const void *kernel_address =
             (const void *)(uintptr_t)UINT64_C(0x80200000);
         long descriptor = rose_open("/etc/motd", USER_OPEN_READ);
+        long close_on_exec_descriptor =
+            rose_open("/etc/motd", USER_OPEN_READ);
         char first_character;
         long heap_query = rose_brk(0U);
 
-        if (descriptor != 3 ||
+        if (descriptor != 3 || close_on_exec_descriptor != 4 ||
+            rose_set_descriptor_flags(
+                (int)close_on_exec_descriptor,
+                USER_DESCRIPTOR_CLOSE_ON_EXEC) != 0 ||
             rose_read((int)descriptor, &first_character, 1U) != 1 ||
             first_character != 'W' || heap_query <= 0 ||
             rose_brk((uintptr_t)heap_query + 1U) != heap_query + 1) {
@@ -430,6 +613,7 @@ static int run_execve_target(int argc, char **argv, char **environment) {
             find_environment_value(environment, "EXECVE_TEST");
         char second_character;
         char current_directory[64];
+        struct user_file_status descriptor_status;
         long heap_query = rose_brk(0U);
 
         if (argc != 2 || argv == NULL ||
@@ -441,7 +625,10 @@ static int run_execve_target(int argc, char **argv, char **environment) {
             rose_getcwd(current_directory, sizeof(current_directory)) != 5 ||
             !strings_equal(current_directory, "/bin") ||
             rose_read(3, &second_character, 1U) != 1 ||
-            second_character != 'e' || heap_query <= 0 ||
+            second_character != 'e' ||
+            rose_fstat(4, &descriptor_status) !=
+                -USER_ERROR_BAD_FILE_DESCRIPTOR ||
+            heap_query <= 0 ||
             rose_brk((uintptr_t)heap_query + 1U) != heap_query + 1) {
                 return 29;
         }
@@ -670,7 +857,7 @@ int user_main(int argc, char **argv,
                 return run_syscall_test();
 
         case USER_PROGRAM_CAT:
-                return run_cat();
+                return run_cat(argc, argv);
 
         case USER_PROGRAM_CONSOLE_READ:
                 return run_console_read();
@@ -698,6 +885,27 @@ int user_main(int argc, char **argv,
 
         case USER_PROGRAM_SH:
                 return rose_shell_main(environment);
+
+        case USER_PROGRAM_LS:
+                return run_ls(argc, argv);
+
+        case USER_PROGRAM_ECHO:
+                return run_echo(argc, argv);
+
+        case USER_PROGRAM_PWD:
+                return run_pwd(argc);
+
+        case USER_PROGRAM_ENV:
+                return run_env(argc, environment);
+
+        case USER_PROGRAM_MKDIR:
+                return run_mkdir(argc, argv);
+
+        case USER_PROGRAM_RM:
+                return run_rm(argc, argv);
+
+        case USER_PROGRAM_DESCRIPTOR_TEST:
+                return run_descriptor_test();
 
         default:
                 return 2;
