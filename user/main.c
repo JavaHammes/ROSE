@@ -110,6 +110,43 @@ static int run_syscall_test(void) {
                 return 5;
         }
 
+        char *child_arguments[] = {"/bin/hello", NULL};
+        char *child_environment[] = {NULL};
+        long parent_pid = rose_getpid();
+
+        if (parent_pid <= 0 ||
+            rose_waitpid(parent_pid, NULL, 0U) != -USER_ERROR_NO_CHILD ||
+            rose_waitpid(-1, NULL, 2U) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_spawn("/missing", child_arguments, child_environment) !=
+                -USER_ERROR_NO_ENTRY) {
+                return 30;
+        }
+
+        long child_pid =
+            rose_spawn("/bin/hello", child_arguments, child_environment);
+        int wait_status = -1;
+
+        if (child_pid <= 0 || child_pid == parent_pid ||
+            rose_waitpid(child_pid, (int *)kernel_address,
+                         USER_WAIT_NO_HANG) != -USER_ERROR_BAD_ADDRESS) {
+                return 31;
+        }
+
+        long waited_pid =
+            rose_waitpid(-1, &wait_status, USER_WAIT_NO_HANG);
+        if (waited_pid == 0) {
+                waited_pid = rose_waitpid(-1, &wait_status, 0U);
+        }
+        if (waited_pid != child_pid ||
+            !USER_WAIT_STATUS_EXITED(wait_status) ||
+            USER_WAIT_STATUS_EXIT_CODE(wait_status) != 0U ||
+            rose_waitpid(child_pid, NULL, USER_WAIT_NO_HANG) !=
+                -USER_ERROR_NO_CHILD) {
+                return 32;
+        }
+
+        print("Process hierarchy passed\n");
         print("Syscall validation passed\n");
         return 0;
 }

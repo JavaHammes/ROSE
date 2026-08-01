@@ -95,6 +95,7 @@ struct process_descriptor {
 struct process {
         /* Scheduler-visible identity and saved execution state. */
         uint64_t pid;
+        uint64_t parent_pid;
         enum process_state state;
         struct trap_frame context;
         /* Resources below remain owned until process_release_resources. */
@@ -142,9 +143,9 @@ static uint64_t scheduler_context_switches;
 static uint64_t scheduler_blocks;
 static uint8_t executable_buffer[PROCESS_EXECUTABLE_MAX];
 static struct process_replacement exec_replacement;
-static char exec_string_buffer[PAGE_SIZE];
-static const char *exec_arguments[PROCESS_ARGUMENT_LIMIT];
-static const char *exec_environment[PROCESS_ENVIRONMENT_LIMIT];
+static char startup_string_buffer[PAGE_SIZE];
+static const char *startup_arguments[PROCESS_ARGUMENT_LIMIT];
+static const char *startup_environment[PROCESS_ENVIRONMENT_LIMIT];
 
 /* Freestanding replacement for clearing process records. */
 static void bytes_zero(void *destination, size_t size) {
@@ -292,6 +293,19 @@ static struct process *process_find_by_pid(uint64_t pid) {
         }
 
         return NULL;
+}
+
+/* A process whose parent exits becomes kernel-owned. This kernel has no
+ * permanently resident init process yet, so PID 0 is the stable reaper. */
+static void process_orphan_children(uint64_t parent_pid) {
+        for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
+                struct process *process = &process_table[index];
+
+                if (process->state != PROCESS_UNUSED &&
+                    process->parent_pid == parent_pid) {
+                        process->parent_pid = 0U;
+                }
+        }
 }
 
 static size_t string_length(const char *text) {
@@ -455,25 +469,32 @@ static void process_verify_address_space(const struct page_table *root,
  * virtual_memory_create_address_space; only the ELF and stack mappings receive
  * VM_PAGE_USER.
  */
-static bool process_create(struct process *process, const char *path,
-                           const struct user_process_startup *startup) {
+static uint64_t process_create(struct process *process, const char *path,
+                               const struct user_process_startup *startup,
+                               uint64_t parent_pid) {
         struct vfs_file executable;
+        int open_result = vfs_open(path, VFS_OPEN_READ, &executable);
 
-        if (vfs_open(path, VFS_OPEN_READ, &executable) != 0 ||
-            executable.type != VFS_NODE_REGULAR || executable.size == 0U ||
+        if (open_result != 0) {
+                return (uint64_t)(int64_t)open_result;
+        }
+        if (executable.type != VFS_NODE_REGULAR || executable.size == 0U ||
             executable.size > sizeof(executable_buffer)) {
-                return false;
+                return (uint64_t)-(int64_t)USER_ERROR_EXEC_FORMAT;
         }
 
         long executable_length = vfs_read(&executable, 0U, executable_buffer,
                                           (size_t)executable.size);
-        if (executable_length < 0 ||
-            (uint64_t)executable_length != executable.size) {
-                return false;
+        if (executable_length < 0) {
+                return (uint64_t)(int64_t)executable_length;
+        }
+        if ((uint64_t)executable_length != executable.size) {
+                return (uint64_t)-(int64_t)USER_ERROR_IO;
         }
 
         bytes_zero(process, sizeof(*process));
         process->pid = next_pid;
+        process->parent_pid = parent_pid;
         process->state = PROCESS_READY;
         /* SPIE causes sret to enable supervisor interrupts while U-mode runs. */
         process->context.sstatus = SSTATUS_SPIE;
@@ -495,29 +516,40 @@ static bool process_create(struct process *process, const char *path,
                 process_release_resources(process);
                 process->state = PROCESS_EXITED;
                 process->exit_status = 1U;
-                return false;
+                return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
         }
 
         struct page_table *root = process->address_space;
 
         if (!process_build_initial_stack(process->stack_page,
-                                         &process->context, path, startup) ||
-            !page_table_map(root, USER_STACK_ADDRESS,
+                                         &process->context, path, startup)) {
+                process_release_resources(process);
+                process->state = PROCESS_EXITED;
+                process->exit_status = 1U;
+                return (uint64_t)-(int64_t)
+                    USER_ERROR_ARGUMENT_LIST_TOO_LONG;
+        }
+        if (!page_table_map(root, USER_STACK_ADDRESS,
                             (uintptr_t)process->stack_page,
-                            VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE) ||
-            !elf_load_image(root, executable_buffer, (size_t)executable.size,
+                            VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE)) {
+                process_release_resources(process);
+                process->state = PROCESS_EXITED;
+                process->exit_status = 1U;
+                return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
+        }
+        if (!elf_load_image(root, executable_buffer, (size_t)executable.size,
                             USER_ADDRESS_MIN, USER_STACK_GUARD_ADDRESS,
                             &process->loaded_image)) {
                 process_release_resources(process);
                 process->state = PROCESS_EXITED;
                 process->exit_status = 1U;
-                return false;
+                return (uint64_t)-(int64_t)USER_ERROR_EXEC_FORMAT;
         }
 
         process->context.sepc = process->loaded_image.entry;
         process_verify_address_space(root, process->stack_page);
 
-        return true;
+        return 0U;
 }
 
 /* Validate a complete user range with the requested leaf permissions. */
@@ -634,13 +666,13 @@ static uint64_t user_copy_path(uintptr_t user_path,
         return (uint64_t)-(int64_t)USER_ERROR_NAME_TOO_LONG;
 }
 
-/* Copy one execve string into the shared transaction buffer. Its aggregate
- * page-sized bound matches the maximum storage available on the new stack. */
-static uint64_t user_copy_exec_string(uintptr_t user_string,
-                                      size_t *buffer_offset) {
+/* Copy one startup string into the shared transaction buffer used by execve
+ * and spawn. Its page-sized bound matches the new stack's available storage. */
+static uint64_t user_copy_startup_string(uintptr_t user_string,
+                                         size_t *buffer_offset) {
         size_t source_offset = 0U;
 
-        while (*buffer_offset < sizeof(exec_string_buffer)) {
+        while (*buffer_offset < sizeof(startup_string_buffer)) {
                 uintptr_t address;
 
                 if (user_string > UINTPTR_MAX - source_offset ||
@@ -653,7 +685,7 @@ static uint64_t user_copy_exec_string(uintptr_t user_string,
                 }
 
                 char character = *(const char *)address;
-                exec_string_buffer[*buffer_offset] = character;
+                startup_string_buffer[*buffer_offset] = character;
                 (*buffer_offset)++;
                 source_offset++;
 
@@ -668,11 +700,12 @@ static uint64_t user_copy_exec_string(uintptr_t user_string,
 /* Copy a null-terminated argv or envp array without directly dereferencing
  * either its user pointers or strings. The slot after the fixed limit is read
  * only to distinguish a valid terminator from E2BIG. */
-static uint64_t user_copy_exec_vector(uintptr_t user_vector,
-                                      const char **destination,
-                                      size_t destination_limit,
-                                      bool require_entry, size_t *entry_count,
-                                      size_t *buffer_offset) {
+static uint64_t user_copy_startup_vector(uintptr_t user_vector,
+                                         const char **destination,
+                                         size_t destination_limit,
+                                         bool require_entry,
+                                         size_t *entry_count,
+                                         size_t *buffer_offset) {
         for (size_t index = 0U; index <= destination_limit; index++) {
                 size_t pointer_offset = index * sizeof(uintptr_t);
                 uintptr_t user_string;
@@ -700,9 +733,9 @@ static uint64_t user_copy_exec_vector(uintptr_t user_vector,
                             USER_ERROR_ARGUMENT_LIST_TOO_LONG;
                 }
 
-                destination[index] = &exec_string_buffer[*buffer_offset];
+                destination[index] = &startup_string_buffer[*buffer_offset];
                 uint64_t result =
-                    user_copy_exec_string(user_string, buffer_offset);
+                    user_copy_startup_string(user_string, buffer_offset);
 
                 if (result != 0U) {
                         return result;
@@ -852,23 +885,23 @@ static uint64_t syscall_execve(struct trap_frame *frame, uintptr_t user_path,
         size_t argument_count;
         size_t environment_count;
 
-        result = user_copy_exec_vector(
-            user_arguments, exec_arguments, PROCESS_ARGUMENT_LIMIT, true,
+        result = user_copy_startup_vector(
+            user_arguments, startup_arguments, PROCESS_ARGUMENT_LIMIT, true,
             &argument_count, &string_buffer_offset);
         if (result != 0U) {
                 return result;
         }
-        result = user_copy_exec_vector(
-            user_environment, exec_environment, PROCESS_ENVIRONMENT_LIMIT,
+        result = user_copy_startup_vector(
+            user_environment, startup_environment, PROCESS_ENVIRONMENT_LIMIT,
             false, &environment_count, &string_buffer_offset);
         if (result != 0U) {
                 return result;
         }
 
         const struct user_process_startup startup = {
-            .arguments = exec_arguments,
+            .arguments = startup_arguments,
             .argument_count = argument_count,
-            .environment = exec_environment,
+            .environment = startup_environment,
             .environment_count = environment_count,
         };
 
@@ -879,6 +912,136 @@ static uint64_t syscall_execve(struct trap_frame *frame, uintptr_t user_path,
 
         process_commit_replacement(frame);
         return 0U;
+}
+
+/* Spawn constructs a separate image and records the caller as its parent. The
+ * child starts READY and is scheduled normally after this syscall returns. */
+static uint64_t syscall_spawn(uintptr_t user_path, uintptr_t user_arguments,
+                              uintptr_t user_environment) {
+        char path[USER_PATH_MAX];
+        uint64_t result = user_copy_path(user_path, path);
+
+        if (result != 0U) {
+                return result;
+        }
+
+        size_t string_buffer_offset = 0U;
+        size_t argument_count;
+        size_t environment_count;
+
+        result = user_copy_startup_vector(
+            user_arguments, startup_arguments, PROCESS_ARGUMENT_LIMIT, true,
+            &argument_count, &string_buffer_offset);
+        if (result != 0U) {
+                return result;
+        }
+        result = user_copy_startup_vector(
+            user_environment, startup_environment, PROCESS_ENVIRONMENT_LIMIT,
+            false, &environment_count, &string_buffer_offset);
+        if (result != 0U) {
+                return result;
+        }
+
+        struct process *child = process_find_available_slot();
+        if (child == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_TRY_AGAIN;
+        }
+
+        const struct user_process_startup startup = {
+            .arguments = startup_arguments,
+            .argument_count = argument_count,
+            .environment = startup_environment,
+            .environment_count = environment_count,
+        };
+        uint64_t parent_pid = active_process->pid;
+
+        result = process_create(child, path, &startup, parent_pid);
+        if (result != 0U) {
+                bytes_zero(child, sizeof(*child));
+                return result;
+        }
+
+        return child->pid;
+}
+
+static bool process_is_waitable_child(const struct process *process,
+                                      int64_t requested_pid) {
+        if (process->state == PROCESS_UNUSED || active_process == NULL ||
+            process->parent_pid != active_process->pid) {
+                return false;
+        }
+
+        return requested_pid == -1 ||
+               process->pid == (uint64_t)requested_pid;
+}
+
+/* Leave sepc at ECALL while blocking. A child exit wakes the parent, which
+ * re-enters this function and atomically consumes the retained zombie status. */
+static void syscall_waitpid(struct trap_frame *frame, int64_t requested_pid,
+                            uintptr_t user_status, uint32_t options) {
+        if ((options & ~(uint32_t)USER_WAIT_NO_HANG) != 0U ||
+            requested_pid == 0 || requested_pid < -1) {
+                frame->a0 =
+                    (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+                frame->sepc += 4U;
+                return;
+        }
+        bool found_child = false;
+
+        for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
+                struct process *child = &process_table[index];
+
+                if (!process_is_waitable_child(child, requested_pid)) {
+                        continue;
+                }
+                found_child = true;
+
+                if (child->state != PROCESS_EXITED) {
+                        continue;
+                }
+                if (user_status != 0U &&
+                    !user_range_is_valid(user_status, sizeof(int),
+                                         VM_PAGE_WRITE)) {
+                        frame->a0 =
+                            (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+                        frame->sepc += 4U;
+                        return;
+                }
+
+                uint64_t child_pid = child->pid;
+                int wait_status =
+                    (int)((child->exit_status & UINT64_C(0xff)) << 8U);
+
+                if (user_status != 0U) {
+                        user_copy_to(user_status,
+                                     (const uint8_t *)&wait_status,
+                                     sizeof(wait_status));
+                }
+                process_release_resources(child);
+                bytes_zero(child, sizeof(*child));
+                frame->a0 = child_pid;
+                frame->sepc += 4U;
+                return;
+        }
+
+        if (!found_child) {
+                frame->a0 = (uint64_t)-(int64_t)USER_ERROR_NO_CHILD;
+                frame->sepc += 4U;
+                return;
+        }
+        if (user_status != 0U &&
+            !user_range_is_valid(user_status, sizeof(int), VM_PAGE_WRITE)) {
+                frame->a0 = (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+                frame->sepc += 4U;
+                return;
+        }
+        if ((options & (uint32_t)USER_WAIT_NO_HANG) != 0U) {
+                frame->a0 = 0U;
+                frame->sepc += 4U;
+                return;
+        }
+
+        scheduler_block_current(frame, SCHEDULER_WAIT_CHILD);
 }
 
 /*
@@ -1402,6 +1565,8 @@ static void user_process_finish(struct trap_frame *frame, uint64_t status) {
 
         active_process->state = PROCESS_EXITED;
         active_process->exit_status = status;
+        process_orphan_children(active_process->pid);
+        (void)scheduler_wake_all(SCHEDULER_WAIT_CHILD);
 
         struct process *next = scheduler_find_next_ready();
 
@@ -1538,7 +1703,7 @@ bool user_process_spawn(const char *path,
         if (process == NULL) {
                 return false;
         }
-        if (!process_create(process, path, startup)) {
+        if (process_create(process, path, startup, 0U) != 0U) {
                 bytes_zero(process, sizeof(*process));
                 return false;
         }
@@ -1569,6 +1734,8 @@ bool user_process_kill(uint64_t pid) {
 
         process->state = PROCESS_EXITED;
         process->exit_status = 137U;
+        process_orphan_children(process->pid);
+        (void)scheduler_wake_all(SCHEDULER_WAIT_CHILD);
         process_release_resources(process);
         return true;
 }
@@ -1760,6 +1927,24 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 return;
         }
 
+        case USER_SYSCALL_GETPID:
+                frame->a0 = active_process->pid;
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_WAITPID:
+                syscall_waitpid(frame, (int64_t)frame->a0,
+                                (uintptr_t)frame->a1,
+                                (uint32_t)frame->a2);
+                return;
+
+        case USER_SYSCALL_SPAWN:
+                frame->a0 = syscall_spawn((uintptr_t)frame->a0,
+                                          (uintptr_t)frame->a1,
+                                          (uintptr_t)frame->a2);
+                frame->sepc += 4U;
+                return;
+
         case USER_SYSCALL_EXIT:
                 frame->sepc += 4U;
                 user_process_finish(frame, frame->a0);
@@ -1823,7 +2008,7 @@ static const char *process_state_name(enum process_state state) {
 
 /* Display both runnable processes and zombies awaiting reap. */
 void user_process_print_table(void) {
-        uart_puts("PID  STATE    STATUS\n");
+        uart_puts("PID  STATE    STATUS  PPID\n");
 
         bool found = false;
 
@@ -1843,6 +2028,9 @@ void user_process_print_table(void) {
                         uart_puts("   ");
                         uart_put_uint64(process->exit_status);
                 }
+
+                uart_puts("   ppid=");
+                uart_put_uint64(process->parent_pid);
 
                 uart_putc('\n');
         }

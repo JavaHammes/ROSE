@@ -21,6 +21,12 @@ long rose_unlink(const char *path);
 long rose_execve(const char *path, char *const arguments[],
                  char *const environment[]);
 
+/* Create a child process and wait for child state changes. */
+long rose_spawn(const char *path, char *const arguments[],
+                char *const environment[]);
+long rose_getpid(void);
+long rose_waitpid(int64_t pid, int *status, uint32_t options);
+
 /* Terminate the calling process or voluntarily give another process a turn. */
 _Noreturn void rose_exit(uint64_t status);
 void rose_yield(void);

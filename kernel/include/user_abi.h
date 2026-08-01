@@ -16,6 +16,9 @@
 #define USER_SYSCALL_MKDIR 10
 #define USER_SYSCALL_UNLINK 11
 #define USER_SYSCALL_EXECVE 12
+#define USER_SYSCALL_GETPID 13
+#define USER_SYSCALL_WAITPID 14
+#define USER_SYSCALL_SPAWN 15
 
 #else
 
@@ -33,6 +36,9 @@ enum user_syscall_number {
         USER_SYSCALL_MKDIR = 10,
         USER_SYSCALL_UNLINK = 11,
         USER_SYSCALL_EXECVE = 12,
+        USER_SYSCALL_GETPID = 13,
+        USER_SYSCALL_WAITPID = 14,
+        USER_SYSCALL_SPAWN = 15,
 };
 
 /* Stable negative error values returned in a0 by failed system calls. */
@@ -42,6 +48,8 @@ enum user_syscall_error {
         USER_ERROR_ARGUMENT_LIST_TOO_LONG = 7,
         USER_ERROR_EXEC_FORMAT = 8,
         USER_ERROR_BAD_FILE_DESCRIPTOR = 9,
+        USER_ERROR_NO_CHILD = 10,
+        USER_ERROR_TRY_AGAIN = 11,
         USER_ERROR_OUT_OF_MEMORY = 12,
         USER_ERROR_PERMISSION = 13,
         USER_ERROR_BAD_ADDRESS = 14,
@@ -70,6 +78,14 @@ enum user_seek_whence {
         USER_SEEK_CURRENT,
         USER_SEEK_END,
 };
+
+enum user_wait_options {
+        USER_WAIT_NO_HANG = (1U << 0),
+};
+
+#define USER_WAIT_STATUS_EXITED(status) (((uint32_t)(status) & 0x7fU) == 0U)
+#define USER_WAIT_STATUS_EXIT_CODE(status) \
+        (((uint32_t)(status) >> 8U) & 0xffU)
 
 enum user_file_type {
         USER_FILE_DIRECTORY,

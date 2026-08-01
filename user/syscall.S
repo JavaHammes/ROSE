@@ -94,6 +94,32 @@ rose_execve:
     ret
 .size rose_execve, . - rose_execve
 
+.globl rose_spawn
+.type rose_spawn, @function
+rose_spawn:
+    /* a0-a2 contain path, argv, and envp for the new child image. */
+    li a7, USER_SYSCALL_SPAWN
+    ecall
+    ret
+.size rose_spawn, . - rose_spawn
+
+.globl rose_getpid
+.type rose_getpid, @function
+rose_getpid:
+    li a7, USER_SYSCALL_GETPID
+    ecall
+    ret
+.size rose_getpid, . - rose_getpid
+
+.globl rose_waitpid
+.type rose_waitpid, @function
+rose_waitpid:
+    /* a0-a2 contain the child selector, status pointer, and options. */
+    li a7, USER_SYSCALL_WAITPID
+    ecall
+    ret
+.size rose_waitpid, . - rose_waitpid
+
 .globl rose_exit
 .type rose_exit, @function
 rose_exit:

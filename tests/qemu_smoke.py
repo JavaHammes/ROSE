@@ -194,6 +194,7 @@ def main() -> int:
         )
         require(
             session.command("run /bin/syscall-test"),
+            "Process hierarchy passed",
             "Syscall validation passed",
             "exited with status 0",
             "Scheduler blocks:",

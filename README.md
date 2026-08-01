@@ -33,16 +33,20 @@ scheduling, and automated emulator tests.
 - Eight-entry per-process descriptor tables with standard input, output, and
   error attached to `/dev/console`; ramfs files retain independent offsets.
 - U-mode C runtime with descriptor I/O, `open`, `close`, `stat`, `lseek`,
-  directory iteration, `mkdir`, `unlink`, `execve`, `exit`, and `yield` system
-  calls. A successful `execve` atomically replaces the user image while
-  preserving the process identity and open descriptors.
+  directory iteration, `mkdir`, `unlink`, `spawn`, `execve`, `getpid`,
+  `waitpid`, `exit`, and `yield` system calls. A successful `execve` atomically
+  replaces the user image while preserving the process identity and open
+  descriptors. `spawn` creates a child with copied arguments and environment;
+  `waitpid` supports a specific child or any child and optional nonblocking
+  polling.
   Programs start with conventional `argc`, `argv`, and `envp` values copied to
   their private stack.
   UART reads and writes block on scheduler wait channels and resume from device
   interrupts without polling in syscall traps.
 - Eight-slot round-robin process scheduler with timer preemption, guarded user
   stacks, per-process kernel trap stacks, process creation, termination,
-  waiting, reaping, typed block/wake channels, and an interruptible idle path.
+  parent/child ownership, orphan adoption by PID 0, waiting, reaping, typed
+  block/wake channels, and an interruptible idle path.
 - Interrupt-driven UART input, PLIC external interrupts, SBI timers, panic
   diagnostics, and SBI system shutdown.
 - Automated QEMU tests at two RAM sizes, including leak detection.
@@ -138,8 +142,8 @@ make check
 
 The smoke test covers disk-root boot through `/sbin/init`, VirtIO discovery,
 ext2 mutation, ELF execution from disk, user/kernel isolation, syscall
-validation, blocking UART I/O, preemption, process lifecycle commands, memory
-reclamation, and clean shutdown.
+validation, blocking UART I/O, child creation and waiting, preemption, process
+lifecycle commands, memory reclamation, and clean shutdown.
 
 For source-level debugging, use `make debug` in one terminal and `make gdb` in
 another. `make disassemble` writes an annotated disassembly to
@@ -159,9 +163,10 @@ another. `make disassemble` writes an annotated disassembly to
    Sv39 root, user stack, kernel trap stack, and pages populated from that ELF.
 6. Traps switch from the untrusted user stack to the process kernel stack.
    Syscalls, faults, yields, and timer ticks may update the saved trap frame.
-7. Blocking console I/O retains its `ecall` and resumes through a fresh trap
-   after an RX or transmit-empty interrupt. If every process is blocked, the
-   foreground scheduler waits in supervisor mode with `wfi`.
+7. Blocking console I/O and `waitpid` retain their `ecall` and resume through a
+   fresh trap after their device or child wait channel is woken. If every
+   process is blocked, the foreground scheduler waits in supervisor mode with
+   `wfi`.
 8. When no ready or blocked process remains, execution returns to the foreground
    shell; exited processes retain only status metadata until `reap`.
 
