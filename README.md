@@ -315,3 +315,10 @@ stacks, sessions, or realtime queues. Anonymous mappings use a fixed
 sixteen-entry VMA table and do not yet support file backing, shared mappings,
 or fixed addresses. There are no general-purpose kernel threads, ASIDs,
 networking, users, or permissions enforcement.
+
+## License
+
+Copyright (C) 2026 Alexander Berlin.
+
+ROSE is licensed under the GNU Affero General Public License, version 3 only
+(`AGPL-3.0-only`). See [LICENSE](LICENSE) for the full license text.
