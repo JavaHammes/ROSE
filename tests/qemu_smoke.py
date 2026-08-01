@@ -289,11 +289,42 @@ def main() -> int:
         require(session.command("mkdir /tmp"), "rose> ")
         session.command("echo redirection works > /tmp/message")
         session.command("echo append works >> /tmp/message")
+        session.command("echo numbered output 1> /tmp/numbered-output")
+        session.command("cat /first-missing 2> /tmp/error-output")
+        session.command("cat /second-missing 2>> /tmp/error-output")
+        session.command("cd /missing 2> /tmp/builtin-error")
+        session.command("missing-command 2> /tmp/not-found-error")
+        session.command("cat /third-missing > /tmp/combined-output 2>&1")
+        session.command(
+            "cat /fourth-missing 2>&1 | cat > /tmp/pipeline-error"
+        )
         require(session.command("ls /tmp"), "message")
         require(
             session.command("cat < /tmp/message"),
             "redirection works",
             "append works",
+        )
+        require(session.command("cat 0< /tmp/numbered-output"), "numbered output")
+        require(
+            session.command("cat /tmp/error-output"),
+            "cat: unable to open: /first-missing",
+            "cat: unable to open: /second-missing",
+        )
+        require(
+            session.command("cat /tmp/builtin-error"),
+            "cd: unable to change directory: /missing",
+        )
+        require(
+            session.command("cat /tmp/not-found-error"),
+            "sh: command not found: missing-command",
+        )
+        require(
+            session.command("cat /tmp/combined-output"),
+            "cat: unable to open: /third-missing",
+        )
+        require(
+            session.command("cat /tmp/pipeline-error"),
+            "cat: unable to open: /fourth-missing",
         )
         session.command("echo two-stage-data | cat > /tmp/two-stage")
         require(session.command("cat /tmp/two-stage"), "two-stage-data")
@@ -301,6 +332,12 @@ def main() -> int:
         require(session.command("cat /tmp/three-stage"), "three-stage-data")
         require(session.command("pwd | cat"), "\n/\n")
         session.command("rm /tmp/message")
+        session.command("rm /tmp/numbered-output")
+        session.command("rm /tmp/error-output")
+        session.command("rm /tmp/builtin-error")
+        session.command("rm /tmp/not-found-error")
+        session.command("rm /tmp/combined-output")
+        session.command("rm /tmp/pipeline-error")
         session.command("rm /tmp/two-stage")
         session.command("rm /tmp/three-stage")
         session.command("rm /tmp")

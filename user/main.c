@@ -51,6 +51,10 @@ static void print(const char *text) {
         (void)rose_write(USER_STDOUT_FILENO, text, string_length(text));
 }
 
+static void print_error(const char *text) {
+        (void)rose_write(USER_STDERR_FILENO, text, string_length(text));
+}
+
 static bool write_all(int descriptor, const char *buffer, size_t length) {
         size_t written = 0U;
 
@@ -1036,16 +1040,16 @@ static int run_cat(int argc, char **argv) {
                 long descriptor = rose_open(argv[index], USER_OPEN_READ);
 
                 if (descriptor < 0) {
-                        print("cat: unable to open: ");
-                        print(argv[index]);
-                        print("\n");
+                        print_error("cat: unable to open: ");
+                        print_error(argv[index]);
+                        print_error("\n");
                         status = 1;
                         continue;
                 }
                 if (copy_descriptor_to_stdout((int)descriptor) != 0) {
-                        print("cat: read failed: ");
-                        print(argv[index]);
-                        print("\n");
+                        print_error("cat: read failed: ");
+                        print_error(argv[index]);
+                        print_error("\n");
                         status = 1;
                 }
                 if (rose_close((int)descriptor) != 0) {
@@ -1058,16 +1062,16 @@ static int run_cat(int argc, char **argv) {
 
 static int run_ls(int argc, char **argv) {
         if (argc > 2) {
-                print("Usage: ls [DIR]\n");
+                print_error("Usage: ls [DIR]\n");
                 return 1;
         }
 
         const char *path = argc == 2 ? argv[1] : ".";
         long descriptor = rose_open(path, USER_OPEN_READ | USER_OPEN_DIRECTORY);
         if (descriptor < 0) {
-                print("ls: unable to open directory: ");
-                print(path);
-                print("\n");
+                print_error("ls: unable to open directory: ");
+                print_error(path);
+                print_error("\n");
                 return 1;
         }
 
@@ -1087,9 +1091,9 @@ static int run_ls(int argc, char **argv) {
 
         int status = result == 0 ? 0 : 1;
         if (result < 0) {
-                print("ls: unable to read directory: ");
-                print(path);
-                print("\n");
+                print_error("ls: unable to read directory: ");
+                print_error(path);
+                print_error("\n");
         }
         return rose_close((int)descriptor) == 0 ? status : 1;
 }
@@ -1107,12 +1111,12 @@ static int run_echo(int argc, char **argv) {
 
 static int run_pwd(int argc) {
         if (argc != 1) {
-                print("Usage: pwd\n");
+                print_error("Usage: pwd\n");
                 return 1;
         }
         char directory[64];
         if (rose_getcwd(directory, sizeof(directory)) < 0) {
-                print("pwd: unable to read the working directory\n");
+                print_error("pwd: unable to read the working directory\n");
                 return 1;
         }
         print(directory);
@@ -1122,7 +1126,7 @@ static int run_pwd(int argc) {
 
 static int run_env(int argc, char **environment) {
         if (argc != 1) {
-                print("Usage: env\n");
+                print_error("Usage: env\n");
                 return 1;
         }
         for (size_t index = 0U; environment[index] != NULL; index++) {
@@ -1134,16 +1138,16 @@ static int run_env(int argc, char **environment) {
 
 static int run_mkdir(int argc, char **argv) {
         if (argc < 2) {
-                print("Usage: mkdir DIR...\n");
+                print_error("Usage: mkdir DIR...\n");
                 return 1;
         }
 
         int status = 0;
         for (int index = 1; index < argc; index++) {
                 if (rose_mkdir(argv[index]) < 0) {
-                        print("mkdir: unable to create: ");
-                        print(argv[index]);
-                        print("\n");
+                        print_error("mkdir: unable to create: ");
+                        print_error(argv[index]);
+                        print_error("\n");
                         status = 1;
                 }
         }
@@ -1152,16 +1156,16 @@ static int run_mkdir(int argc, char **argv) {
 
 static int run_rm(int argc, char **argv) {
         if (argc < 2) {
-                print("Usage: rm PATH...\n");
+                print_error("Usage: rm PATH...\n");
                 return 1;
         }
 
         int status = 0;
         for (int index = 1; index < argc; index++) {
                 if (rose_unlink(argv[index]) < 0) {
-                        print("rm: unable to remove: ");
-                        print(argv[index]);
-                        print("\n");
+                        print_error("rm: unable to remove: ");
+                        print_error(argv[index]);
+                        print_error("\n");
                         status = 1;
                 }
         }
@@ -1387,8 +1391,8 @@ static int run_filesystem_test(void) {
             -USER_ERROR_INVALID_ARGUMENT) {
                 return 46;
         }
-        descriptor = rose_open("/tmp/state",
-                               USER_OPEN_WRITE | USER_OPEN_APPEND);
+        descriptor =
+            rose_open("/tmp/state", USER_OPEN_WRITE | USER_OPEN_APPEND);
         if (descriptor < 0 ||
             rose_lseek((int)descriptor, 0, USER_SEEK_SET) != 0 ||
             rose_write((int)descriptor, suffix, sizeof(suffix) - 1U) !=

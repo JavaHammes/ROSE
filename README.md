@@ -97,9 +97,10 @@ scheduling, and automated emulator tests.
   `SIGTTIN`.
 - Interactive `/bin/sh` process with console line editing, quoted and escaped
   argument parsing, mutable environment variables, `PATH` lookup, working
-  directory built-ins, `<`, truncating `>`, and appending `>>` redirection,
-  foreground and `&` background pipelines of up to six commands, and
-  `jobs`/`fg` job management.
+  directory built-ins, and ordered standard-descriptor redirection with `<`,
+  truncating `>`, appending `>>`, `2>`, `2>>`, and descriptor duplication such
+  as `2>&1`. Foreground and `&` background pipelines support up to six commands,
+  with `jobs`/`fg` job management.
   Practical `/bin` utilities include `ls`, `cat`, `echo`, `pwd`, `env`,
   `mkdir`, and `rm`. Command syntax and dispatch do not run in supervisor mode.
 - Sixteen-slot round-robin process scheduler with timer preemption, guarded user
@@ -182,6 +183,8 @@ Useful commands are:
 | `mkdir DIR...` / `rm PATH...` | Create or remove filesystem entries. |
 | `echo hello > /tmp/message` | Create or truncate a file using redirection. |
 | `echo again >> /tmp/message` | Append to a file using redirection. |
+| `cat /missing 2> /tmp/error` | Send diagnostics to a separate file. |
+| `cat /missing > /tmp/all 2>&1` | Combine standard output and error in order. |
 | `cat < /tmp/message` | Feed a file to a command as standard input. |
 | `echo hello \| cat \| cat` | Run a multi-stage foreground pipeline. |
 | `hello` | Resolve `/bin/hello` through `PATH` and run it. |
@@ -247,8 +250,9 @@ The smoke tests cover disk-root boot through `/sbin/init` into `/bin/sh`,
 userspace line parsing and built-ins, `PATH` execution, VirtIO-backed ext2
 mutation, directory utilities, input/output redirection, multi-stage pipelines,
 user/kernel isolation, syscall validation, working-directory resolution,
-shared descriptor offsets across aliases and processes, close-on-exec and
-nonblocking inheritance, shared-memory visibility and cleanup,
+shared descriptor offsets across aliases and processes, ordered standard-stream
+redirection and duplication, close-on-exec and nonblocking inheritance,
+shared-memory visibility and cleanup,
 pseudo-terminal duplex I/O, system telemetry, userspace heap growth and
 shrinkage, lazy anonymous mappings, partial protection and unmapping, mapping
 protection and reclamation, copy-on-write `fork` address-space isolation and
@@ -299,8 +303,9 @@ another. `make disassemble` writes an annotated disassembly to
 
 ## Deliberate limitations
 
-ROSE currently targets one hart and one QEMU `virt` platform. The shell has no
-descriptor number syntax, expansion, `bg` command, session management, or
+ROSE currently targets one hart and one QEMU `virt` platform. Shell redirection
+is limited to the three standard descriptors and has no descriptor-close
+syntax; the shell also has no expansion, `bg` command, session management, or
 scripting language. The ext2 implementation is synchronous,
 write-through, limited to one block group and direct plus singly indirect block
 addressing (268 KiB files), and does not yet provide journaling or crash
