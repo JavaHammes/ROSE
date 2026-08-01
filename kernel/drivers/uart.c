@@ -335,8 +335,8 @@ void uart_interrupts_enable(void) {
  * - the UART stops asserting the receive interrupt
  * - the interrupt can safely be completed in the PLIC
  *
- * Received bytes are retained in the software ring until terminal_poll handles
- * and echoes them outside interrupt context.
+ * Received bytes are retained in the software ring until a process reads the
+ * console device. Line editing and echoing are owned by /bin/sh.
  *
  */
 void uart_handle_interrupt(void) {

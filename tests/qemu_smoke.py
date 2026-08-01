@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Boot ROSE in QEMU and exercise its public terminal interface."""
+"""Boot ROSE in QEMU and exercise its userspace shell interface."""
 
 from __future__ import annotations
 
 import os
-import re
 import select
 import subprocess
 import sys
@@ -102,22 +101,6 @@ def require(output: str, *needles: str) -> None:
         raise AssertionError(f"missing {missing!r} in command output:\n{output}")
 
 
-def used_pages(output: str) -> int:
-    """Extract the allocator's used-page count from meminfo output."""
-    match = re.search(r"used:\s+(\d+) pages", output)
-    if match is None:
-        raise AssertionError(f"could not parse memory usage:\n{output}")
-    return int(match.group(1))
-
-
-def spawned_pid(output: str) -> int:
-    """Extract the PID assigned by the spawn command."""
-    match = re.search(r"Spawned process (\d+)", output)
-    if match is None:
-        raise AssertionError(f"could not parse process ID:\n{output}")
-    return int(match.group(1))
-
-
 def main() -> int:
     # Environment overrides mirror Makefile variables and keep the test usable
     # with differently named cross-toolchains or QEMU installations.
@@ -154,73 +137,61 @@ def main() -> int:
     session = QemuSession(command)
     try:
         boot = session.read_until(b"rose> ", 15.0)
-        require(boot, "ROSE init: writable disk root online")
-
-        info = session.command("info")
-        memory_match = re.fullmatch(r"(\d+)M", memory)
-        if memory_match is not None:
-            expected_ram_end = 0x80000000 + int(memory_match.group(1)) * 1024 * 1024
-            require(
-                info,
-                "RAM: 0x0000000080000000 - " f"0x{expected_ram_end:016x}",
-            )
         require(
-            info,
-            "Virtual memory: Sv39",
-            "RAM: 0x",
-            "Timer frequency: 10000000 Hz",
-            "UART: 0x0000000010000000 (IRQ 10)",
-            "PLIC: 0x000000000c000000",
-            "Root filesystem: writable ext2",
-            "Block device: VirtIO (512-byte sectors: 8192)",
+            boot,
+            "ROSE init: writable disk root online",
+            "ROSE userspace shell",
         )
 
-        # The upper bound guards against accidentally returning to the original
-        # all-4-KiB kernel identity map, which consumed about 70 table pages.
-        baseline = used_pages(session.command("meminfo"))
-        if baseline > 8:
-            raise AssertionError(f"kernel page tables use {baseline} pages; expected at most 8")
+        # The prompt, line editor, quote/backslash parser, and built-ins now run
+        # in /bin/sh rather than supervisor mode.
+        require(
+            session.command("echo 'hello world' \"from sh\" escaped\\ value"),
+            "hello world from sh escaped value",
+        )
+        require(session.command("pwd"), "\n/\n")
+        session.command("cd /etc")
+        require(session.command("pwd"), "\n/etc\n")
+        session.command("cd /")
+        require(
+            session.command("help"),
+            "Built-ins:",
+            "Programs are loaded from PATH",
+        )
 
         require(
-            session.command("run"),
+            session.command("hello"),
             "Hello from U-mode C",
-            "exited with status 0",
-            "Scheduler blocks:",
         )
         require(
-            session.command("run /bin/fault"),
+            session.command("fault"),
             "terminated by exception 13",
-            "exited with status 1",
         )
         require(
-            session.command("run /bin/syscall-test"),
+            session.command("syscall-test"),
             "Working directory passed",
             "Descriptor duplication passed",
             "Process hierarchy passed",
             "Userspace heap passed",
             "Syscall validation passed",
-            "exited with status 0",
-            "Scheduler blocks:",
         )
         require(
-            session.command("run /bin/missing"),
-            "Unable to load program: /bin/missing",
+            session.command("missing"),
+            "sh: command not found: missing",
         )
 
         motd = "Welcome to ROSE. This message was read from writable ext2."
-        require(session.command("run /bin/cat"), motd, "exited with status 0")
+        require(session.command("cat"), motd)
 
         require(
-            session.command("run /bin/fs-test"),
+            session.command("fs-test"),
             "Filesystem mutation passed",
-            "exited with status 0",
         )
 
         session.command("setenv ROSE_TEST passed")
         require(
-            session.command("run /bin/args-env alpha beta"),
+            session.command("args-env alpha beta"),
             "Program arguments and environment passed",
-            "exited with status 0",
         )
         require(
             session.command("env"),
@@ -231,83 +202,31 @@ def main() -> int:
         )
 
         require(
-            session.command("run /bin/execve"),
+            session.command("execve"),
             "Execve replacement passed",
-            "exited with status 0",
         )
 
         console = session.command_with_input(
-            "run /bin/console-read", b"Console reader waiting\r\n", b"Z"
+            "console-read", b"Console reader waiting\r\n", b"Z"
         )
         require(
             console,
             "Console reader waiting",
             "Console read: Z",
-            "exited with status 0",
-            "Scheduler blocks:",
         )
 
-        # Direct runs leave zombies by design. Reap them before filling the
-        # fixed process table with concurrency tests.
-        require(session.command("reap"), "Reaped 8 process(es)")
-
         require(
-            session.command("run /bin/pipe-test"),
+            session.command("pipe-test"),
             "Pipe communication passed",
-            "exited with status 0",
-            "Scheduler blocks:",
         )
-        require(session.command("reap"), "Reaped 1 process(es)")
 
-        first_cat = spawned_pid(session.command("spawn /bin/cat"))
-        second_cat = spawned_pid(session.command("spawn /bin/cat"))
-        cat_pair = session.command("wait")
-        if cat_pair.count(motd) != 2:
-            raise AssertionError(f"independent file offsets failed:\n{cat_pair}")
+        # The compatibility alias still supplies the old default demonstration,
+        # while parsing and child management remain entirely in userspace.
         require(
-            cat_pair,
-            f"Process {first_cat} exited with status 0",
-            f"Process {second_cat} exited with status 0",
+            session.command("run"),
+            "Hello from U-mode C",
+            "Process exited with status 0",
         )
-        require(session.command("reap"), "Reaped 2 process(es)")
-
-        # Separate spawn from wait so READY persistence and ps are tested before
-        # the foreground scheduler consumes the processes.
-        process_a = spawned_pid(session.command("spawn /bin/process-a"))
-        process_b = spawned_pid(session.command("spawn /bin/process-b"))
-        process_table = session.command("ps")
-        require(process_table, f"{process_a}    ready", f"{process_b}    ready")
-
-        scheduler = session.command("wait", 15.0)
-        require(
-            scheduler,
-            "Process A: running",
-            "Process B: running",
-            "Scheduler switches:",
-            "preemptions)",
-            "Scheduler blocks:",
-        )
-        preemptions = re.search(r"\((\d+) preemptions\)", scheduler)
-        if preemptions is None or int(preemptions.group(1)) == 0:
-            raise AssertionError(f"timer did not preempt the user processes:\n{scheduler}")
-
-        killed = spawned_pid(session.command("spawn /bin/hello"))
-        require(session.command(f"kill {killed}"), f"Terminated process {killed}")
-        require(
-            session.command("wait"),
-            "No ready processes",
-            f"Process {killed} exited with status 137",
-        )
-
-        require(session.command("reap"), "Reaped ")
-        require(session.command("ps"), "(no processes)")
-
-        # All process-owned stacks, ELF pages, and page tables must be gone.
-        final_used = used_pages(session.command("meminfo"))
-        if final_used != baseline:
-            raise AssertionError(
-                f"page leak detected: baseline {baseline}, final {final_used}"
-            )
 
         session.shutdown()
     finally:
@@ -317,21 +236,17 @@ def main() -> int:
     # embedded diagnostic environment rather than preventing recovery.
     fallback = QemuSession(base_command)
     try:
-        fallback.read_until(b"rose> ", 15.0)
+        boot = fallback.read_until(b"rose> ", 15.0)
+        require(boot, "ROSE userspace shell")
         require(
-            fallback.command("info"),
-            "Root filesystem: embedded ramfs fallback",
-        )
-        require(
-            fallback.command("run /bin/hello"),
+            fallback.command("hello"),
             "Hello from U-mode C",
-            "exited with status 0",
         )
         fallback.shutdown()
     finally:
         fallback.close()
 
-    print(f"QEMU smoke test passed ({memory}, {baseline} kernel pages in use)")
+    print(f"QEMU userspace-shell smoke test passed ({memory})")
     return 0
 
 

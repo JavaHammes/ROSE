@@ -3,12 +3,13 @@
  *
  * a0-a5 carry arguments, a7 selects the syscall, and the kernel returns its
  * result in a0. The kernel advances sepc past ecall before returning here.
+ * Each stub has its own section so --gc-sections retains only the calls used
+ * by a given small executable.
  */
 #include "user_abi.h"
 
-.section .text,"ax",@progbits
+.section .text.rose_write,"ax",@progbits
 .align 2
-
 .globl rose_write
 .type rose_write, @function
 rose_write:
@@ -18,6 +19,8 @@ rose_write:
     ret
 .size rose_write, . - rose_write
 
+.section .text.rose_read,"ax",@progbits
+.align 2
 .globl rose_read
 .type rose_read, @function
 rose_read:
@@ -27,6 +30,8 @@ rose_read:
     ret
 .size rose_read, . - rose_read
 
+.section .text.rose_open,"ax",@progbits
+.align 2
 .globl rose_open
 .type rose_open, @function
 rose_open:
@@ -36,6 +41,8 @@ rose_open:
     ret
 .size rose_open, . - rose_open
 
+.section .text.rose_close,"ax",@progbits
+.align 2
 .globl rose_close
 .type rose_close, @function
 rose_close:
@@ -45,6 +52,8 @@ rose_close:
     ret
 .size rose_close, . - rose_close
 
+.section .text.rose_stat,"ax",@progbits
+.align 2
 .globl rose_stat
 .type rose_stat, @function
 rose_stat:
@@ -53,6 +62,8 @@ rose_stat:
     ret
 .size rose_stat, . - rose_stat
 
+.section .text.rose_fstat,"ax",@progbits
+.align 2
 .globl rose_fstat
 .type rose_fstat, @function
 rose_fstat:
@@ -61,6 +72,8 @@ rose_fstat:
     ret
 .size rose_fstat, . - rose_fstat
 
+.section .text.rose_lseek,"ax",@progbits
+.align 2
 .globl rose_lseek
 .type rose_lseek, @function
 rose_lseek:
@@ -69,6 +82,8 @@ rose_lseek:
     ret
 .size rose_lseek, . - rose_lseek
 
+.section .text.rose_read_directory,"ax",@progbits
+.align 2
 .globl rose_read_directory
 .type rose_read_directory, @function
 rose_read_directory:
@@ -77,6 +92,8 @@ rose_read_directory:
     ret
 .size rose_read_directory, . - rose_read_directory
 
+.section .text.rose_mkdir,"ax",@progbits
+.align 2
 .globl rose_mkdir
 .type rose_mkdir, @function
 rose_mkdir:
@@ -85,6 +102,8 @@ rose_mkdir:
     ret
 .size rose_mkdir, . - rose_mkdir
 
+.section .text.rose_unlink,"ax",@progbits
+.align 2
 .globl rose_unlink
 .type rose_unlink, @function
 rose_unlink:
@@ -93,6 +112,8 @@ rose_unlink:
     ret
 .size rose_unlink, . - rose_unlink
 
+.section .text.rose_chdir,"ax",@progbits
+.align 2
 .globl rose_chdir
 .type rose_chdir, @function
 rose_chdir:
@@ -101,6 +122,8 @@ rose_chdir:
     ret
 .size rose_chdir, . - rose_chdir
 
+.section .text.rose_getcwd,"ax",@progbits
+.align 2
 .globl rose_getcwd
 .type rose_getcwd, @function
 rose_getcwd:
@@ -109,6 +132,8 @@ rose_getcwd:
     ret
 .size rose_getcwd, . - rose_getcwd
 
+.section .text.rose_dup,"ax",@progbits
+.align 2
 .globl rose_dup
 .type rose_dup, @function
 rose_dup:
@@ -117,6 +142,8 @@ rose_dup:
     ret
 .size rose_dup, . - rose_dup
 
+.section .text.rose_dup2,"ax",@progbits
+.align 2
 .globl rose_dup2
 .type rose_dup2, @function
 rose_dup2:
@@ -125,6 +152,8 @@ rose_dup2:
     ret
 .size rose_dup2, . - rose_dup2
 
+.section .text.rose_pipe,"ax",@progbits
+.align 2
 .globl rose_pipe
 .type rose_pipe, @function
 rose_pipe:
@@ -134,6 +163,8 @@ rose_pipe:
     ret
 .size rose_pipe, . - rose_pipe
 
+.section .text.rose_execve,"ax",@progbits
+.align 2
 .globl rose_execve
 .type rose_execve, @function
 rose_execve:
@@ -143,6 +174,8 @@ rose_execve:
     ret
 .size rose_execve, . - rose_execve
 
+.section .text.rose_spawn,"ax",@progbits
+.align 2
 .globl rose_spawn
 .type rose_spawn, @function
 rose_spawn:
@@ -152,6 +185,8 @@ rose_spawn:
     ret
 .size rose_spawn, . - rose_spawn
 
+.section .text.rose_getpid,"ax",@progbits
+.align 2
 .globl rose_getpid
 .type rose_getpid, @function
 rose_getpid:
@@ -160,6 +195,8 @@ rose_getpid:
     ret
 .size rose_getpid, . - rose_getpid
 
+.section .text.rose_waitpid,"ax",@progbits
+.align 2
 .globl rose_waitpid
 .type rose_waitpid, @function
 rose_waitpid:
@@ -169,6 +206,8 @@ rose_waitpid:
     ret
 .size rose_waitpid, . - rose_waitpid
 
+.section .text.rose_brk,"ax",@progbits
+.align 2
 .globl rose_brk
 .type rose_brk, @function
 rose_brk:
@@ -178,6 +217,8 @@ rose_brk:
     ret
 .size rose_brk, . - rose_brk
 
+.section .text.rose_exit,"ax",@progbits
+.align 2
 .globl rose_exit
 .type rose_exit, @function
 rose_exit:
@@ -188,6 +229,8 @@ rose_exit:
     j 1b
 .size rose_exit, . - rose_exit
 
+.section .text.rose_yield,"ax",@progbits
+.align 2
 .globl rose_yield
 .type rose_yield, @function
 rose_yield:
@@ -197,6 +240,8 @@ rose_yield:
     ret
 .size rose_yield, . - rose_yield
 
+.section .text.rose_syscall,"ax",@progbits
+.align 2
 .globl rose_syscall
 .type rose_syscall, @function
 rose_syscall:

@@ -21,6 +21,10 @@
 static volatile uint64_t user_cookie = UINT64_C(0x524f5345);
 static volatile uint64_t user_counter;
 
+/* Linked only into /bin/sh; constant program selection removes the reference
+ * from every other independently linked user image. */
+int rose_shell_main(char **environment);
+
 /* Small libc replacements keep the user executable completely freestanding. */
 static size_t string_length(const char *text) {
         size_t length = 0U;
@@ -647,7 +651,16 @@ int user_main(int argc, char **argv,
 
         case USER_PROGRAM_INIT:
                 print("ROSE init: writable disk root online\n");
-                return 0;
+                {
+                        char *arguments[] = {"/bin/sh", NULL};
+                        char *shell_environment[] = {
+                            "HOME=/", "PATH=/bin:/sbin", "TERM=rose", NULL};
+                        long result = rose_execve("/bin/sh", arguments,
+                                                  shell_environment);
+
+                        print("ROSE init: unable to start /bin/sh\n");
+                        return result < 0 ? 1 : 0;
+                }
 
         case USER_PROGRAM_FS_TEST:
                 return run_filesystem_test();
@@ -666,6 +679,9 @@ int user_main(int argc, char **argv,
 
         case USER_PROGRAM_PIPE_WRITER:
                 return run_pipe_writer();
+
+        case USER_PROGRAM_SH:
+                return rose_shell_main(environment);
 
         default:
                 return 2;

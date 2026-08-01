@@ -41,11 +41,10 @@ USER_COMMON_OBJECTS := \
 	$(BUILD_DIR)/user/start.o \
 	$(BUILD_DIR)/user/syscall.o
 
-# Each userspace path is a distinct ELF. All variants use the same small source,
-# with a build-time selector allowing dead-code elimination to retain only the
-# requested demonstration. The disk receives every image; the diagnostic
-# ramfs retains only the original seven programs.
-USER_PROGRAMS := hello fault process_a process_b syscall_test cat console_read init fs_test args_env execve execve_target pipe_test pipe_writer
+# Each userspace path is a distinct ELF. Demonstrations share a build-time
+# selected source, while /bin/sh adds its own implementation object. The disk
+# receives every image; the diagnostic ramfs retains its programs and shell.
+USER_PROGRAMS := hello fault process_a process_b syscall_test cat console_read init fs_test args_env execve execve_target pipe_test pipe_writer sh
 USER_PROGRAM_hello := 0
 USER_PROGRAM_fault := 1
 USER_PROGRAM_process_a := 2
@@ -60,16 +59,22 @@ USER_PROGRAM_execve := 10
 USER_PROGRAM_execve_target := 11
 USER_PROGRAM_pipe_test := 12
 USER_PROGRAM_pipe_writer := 13
+USER_PROGRAM_sh := 14
+# The shell must stay within ext2's twelve-direct-block file limit.
+USER_PROGRAM_CFLAGS_sh := -Os
 USER_ELFS := $(foreach program,$(USER_PROGRAMS),$(BUILD_DIR)/user/$(program)/program.elf)
 USER_LOAD_ELFS := $(USER_ELFS:.elf=.load.elf)
-USER_FALLBACK_PROGRAMS := hello fault process_a process_b syscall_test cat console_read
+USER_FALLBACK_PROGRAMS := hello fault process_a process_b syscall_test cat console_read sh
 USER_FALLBACK_ELFS := $(foreach program,$(USER_FALLBACK_PROGRAMS),$(BUILD_DIR)/user/$(program)/program.load.elf)
 USER_IMAGE_OBJECT := $(BUILD_DIR)/kernel/arch/riscv64/user_image.o
+
+USER_EXTRA_OBJECTS_sh := $(BUILD_DIR)/user/sh.o
 
 # Compiler-generated dependency files keep incremental header rebuilds correct.
 DEPS := \
 	$(OBJECTS:.o=.d) \
 	$(USER_COMMON_OBJECTS:.o=.d) \
+	$(BUILD_DIR)/user/sh.d \
 	$(foreach program,$(USER_PROGRAMS),$(BUILD_DIR)/user/$(program)/main.d)
 
 ARCH_FLAGS := \
@@ -155,6 +160,7 @@ $(ROOT_IMAGE): tools/mkrosefs.py $(USER_LOAD_ELFS)
 		--file /bin/execve-target=$(BUILD_DIR)/user/execve_target/program.load.elf \
 		--file /bin/pipe-test=$(BUILD_DIR)/user/pipe_test/program.load.elf \
 		--file /bin/pipe-writer=$(BUILD_DIR)/user/pipe_writer/program.load.elf \
+		--file /bin/sh=$(BUILD_DIR)/user/sh/program.load.elf \
 		--file /sbin/init=$(BUILD_DIR)/user/init/program.load.elf
 
 
@@ -168,15 +174,18 @@ define USER_PROGRAM_template
 $(BUILD_DIR)/user/$(1)/main.o: user/main.c
 	@mkdir -p $$(dir $$@)
 	$$(CC) $$(USER_INCLUDES) $$(USER_CFLAGS) \
-		-DROSE_PROGRAM=$$(USER_PROGRAM_$(1)) -c $$< -o $$@
+		-DROSE_PROGRAM=$$(USER_PROGRAM_$(1)) \
+		$$(USER_PROGRAM_CFLAGS_$(1)) -c $$< -o $$@
 
 $(BUILD_DIR)/user/$(1)/program.elf: \
 		$(BUILD_DIR)/user/$(1)/main.o $$(USER_COMMON_OBJECTS) \
+		$$(USER_EXTRA_OBJECTS_$(1)) \
 		$$(USER_LINKER_SCRIPT)
 	@mkdir -p $$(dir $$@)
 	$$(CC) $$(USER_LDFLAGS) \
 		-Wl,-Map=$(BUILD_DIR)/user/$(1)/program.map \
-		$(BUILD_DIR)/user/$(1)/main.o $$(USER_COMMON_OBJECTS) -o $$@
+		$(BUILD_DIR)/user/$(1)/main.o $$(USER_COMMON_OBJECTS) \
+		$$(USER_EXTRA_OBJECTS_$(1)) -o $$@
 	$$(SIZE) $$@
 endef
 
@@ -197,6 +206,12 @@ $(USER_IMAGE_OBJECT): $(USER_FALLBACK_ELFS)
 $(BUILD_DIR)/user/%.o: user/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_INCLUDES) $(USER_CFLAGS) -c $< -o $@
+
+
+$(BUILD_DIR)/user/sh.o: user/sh.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_INCLUDES) $(USER_CFLAGS) $(USER_PROGRAM_CFLAGS_sh) \
+		-c $< -o $@
 
 
 $(BUILD_DIR)/user/%.o: user/%.S

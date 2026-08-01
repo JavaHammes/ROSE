@@ -2,10 +2,11 @@
 #include "ext2.h"
 #include "interrupt.h"
 #include "page_allocator.h"
+#include "panic.h"
 #include "platform.h"
 #include "plic.h"
 #include "ramfs.h"
-#include "terminal.h"
+#include "sbi.h"
 #include "timer.h"
 #include "trap.h"
 #include "uart.h"
@@ -43,25 +44,33 @@ void kernel_main(unsigned long hart_id, const void *dtb) {
         external_interrupts_enable();
         global_interrupts_enable();
 
-        /* A disk root owns the first userspace process. The embedded ramfs is
-         * retained only as a diagnostic fallback when no valid disk mounts. */
+        size_t idle_page_count = page_used_count();
+
+        /* A disk root enters its init image, which replaces itself with
+         * /bin/sh. The embedded ramfs starts the same shell directly as a
+         * diagnostic fallback when no valid disk mounts. */
         if (vfs_uses_disk_root()) {
                 user_process_run_path("/sbin/init", NULL);
-                (void)user_process_reap_exited();
+        } else {
+                user_process_run_path("/bin/sh", NULL);
+        }
+        (void)user_process_reap_exited();
+        if (page_used_count() != idle_page_count) {
+                uart_puts("Idle pages: ");
+                uart_put_uint64(idle_page_count);
+                uart_puts("; current pages: ");
+                uart_put_uint64(page_used_count());
+                uart_putc('\n');
+                panic("User process page leak after shell exit");
         }
 
-        terminal_init();
+        /* Returning from the long-lived shell is the userspace shutdown
+         * request. Keep a stopped machine quiescent if firmware rejects it. */
+        if (sbi_shutdown() != 0) {
+                uart_puts("SBI shutdown request failed\n");
+        }
 
         while (1) {
-                terminal_poll();
-
-                /*
-                 * Sleep until the next interrupt.
-                 *
-                 * A UART interrupt will place characters in the receive
-                 * buffer. After returning from the trap handler, execution
-                 * resumes here and terminal_poll() processes them.
-                 */
                 __asm__ volatile("wfi");
         }
 }

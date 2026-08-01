@@ -53,6 +53,13 @@ user_console_read_elf_start:
 .globl user_console_read_elf_end
 user_console_read_elf_end:
 
+.balign 16
+.globl user_sh_elf_start
+user_sh_elf_start:
+    .incbin "kernel/build/user/sh/program.load.elf"
+.globl user_sh_elf_end
+user_sh_elf_end:
+
 .globl user_program_elf_end
 user_program_elf_end:
 

@@ -24,7 +24,8 @@ scheduling, and automated emulator tests.
   segment handling, W^X enforcement, and complete unload ownership tracking.
 - Generic sector-device interface, modern VirtIO-MMIO block driver, and a
   sixteen-entry write-through cache for 1 KiB filesystem blocks.
-- Writable ext2 root filesystem containing `/sbin/init`, programs, and data.
+- Writable ext2 root filesystem containing `/sbin/init`, `/bin/sh`, programs,
+  and data.
   The supported ext2 profile uses one block group, direct blocks, 1 KiB blocks,
   128-byte inodes, and file-type directory entries. A linker-embedded ramfs is
   retained as a boot-diagnostic fallback.
@@ -52,12 +53,16 @@ scheduling, and automated emulator tests.
   their private stack.
   UART reads and writes block on scheduler wait channels and resume from device
   interrupts without polling in syscall traps.
+- Interactive `/bin/sh` process with console line editing, quoted and escaped
+  argument parsing, mutable environment variables, `PATH` lookup, working
+  directory built-ins, and foreground child execution through `spawn` and
+  `waitpid`. Command syntax and dispatch do not run in supervisor mode.
 - Eight-slot round-robin process scheduler with timer preemption, guarded user
   stacks, per-process kernel trap stacks, process creation, termination,
   parent/child ownership, orphan adoption by PID 0, waiting, reaping, typed
   block/wake channels, and an interruptible idle path.
 - Interrupt-driven UART input, PLIC external interrupts, SBI timers, panic
-  diagnostics, and SBI system shutdown.
+  diagnostics, and clean shutdown after the userspace shell exits.
 - Automated QEMU tests at two RAM sizes, including leak detection.
 
 At idle, the kernel uses five physical pages for its Sv39 tables on the default
@@ -69,12 +74,12 @@ ensure it returns to that baseline.
 ```text
 kernel/
   arch/riscv64/   boot, trap, context-switch, and embedded-image assembly
-  core/           kernel entry, platform parser, shell, traps, ELF, processes
+  core/           kernel entry, platform parser, traps, ELF, processes
   drivers/        NS16550A UART, PLIC, and VirtIO block drivers
   include/        kernel and shared ABI headers
   linker/         kernel memory layout
   memory/         physical and virtual memory managers
-user/             freestanding C test program, runtime stubs, and linker script
+user/             `/bin/sh`, freestanding programs, syscall stubs, linker script
 tests/            end-to-end QEMU smoke test
 tools/            deterministic ext2 root-image generator
 ```
@@ -104,28 +109,25 @@ make -j4
 make run
 ```
 
-The terminal starts at `rose>`. Useful commands are:
+After `/sbin/init` replaces itself with `/bin/sh`, the shell starts at `rose>`.
+Useful commands are:
 
 | Command | Purpose |
 | --- | --- |
-| `help` | List every command. |
-| `info` | Show the discovered platform and virtual-memory state. |
-| `meminfo` | Show usable, used, and free physical pages. |
-| `run [PATH [ARG...]]` | Run a program with arguments (defaults to `/bin/hello`). |
-| `run /bin/fault` | Verify that U-mode cannot read supervisor kernel text. |
-| `run /bin/syscall-test` | Verify invalid pointers and unknown syscall handling. |
-| `run /bin/cat` | Read `/etc/motd` through a regular-file descriptor. |
-| `run /bin/console-read` | Block until one byte arrives on standard input. |
-| `run /bin/fs-test` | Exercise writable files, directories, stat, and seek. |
-| `runmulti` | Run two timer-preempted processes. |
-| `spawn [PATH [ARG...]]` | Create a ready process with arguments. |
+| `help` | List shell built-ins and command lookup behavior. |
+| `echo "hello world"` | Parse quotes and print arguments. |
+| `pwd` / `cd [DIR]` | Inspect or change the shell working directory. |
+| `hello` | Resolve `/bin/hello` through `PATH` and run it. |
+| `fault` | Verify that U-mode cannot read supervisor kernel text. |
+| `syscall-test` | Verify invalid pointers and unknown syscall handling. |
+| `cat` | Read `/etc/motd` through a regular-file descriptor. |
+| `console-read` | Block a child until one byte arrives on standard input. |
+| `fs-test` | Exercise writable files, directories, stat, and seek. |
+| `pipe-test` | Exercise inherited descriptors and blocking anonymous pipes. |
 | `env` | Show environment variables inherited by new programs. |
 | `setenv NAME VALUE` | Set an inherited environment variable. |
 | `unsetenv NAME` | Remove an inherited environment variable. |
-| `wait` | Run all ready processes until they exit. |
-| `kill PID` | Terminate a ready process. |
-| `ps` | Show ready and exited process-table entries. |
-| `reap` | Remove exited entries and make their slots reusable. |
+| `run [PATH [ARG...]]` | Compatibility alias; defaults to `/bin/hello`. |
 | `exit` | Shut QEMU down through SBI SRST. |
 
 ## Verification
@@ -149,12 +151,12 @@ Run static analysis and both emulator configurations:
 make check
 ```
 
-The smoke test covers disk-root boot through `/sbin/init`, VirtIO discovery,
-ext2 mutation, ELF execution from disk, user/kernel isolation, syscall
-validation, working-directory resolution, shared duplicate-descriptor offsets,
-userspace heap growth and shrinkage, blocking UART and pipe I/O, child creation
-and waiting, preemption, process lifecycle commands, memory reclamation, and
-clean shutdown.
+The smoke test covers disk-root boot through `/sbin/init` into `/bin/sh`,
+userspace line parsing and built-ins, `PATH` execution, VirtIO-backed ext2
+mutation, user/kernel isolation, syscall validation, working-directory
+resolution, shared duplicate-descriptor offsets, userspace heap growth and
+shrinkage, blocking UART and pipe I/O, child creation and waiting, memory
+reclamation, fallback-ramfs shell boot, and clean shutdown.
 
 For source-level debugging, use `make debug` in one terminal and `make gdb` in
 another. `make disassemble` writes an annotated disassembly to
@@ -165,26 +167,29 @@ another. `make disassemble` writes an annotated disassembly to
 1. OpenSBI enters `_entry` in supervisor mode and supplies the hart ID and DTB.
 2. Assembly establishes the boot stack, clears BSS, and calls `kernel_main`.
 3. The kernel parses the DTB, initializes physical memory, builds the kernel
-   Sv39 address space, and enables interrupts and the terminal.
+   Sv39 address space, and enables interrupts and console I/O.
 4. The kernel mounts its embedded diagnostic ramfs, negotiates the modern
    VirtIO-MMIO block device, validates ext2, and replaces the VFS root with the
    disk filesystem. `/dev/console` remains a VFS character-device overlay.
-5. `/sbin/init` is read from the disk and runs as the first user process. A
-   process resolving any later executable receives a private
-   Sv39 root, user stack, kernel trap stack, and pages populated from that ELF.
+5. `/sbin/init` is read from disk as the first user process and uses `execve`
+   to become `/bin/sh`; the fallback ramfs starts `/bin/sh` directly. A process
+   resolving any later executable receives a private Sv39 root, user stack,
+   kernel trap stack, and pages populated from that ELF.
 6. Traps switch from the untrusted user stack to the process kernel stack.
    Syscalls, faults, yields, and timer ticks may update the saved trap frame.
-7. Blocking console I/O, pipe I/O, and `waitpid` retain their `ecall` and resume
-   through a fresh trap after their wait channel is woken. If every process is
-   blocked, the foreground scheduler waits in supervisor mode with `wfi`.
-8. When no ready or blocked process remains, execution returns to the foreground
-   shell; exited processes retain only status metadata until `reap`.
+7. `/bin/sh` reads and edits console input, parses the line, handles built-ins,
+   or spawns a `PATH`-resolved child and waits for it. Blocking console I/O,
+   pipe I/O, and `waitpid` retain their `ecall` and resume through a fresh trap
+   after their wait channel is woken. If every process is blocked, the kernel
+   scheduler waits in supervisor mode with `wfi`.
+8. Exiting `/bin/sh` returns to the kernel, which verifies that all user-owned
+   pages were reclaimed and requests SBI system shutdown.
 
 ## Deliberate limitations
 
-ROSE currently targets one hart and one QEMU `virt` platform. User workloads
-run as a foreground batch while the kernel maintains persistent ready and
-exited states between shell commands. The ext2 implementation is synchronous,
+ROSE currently targets one hart and one QEMU `virt` platform. The shell runs
+one foreground command at a time and has no pipelines, redirection, expansion,
+job control, or scripting language. The ext2 implementation is synchronous,
 write-through, limited to one block group and twelve direct blocks per inode
 (12 KiB files), and does not yet provide journaling or crash recovery. The
 VirtIO queue is polled synchronously; it is not yet connected to a scheduler

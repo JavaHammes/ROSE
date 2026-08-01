@@ -149,6 +149,7 @@ enum user_program {
         USER_PROGRAM_EXECVE_TARGET,
         USER_PROGRAM_PIPE_TEST,
         USER_PROGRAM_PIPE_WRITER,
+        USER_PROGRAM_SH,
 };
 
 #endif

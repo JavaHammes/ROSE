@@ -15,20 +15,12 @@ struct user_process_startup {
         const char *const *environment;
 };
 
-/* Convenience foreground demonstrations exposed by the kernel shell. */
-void user_process_run(void);
+/* Kernel boot entry for a userspace executable. */
 void user_process_run_path(const char *path,
                            const struct user_process_startup *startup);
-void user_process_run_multi(void);
 
-/* Persistent process-table lifecycle operations used by spawn/wait/kill/reap. */
-bool user_process_spawn(const char *path,
-                        const struct user_process_startup *startup,
-                        uint64_t *pid);
-bool user_process_run_ready(void);
-bool user_process_kill(uint64_t pid);
+/* Reap kernel-owned zombies after the final userspace process exits. */
 size_t user_process_reap_exited(void);
-void user_process_print_table(void);
 bool user_process_is_active(void);
 
 /* Entry points called only from the high-level trap dispatcher. */

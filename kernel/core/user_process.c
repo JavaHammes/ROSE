@@ -6,10 +6,10 @@
  * register set lives in a trap_frame, allowing the trap handler to switch
  * processes by replacing the frame that assembly will restore.
  *
- * The shell can create several READY processes and later run them as one
- * foreground batch. Timer interrupts preempt U-mode, yield switches voluntarily,
- * and typed wait channels support BLOCKED processes. When no process can run,
- * assembly resumes scheduler_run_ready so supervisor mode can idle or finish.
+ * A userspace shell can create child processes and wait for them. Timer
+ * interrupts preempt U-mode, yield switches voluntarily, and typed wait
+ * channels support BLOCKED processes. When no process can run, assembly
+ * resumes scheduler_run_ready so supervisor mode can idle or finish.
  */
 #include <stdbool.h>
 #include <stddef.h>
@@ -48,7 +48,7 @@ enum descriptor_access {
 
 enum process_state {
         /* UNUSED slots may be assigned a new PID. EXITED slots retain status
-         * until the shell explicitly reaps them. */
+         * until their parent waits or the kernel reaps an orphan. */
         PROCESS_UNUSED,
         PROCESS_READY,
         PROCESS_RUNNING,
@@ -82,7 +82,7 @@ _Static_assert((uint32_t)USER_OPEN_READ == (uint32_t)VFS_OPEN_READ &&
 
 extern char text_start[];
 
-/* Assembly transitions which save and later restore the suspended shell call. */
+/* Assembly transitions which save and later restore the kernel scheduler. */
 extern void user_mode_enter(const struct trap_frame *context,
                             uintptr_t kernel_trap_stack_top);
 extern void user_mode_resume(void);
@@ -526,20 +526,8 @@ static struct process *process_find_available_slot(void) {
         return NULL;
 }
 
-/* Linear lookup is appropriate for the current eight-entry process table. */
-static struct process *process_find_by_pid(uint64_t pid) {
-        for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
-                if (process_table[index].state != PROCESS_UNUSED &&
-                    process_table[index].pid == pid) {
-                        return &process_table[index];
-                }
-        }
-
-        return NULL;
-}
-
-/* A process whose parent exits becomes kernel-owned. This kernel has no
- * permanently resident init process yet, so PID 0 is the stable reaper. */
+/* A process whose parent exits becomes kernel-owned. PID 0 is the stable
+ * reaper for children orphaned by the long-lived userspace shell. */
 static void process_orphan_children(uint64_t parent_pid) {
         for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
                 struct process *process = &process_table[index];
@@ -2324,7 +2312,7 @@ static bool scheduler_has_blocked_processes(void) {
  * supervisor ABI context and sret enters U-mode; exits and all-blocked states
  * return through user_mode_resume so this loop can finish or wait for an IRQ.
  */
-static bool scheduler_run_ready(bool require_preemption) {
+static bool scheduler_run_ready(void) {
         if (active_process != NULL) {
                 uart_puts("A user process is already running\n");
                 return false;
@@ -2345,10 +2333,24 @@ static bool scheduler_run_ready(bool require_preemption) {
         /* A blocking process may return us here many times. Wait in S-mode
          * when every process is asleep, then restore the complete saved frame
          * of whichever process an interrupt makes READY. */
-        while (first != NULL || scheduler_has_blocked_processes()) {
+        while (true) {
                 if (first == NULL) {
-                        __asm__ volatile("wfi");
                         first = scheduler_find_next_ready();
+                        if (first != NULL) {
+                                continue;
+                        }
+                        if (!scheduler_has_blocked_processes()) {
+                                /* Recheck READY after BLOCKED. An interrupt can
+                                 * wake the last blocked process between the
+                                 * first ready scan and the blocked scan. */
+                                first = scheduler_find_next_ready();
+                                if (first == NULL) {
+                                        break;
+                                }
+                                continue;
+                        }
+
+                        __asm__ volatile("wfi");
                         continue;
                 }
 
@@ -2369,11 +2371,7 @@ static bool scheduler_run_ready(bool require_preemption) {
                 }
 
                 page_table_activate(virtual_memory_kernel_page_table());
-                first = scheduler_find_next_ready();
-        }
-
-        if (require_preemption && scheduler_preemptions == 0U) {
-                panic("Multitasking demo completed without timer preemption");
+                first = NULL;
         }
 
         report_and_release_exited_processes();
@@ -2395,10 +2393,10 @@ static bool scheduler_run_ready(bool require_preemption) {
         return true;
 }
 
-/* Create a persistent READY entry without starting the scheduler. */
-bool user_process_spawn(const char *path,
-                        const struct user_process_startup *startup,
-                        uint64_t *pid) {
+/* Create the initial READY entry before starting the scheduler. */
+static bool user_process_spawn(const char *path,
+                               const struct user_process_startup *startup,
+                               uint64_t *pid) {
         struct process *process = process_find_available_slot();
 
         if (process == NULL) {
@@ -2413,31 +2411,6 @@ bool user_process_spawn(const char *path,
                 *pid = process->pid;
         }
 
-        return true;
-}
-
-/* Run all processes previously created with user_process_spawn. */
-bool user_process_run_ready(void) {
-        return scheduler_run_ready(false);
-}
-
-/*
- * Terminate a READY process from the shell. RUNNING cannot occur here because
- * the foreground shell is suspended whenever U-mode is executing. Status 137
- * follows the conventional 128 + SIGKILL representation.
- */
-bool user_process_kill(uint64_t pid) {
-        struct process *process = process_find_by_pid(pid);
-
-        if (process == NULL || process->state != PROCESS_READY) {
-                return false;
-        }
-
-        process->state = PROCESS_EXITED;
-        process->exit_status = 137U;
-        process_orphan_children(process->pid);
-        (void)scheduler_wake_all(SCHEDULER_WAIT_CHILD);
-        process_release_resources(process);
         return true;
 }
 
@@ -2460,20 +2433,7 @@ size_t user_process_reap_exited(void) {
         return reaped;
 }
 
-/* Spawn and immediately run the default hello demonstration. */
-void user_process_run(void) {
-        uint64_t pid;
-
-        if (!user_process_spawn("/bin/hello", NULL, &pid)) {
-                uart_puts("Unable to create process; run 'reap' and retry\n");
-                return;
-        }
-
-        (void)pid;
-        (void)scheduler_run_ready(false);
-}
-
-/* Spawn one executable by absolute VFS path and run it immediately. */
+/* Spawn the boot executable and run userspace until it exits. */
 void user_process_run_path(const char *path,
                            const struct user_process_startup *startup) {
         uint64_t pid;
@@ -2486,33 +2446,7 @@ void user_process_run_path(const char *path,
         }
 
         (void)pid;
-        (void)scheduler_run_ready(false);
-}
-
-/* Build two independent processes and require at least one timer preemption. */
-void user_process_run_multi(void) {
-        const char *programs[] = {
-            "/bin/process-a",
-            "/bin/process-b",
-        };
-
-        uint64_t created_pids[2];
-
-        /* Construct both processes before entering U-mode so a creation failure
-         * cannot leave the shell suspended with a partial demonstration. */
-        for (size_t index = 0U; index < 2U; index++) {
-                if (!user_process_spawn(programs[index], NULL,
-                                        &created_pids[index])) {
-                        for (size_t created = 0U; created < index; created++) {
-                                (void)user_process_kill(created_pids[created]);
-                        }
-                        uart_puts("Unable to create multitasking demo; run "
-                                  "'reap' and retry\n");
-                        return;
-                }
-        }
-
-        (void)scheduler_run_ready(true);
+        (void)scheduler_run_ready();
 }
 
 bool user_process_is_active(void) {
@@ -2523,7 +2457,7 @@ bool user_process_is_active(void) {
         return active_process->state == PROCESS_RUNNING;
 }
 
-/* Timer interrupts from supervisor mode belong to the shell/kernel and must not
+/* Timer interrupts from supervisor mode belong to the kernel and must not
  * be interpreted as user scheduling events. */
 void user_process_handle_timer(struct trap_frame *frame) {
         if ((frame->sstatus & SSTATUS_SPP) != 0U || !user_process_is_active()) {
@@ -2724,56 +2658,4 @@ void user_process_prepare_user_return(struct trap_frame *frame) {
 
         frame->kernel_trap_stack_top =
             (uintptr_t)active_process->kernel_trap_stack + PAGE_SIZE;
-}
-
-/* Keep terminal formatting separate from the internal enum representation. */
-static const char *process_state_name(enum process_state state) {
-        switch (state) {
-        case PROCESS_UNUSED:
-                return "unused";
-        case PROCESS_READY:
-                return "ready";
-        case PROCESS_RUNNING:
-                return "running";
-        case PROCESS_BLOCKED:
-                return "blocked";
-        case PROCESS_EXITED:
-                return "exited";
-        default:
-                return "unknown";
-        }
-}
-
-/* Display both runnable processes and zombies awaiting reap. */
-void user_process_print_table(void) {
-        uart_puts("PID  STATE    STATUS  PPID\n");
-
-        bool found = false;
-
-        for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
-                const struct process *process = &process_table[index];
-
-                if (process->state == PROCESS_UNUSED) {
-                        continue;
-                }
-
-                found = true;
-                uart_put_uint64(process->pid);
-                uart_puts("    ");
-                uart_puts(process_state_name(process->state));
-
-                if (process->state == PROCESS_EXITED) {
-                        uart_puts("   ");
-                        uart_put_uint64(process->exit_status);
-                }
-
-                uart_puts("   ppid=");
-                uart_put_uint64(process->parent_pid);
-
-                uart_putc('\n');
-        }
-
-        if (!found) {
-                uart_puts("(no processes)\n");
-        }
 }

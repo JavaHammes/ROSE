@@ -20,8 +20,10 @@ extern uint8_t user_cat_elf_start[];
 extern uint8_t user_cat_elf_end[];
 extern uint8_t user_console_read_elf_start[];
 extern uint8_t user_console_read_elf_end[];
+extern uint8_t user_sh_elf_start[];
+extern uint8_t user_sh_elf_end[];
 
-enum { RAMFS_PROGRAM_COUNT = 7 };
+enum { RAMFS_PROGRAM_COUNT = 8 };
 
 static const uint8_t motd_data[] =
     "Welcome to ROSE. Files now have descriptors and independent offsets.\n";
@@ -34,6 +36,7 @@ static struct vfs_node bin_nodes[RAMFS_PROGRAM_COUNT] = {
     {.name = "syscall-test", .type = VFS_NODE_REGULAR},
     {.name = "cat", .type = VFS_NODE_REGULAR},
     {.name = "console-read", .type = VFS_NODE_REGULAR},
+    {.name = "sh", .type = VFS_NODE_REGULAR},
 };
 
 static const struct vfs_node etc_nodes[] = {
@@ -89,6 +92,7 @@ void ramfs_init(void) {
         ramfs_set_file(5U, user_cat_elf_start, user_cat_elf_end);
         ramfs_set_file(6U, user_console_read_elf_start,
                        user_console_read_elf_end);
+        ramfs_set_file(7U, user_sh_elf_start, user_sh_elf_end);
 
         if (!vfs_mount_root(&ramfs_root)) {
                 panic("Failed to mount initial ramfs");
