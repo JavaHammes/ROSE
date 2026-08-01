@@ -394,6 +394,26 @@ rose_system_info:
     ret
 .size rose_system_info, . - rose_system_info
 
+.section .text.rose_mmap,"ax",@progbits
+.align 2
+.globl rose_mmap
+.type rose_mmap, @function
+rose_mmap:
+    li a7, USER_SYSCALL_MMAP
+    ecall
+    ret
+.size rose_mmap, . - rose_mmap
+
+.section .text.rose_munmap,"ax",@progbits
+.align 2
+.globl rose_munmap
+.type rose_munmap, @function
+rose_munmap:
+    li a7, USER_SYSCALL_MUNMAP
+    ecall
+    ret
+.size rose_munmap, . - rose_munmap
+
 .section .text.rose_exit,"ax",@progbits
 .align 2
 .globl rose_exit

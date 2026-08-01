@@ -100,6 +100,193 @@ static void preemption_delay(void) {
 
 static bool strings_equal(const char *left, const char *right);
 
+static int run_anonymous_mapping_test(void) {
+        const size_t page_size = 4096U;
+        const size_t mapping_length = page_size * 2U + 37U;
+        const uint32_t read_write =
+            USER_MEMORY_PROTECTION_READ | USER_MEMORY_PROTECTION_WRITE;
+        struct user_system_info baseline;
+
+        if (rose_system_info(&baseline) != 0 ||
+            rose_mmap(0U, read_write) != -USER_ERROR_INVALID_ARGUMENT ||
+            rose_mmap(page_size, USER_MEMORY_PROTECTION_WRITE) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_mmap(page_size, USER_MEMORY_PROTECTION_READ |
+                                     USER_MEMORY_PROTECTION_WRITE |
+                                     USER_MEMORY_PROTECTION_EXECUTE) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_mmap(page_size, UINT32_C(0x80000000)) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_mmap(SIZE_MAX, USER_MEMORY_PROTECTION_READ) !=
+                -USER_ERROR_INVALID_ARGUMENT) {
+                return 82;
+        }
+
+        /* Fork must copy the reservation itself without forcing either process
+         * to materialize it. A child-only first touch must disappear when the
+         * child is reaped, leaving the parent's reservation untouched. */
+        long untouched_result = rose_mmap(page_size, read_write);
+        if (untouched_result <= 0) {
+                return 101;
+        }
+        volatile uint8_t *untouched =
+            (volatile uint8_t *)(uintptr_t)untouched_result;
+        long untouched_child = rose_fork();
+        if (untouched_child < 0) {
+                return 102;
+        }
+        if (untouched_child == 0) {
+                if (untouched[0] != 0U) {
+                        rose_exit(103U);
+                }
+                untouched[0] = UINT8_C(0x5a);
+                rose_exit(0U);
+        }
+
+        int untouched_status = -1;
+        struct user_system_info after_untouched_child;
+        if (rose_waitpid(untouched_child, &untouched_status, 0U) !=
+                untouched_child ||
+            !USER_WAIT_STATUS_EXITED(untouched_status) ||
+            USER_WAIT_STATUS_EXIT_CODE(untouched_status) != 0U ||
+            rose_system_info(&after_untouched_child) != 0 ||
+            after_untouched_child.used_pages != baseline.used_pages ||
+            rose_munmap((uintptr_t)untouched_result, page_size) != 0) {
+                return 104;
+        }
+
+        long mapping_result = rose_mmap(mapping_length, read_write);
+        if (mapping_result <= 0 ||
+            ((uintptr_t)mapping_result & (page_size - 1U)) != 0U) {
+                return 83;
+        }
+        uintptr_t mapping_address = (uintptr_t)mapping_result;
+        volatile uint8_t *mapping = (volatile uint8_t *)mapping_address;
+
+        struct user_system_info reserved;
+        if (rose_system_info(&reserved) != 0 ||
+            reserved.used_pages != baseline.used_pages) {
+                return 84;
+        }
+
+        if (mapping[0] != 0U || mapping[page_size] != 0U ||
+            mapping[2U * page_size] != 0U ||
+            mapping[mapping_length - 1U] != 0U) {
+                return 85;
+        }
+        mapping[0] = UINT8_C(0x11);
+        mapping[page_size] = UINT8_C(0x22);
+        mapping[2U * page_size] = UINT8_C(0x33);
+
+        struct user_system_info resident;
+        if (rose_system_info(&resident) != 0 ||
+            resident.used_pages < baseline.used_pages + 3U) {
+                return 86;
+        }
+
+        if (rose_munmap(mapping_address + 1U, page_size) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_munmap(mapping_address, 0U) != -USER_ERROR_INVALID_ARGUMENT ||
+            rose_munmap(mapping_address + page_size, page_size) != 0) {
+                return 87;
+        }
+
+        struct user_system_info middle_unmapped;
+        if (rose_system_info(&middle_unmapped) != 0 ||
+            middle_unmapped.used_pages + 1U != resident.used_pages) {
+                return 88;
+        }
+
+        long gap_result = rose_mmap(page_size, read_write);
+        if (gap_result != (long)(mapping_address + page_size)) {
+                return 89;
+        }
+
+        long descriptor = rose_open("/etc/motd", USER_OPEN_READ);
+        if (descriptor != 3 ||
+            rose_read((int)descriptor, (void *)(uintptr_t)gap_result, 1U) !=
+                1 ||
+            rose_close((int)descriptor) != 0 ||
+            mapping[page_size] != (uint8_t)'W') {
+                return 90;
+        }
+
+        long child_pid = rose_fork();
+        if (child_pid < 0) {
+                return 91;
+        }
+        if (child_pid == 0) {
+                if (mapping[0] != UINT8_C(0x11) ||
+                    mapping[page_size] != (uint8_t)'W' ||
+                    mapping[2U * page_size] != UINT8_C(0x33)) {
+                        rose_exit(92U);
+                }
+                mapping[0] = UINT8_C(0xa1);
+                mapping[page_size] = UINT8_C(0xb2);
+                mapping[2U * page_size] = UINT8_C(0xc3);
+                rose_exit(0U);
+        }
+
+        int wait_status = -1;
+        if (rose_waitpid(child_pid, &wait_status, 0U) != child_pid ||
+            !USER_WAIT_STATUS_EXITED(wait_status) ||
+            USER_WAIT_STATUS_EXIT_CODE(wait_status) != 0U ||
+            mapping[0] != UINT8_C(0x11) || mapping[page_size] != (uint8_t)'W' ||
+            mapping[2U * page_size] != UINT8_C(0x33)) {
+                return 93;
+        }
+
+        if (rose_munmap(mapping_address, mapping_length) != 0) {
+                return 94;
+        }
+
+        long read_only_result =
+            rose_mmap(page_size, USER_MEMORY_PROTECTION_READ);
+        if (read_only_result <= 0) {
+                return 95;
+        }
+        volatile uint8_t *read_only =
+            (volatile uint8_t *)(uintptr_t)read_only_result;
+        if (read_only[0] != 0U) {
+                return 96;
+        }
+
+        child_pid = rose_fork();
+        if (child_pid < 0) {
+                return 97;
+        }
+        if (child_pid == 0) {
+                read_only[0] = UINT8_C(1);
+                rose_exit(98U);
+        }
+
+        wait_status = -1;
+        if (rose_waitpid(child_pid, &wait_status, 0U) != child_pid ||
+            !USER_WAIT_STATUS_EXITED(wait_status) ||
+            USER_WAIT_STATUS_EXIT_CODE(wait_status) != 1U ||
+            rose_munmap((uintptr_t)read_only_result, page_size) != 0) {
+                return 99;
+        }
+
+        struct user_system_info released;
+        if (rose_system_info(&released) != 0 ||
+            released.used_pages != baseline.used_pages) {
+                return 100;
+        }
+
+        /* Leave one resident mapping behind intentionally. The shell's wait and
+         * the kernel's final idle-page assertion cover process-exit teardown.
+         */
+        long teardown_result = rose_mmap(page_size, read_write);
+        if (teardown_result <= 0) {
+                return 105;
+        }
+        volatile uint8_t *teardown =
+            (volatile uint8_t *)(uintptr_t)teardown_result;
+        teardown[0] = UINT8_C(0xd4);
+        return 0;
+}
+
 static int run_multi_demo(const char *message) {
         preemption_delay();
 
@@ -606,22 +793,20 @@ static int run_syscall_test(void) {
         struct user_shared_memory_info shared;
         if (rose_shared_memory_create(0U, &shared) !=
                 -USER_ERROR_INVALID_ARGUMENT ||
-            rose_shared_memory_create(4096U,
-                                      (struct user_shared_memory_info *)
-                                          kernel_address) !=
+            rose_shared_memory_create(
+                4096U, (struct user_shared_memory_info *)kernel_address) !=
                 -USER_ERROR_BAD_ADDRESS ||
             rose_shared_memory_create(4096U, &shared) != 0 ||
             shared.identifier == 0U || shared.size != 4096U) {
                 return 76;
         }
-        volatile uint64_t *shared_value =
-            (volatile uint64_t *)shared.address;
+        volatile uint64_t *shared_value = (volatile uint64_t *)shared.address;
         *shared_value = UINT64_C(0x524f534553484d31);
         child_pid = rose_fork();
         if (child_pid == 0) {
                 struct user_shared_memory_info child_mapping;
-                if (rose_shared_memory_map(shared.identifier,
-                                           &child_mapping) != 0 ||
+                if (rose_shared_memory_map(shared.identifier, &child_mapping) !=
+                        0 ||
                     *(volatile uint64_t *)child_mapping.address !=
                         UINT64_C(0x524f534553484d31)) {
                         rose_exit(77U);
@@ -651,8 +836,8 @@ static int run_syscall_test(void) {
         if (rose_openpty((int *)kernel_address) != -USER_ERROR_BAD_ADDRESS ||
             rose_openpty(terminals) != 0 || terminals[0] != 3 ||
             terminals[1] != 4 ||
-            rose_set_descriptor_flags(terminals[0],
-                                      USER_DESCRIPTOR_NONBLOCK) != 0 ||
+            rose_set_descriptor_flags(terminals[0], USER_DESCRIPTOR_NONBLOCK) !=
+                0 ||
             rose_read(terminals[0], &terminal_byte, 1U) !=
                 -USER_ERROR_TRY_AGAIN ||
             rose_write(terminals[0], "m", 1U) != 1 ||
@@ -679,6 +864,12 @@ static int run_syscall_test(void) {
         }
         print("System telemetry passed\n");
         print("Copy-on-write passed\n");
+
+        int mapping_test = run_anonymous_mapping_test();
+        if (mapping_test != 0) {
+                return mapping_test;
+        }
+        print("Anonymous mmap passed\n");
 
         print("Process hierarchy passed\n");
         print("Fork semantics passed\n");
@@ -942,6 +1133,15 @@ static int run_execve_test(void) {
         volatile uint8_t *heap = (volatile uint8_t *)(uintptr_t)heap_query;
         heap[0] = UINT8_C(0x5a);
 
+        long mapping_result = rose_mmap(
+            4096U, USER_MEMORY_PROTECTION_READ | USER_MEMORY_PROTECTION_WRITE);
+        if (mapping_result <= 0) {
+                return 106;
+        }
+        volatile uint8_t *mapping =
+            (volatile uint8_t *)(uintptr_t)mapping_result;
+        mapping[0] = UINT8_C(0x6b);
+
         for (size_t index = 0U; index < 17U; index++) {
                 too_many_arguments[index] = "x";
         }
@@ -962,13 +1162,14 @@ static int run_execve_test(void) {
                         environment) != -USER_ERROR_ARGUMENT_LIST_TOO_LONG) {
                 return 26;
         }
-        if (rose_brk(0U) != heap_query + 1 || heap[0] != UINT8_C(0x5a)) {
+        if (rose_brk(0U) != heap_query + 1 || heap[0] != UINT8_C(0x5a) ||
+            mapping[0] != UINT8_C(0x6b)) {
                 return 37;
         }
 
-        /* Success cannot return; the target verifies the copied vectors,
-         * descriptor offset, and working directory inherited from this image.
-         */
+        /* Success cannot return. In addition to replacing the heap and ELF, it
+         * releases the resident anonymous mapping above. The target verifies
+         * copied vectors, descriptor state, and the inherited directory. */
         if (rose_chdir("/bin") != 0) {
                 return 41;
         }

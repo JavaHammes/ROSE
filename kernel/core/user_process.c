@@ -47,6 +47,7 @@ enum {
         SHARED_MEMORY_OBJECT_LIMIT = 12,
         SHARED_MEMORY_PROCESS_LIMIT = 4,
         SHARED_MEMORY_PAGE_LIMIT = 256,
+        PROCESS_ANONYMOUS_MAPPING_LIMIT = 16,
 };
 
 enum descriptor_access {
@@ -81,6 +82,9 @@ _Static_assert((uint32_t)USER_OPEN_READ == (uint32_t)VFS_OPEN_READ &&
  *   first page after ELF ..     growable userspace heap
  *   0x007ff000                 unmapped stack guard
  *   0x00800000                 one-page user stack
+ *   0x01000000 ..              owned graphical framebuffer
+ *   0x02000000 .. 0x023fffff   four shared-memory mapping slots
+ *   0x04000000 .. 0x0fffffff   private anonymous mappings
  *
  * The stack pointer begins just above the mapped stack page and grows down.
  */
@@ -90,8 +94,9 @@ _Static_assert((uint32_t)USER_OPEN_READ == (uint32_t)VFS_OPEN_READ &&
 #define USER_STACK_TOP (USER_STACK_ADDRESS + PAGE_SIZE)
 #define USER_GRAPHICS_ADDRESS UINT64_C(0x01000000)
 #define USER_SHARED_MEMORY_BASE UINT64_C(0x02000000)
-#define USER_SHARED_MEMORY_STRIDE                                             \
-        (SHARED_MEMORY_PAGE_LIMIT * PAGE_SIZE)
+#define USER_SHARED_MEMORY_STRIDE (SHARED_MEMORY_PAGE_LIMIT * PAGE_SIZE)
+#define USER_MMAP_BASE UINT64_C(0x04000000)
+#define USER_MMAP_END UINT64_C(0x10000000)
 
 extern char text_start[];
 
@@ -147,6 +152,13 @@ struct process_shared_memory_mapping {
         uintptr_t address;
 };
 
+struct process_anonymous_mapping {
+        bool used;
+        uintptr_t start;
+        uintptr_t end;
+        uint32_t protection;
+};
+
 struct process {
         /* Scheduler-visible identity and saved execution state. */
         uint64_t pid;
@@ -171,6 +183,8 @@ struct process {
         struct process_descriptor descriptors[PROCESS_DESCRIPTOR_LIMIT];
         struct process_shared_memory_mapping
             shared_memory[SHARED_MEMORY_PROCESS_LIMIT];
+        struct process_anonymous_mapping
+            anonymous_mappings[PROCESS_ANONYMOUS_MAPPING_LIMIT];
 
         /* Dispositions survive fork. Caught handlers reset on exec, while an
          * ignored disposition remains ignored. Only one handler can be active
@@ -547,6 +561,143 @@ static uintptr_t align_up_to_page(uintptr_t address) {
         return (address + PAGE_SIZE - 1U) & ~(PAGE_SIZE - 1U);
 }
 
+static uint64_t anonymous_mapping_page_flags(uint32_t protection) {
+        uint64_t flags = VM_PAGE_USER;
+
+        if ((protection & USER_MEMORY_PROTECTION_READ) != 0U) {
+                flags |= VM_PAGE_READ;
+        }
+        if ((protection & USER_MEMORY_PROTECTION_WRITE) != 0U) {
+                flags |= VM_PAGE_WRITE;
+        }
+        if ((protection & USER_MEMORY_PROTECTION_EXECUTE) != 0U) {
+                flags |= VM_PAGE_EXECUTE;
+        }
+        return flags;
+}
+
+static struct process_anonymous_mapping *
+process_find_anonymous_mapping(struct process *process, uintptr_t address) {
+        if (process == NULL) {
+                return NULL;
+        }
+
+        for (size_t index = 0U; index < PROCESS_ANONYMOUS_MAPPING_LIMIT;
+             index++) {
+                struct process_anonymous_mapping *mapping =
+                    &process->anonymous_mappings[index];
+
+                if (mapping->used && address >= mapping->start &&
+                    address < mapping->end) {
+                        return mapping;
+                }
+        }
+        return NULL;
+}
+
+static bool
+anonymous_mapping_allows(const struct process_anonymous_mapping *mapping,
+                         uint64_t required_flags) {
+        if (mapping == NULL || !mapping->used) {
+                return false;
+        }
+        if ((required_flags & VM_PAGE_READ) != 0U &&
+            (mapping->protection & USER_MEMORY_PROTECTION_READ) == 0U) {
+                return false;
+        }
+        if ((required_flags & VM_PAGE_WRITE) != 0U &&
+            (mapping->protection & USER_MEMORY_PROTECTION_WRITE) == 0U) {
+                return false;
+        }
+        if ((required_flags & VM_PAGE_EXECUTE) != 0U &&
+            (mapping->protection & USER_MEMORY_PROTECTION_EXECUTE) == 0U) {
+                return false;
+        }
+        return true;
+}
+
+/* Install a zero-filled page for a reserved anonymous address. page_alloc
+ * supplies the zeroing guarantee, while the VMA retains ownership implicitly
+ * through its virtual-address interval. */
+static bool process_materialize_anonymous_page(struct process *process,
+                                               uintptr_t address,
+                                               uint64_t required_flags) {
+        uintptr_t virtual_address = address & ~(PAGE_SIZE - 1U);
+        struct process_anonymous_mapping *mapping =
+            process_find_anonymous_mapping(process, virtual_address);
+
+        if (!anonymous_mapping_allows(mapping, required_flags)) {
+                return false;
+        }
+
+        uintptr_t existing_physical_address;
+        uint64_t existing_flags;
+        if (page_table_translate(process->address_space, virtual_address,
+                                 &existing_physical_address, &existing_flags)) {
+                return (existing_flags & (VM_PAGE_USER | required_flags)) ==
+                       (VM_PAGE_USER | required_flags);
+        }
+
+        uint64_t mapping_flags =
+            anonymous_mapping_page_flags(mapping->protection);
+        if ((mapping_flags & (VM_PAGE_READ | VM_PAGE_EXECUTE)) == 0U) {
+                return false;
+        }
+
+        void *page = page_alloc();
+        if (page == NULL) {
+                return false;
+        }
+        if (!page_table_map(process->address_space, virtual_address,
+                            (uintptr_t)page, mapping_flags)) {
+                page_release(page);
+                return false;
+        }
+        return true;
+}
+
+static void process_release_anonymous_page(struct process *process,
+                                           uintptr_t virtual_address) {
+        uintptr_t physical_address;
+        uint64_t flags;
+
+        if (!page_table_translate(process->address_space, virtual_address,
+                                  &physical_address, &flags)) {
+                return;
+        }
+        if ((physical_address & (PAGE_SIZE - 1U)) != 0U ||
+            (flags & VM_PAGE_USER) == 0U ||
+            !page_table_unmap(process->address_space, virtual_address)) {
+                panic("Anonymous mapping ownership mismatch");
+        }
+        page_release((void *)physical_address);
+}
+
+static void process_release_anonymous_mappings(struct process *process) {
+        if (process == NULL) {
+                return;
+        }
+
+        for (size_t index = 0U; index < PROCESS_ANONYMOUS_MAPPING_LIMIT;
+             index++) {
+                struct process_anonymous_mapping *mapping =
+                    &process->anonymous_mappings[index];
+
+                if (!mapping->used) {
+                        continue;
+                }
+                if (process->address_space == NULL ||
+                    mapping->start >= mapping->end) {
+                        panic("Invalid anonymous mapping release");
+                }
+                for (uintptr_t address = mapping->start; address < mapping->end;
+                     address += PAGE_SIZE) {
+                        process_release_anonymous_page(process, address);
+                }
+                bytes_zero(mapping, sizeof(*mapping));
+        }
+}
+
 /* The heap starts on the first page not owned by the ELF loader. Keeping the
  * two ownership regions disjoint makes shrinking and image teardown exact. */
 static uintptr_t
@@ -643,6 +794,7 @@ static void process_release_image(struct page_table **address_space,
 static void process_release_resources(struct process *process) {
         process_descriptors_close_all(process);
         process_release_shared_memory(process);
+        process_release_anonymous_mappings(process);
         process_release_image(&process->address_space, &process->loaded_image,
                               &process->stack_page, &process->heap_start,
                               &process->heap_break);
@@ -990,6 +1142,13 @@ static void process_replace_owned_page(struct process *process,
                 return;
         }
 
+        struct process_anonymous_mapping *mapping =
+            process_find_anonymous_mapping(process, virtual_address);
+        if (mapping != NULL &&
+            (mapping->protection & USER_MEMORY_PROTECTION_WRITE) != 0U) {
+                return;
+        }
+
         panic("Copy-on-write page has no private owner");
 }
 
@@ -1154,6 +1313,75 @@ static bool process_fork_stack(struct process *child, struct process *parent) {
                                   mapping_flags);
 }
 
+static bool anonymous_mapping_flags_are_valid(
+    const struct process_anonymous_mapping *mapping, uint64_t flags) {
+        uint64_t expected = anonymous_mapping_page_flags(mapping->protection);
+
+        if ((mapping->protection & USER_MEMORY_PROTECTION_WRITE) != 0U) {
+                return flags == expected ||
+                       flags == copy_on_write_flags(expected);
+        }
+        return flags == expected;
+}
+
+/* Copy VMA reservations without materializing untouched pages. Resident pages
+ * are retained directly; writable leaves become COW in both processes. */
+static bool process_fork_anonymous_mappings(struct process *child,
+                                            struct process *parent) {
+        for (size_t index = 0U; index < PROCESS_ANONYMOUS_MAPPING_LIMIT;
+             index++) {
+                child->anonymous_mappings[index] =
+                    parent->anonymous_mappings[index];
+        }
+
+        for (size_t index = 0U; index < PROCESS_ANONYMOUS_MAPPING_LIMIT;
+             index++) {
+                const struct process_anonymous_mapping *mapping =
+                    &parent->anonymous_mappings[index];
+
+                if (!mapping->used) {
+                        continue;
+                }
+                for (uintptr_t address = mapping->start; address < mapping->end;
+                     address += PAGE_SIZE) {
+                        uintptr_t physical_address;
+                        uint64_t flags;
+
+                        if (!page_table_translate(parent->address_space,
+                                                  address, &physical_address,
+                                                  &flags)) {
+                                continue;
+                        }
+                        if ((physical_address & (PAGE_SIZE - 1U)) != 0U ||
+                            !anonymous_mapping_flags_are_valid(mapping,
+                                                               flags)) {
+                                panic("Fork source anonymous mapping mismatch");
+                        }
+
+                        uint64_t child_flags = flags;
+                        if ((mapping->protection &
+                             USER_MEMORY_PROTECTION_WRITE) != 0U) {
+                                child_flags = copy_on_write_flags(
+                                    anonymous_mapping_page_flags(
+                                        mapping->protection));
+                        }
+
+                        page_retain((void *)physical_address);
+                        if (!page_table_map(child->address_space, address,
+                                            physical_address, child_flags)) {
+                                page_release((void *)physical_address);
+                                return false;
+                        }
+                        if (flags != child_flags &&
+                            !page_table_protect(parent->address_space, address,
+                                                child_flags)) {
+                                return false;
+                        }
+                }
+        }
+        return true;
+}
+
 /* Clone page tables and ownership records while sharing user leaves. Only the
  * child's page-table hierarchy and trusted trap stack are allocated eagerly;
  * private writable data is materialized on its first write. */
@@ -1199,7 +1427,8 @@ static uint64_t syscall_fork(const struct trap_frame *frame) {
 
         if (!process_fork_stack(child, parent) ||
             !process_fork_loaded_image(child, parent) ||
-            !process_fork_heap(child, parent)) {
+            !process_fork_heap(child, parent) ||
+            !process_fork_anonymous_mappings(child, parent)) {
                 goto out_of_memory;
         }
 
@@ -1238,7 +1467,13 @@ static bool user_range_is_valid(uintptr_t user_buffer, size_t length,
 
                 if (!page_table_translate(root, user_buffer + offset,
                                           &physical_address, &flags)) {
-                        return false;
+                        if (!process_materialize_anonymous_page(
+                                active_process, user_buffer + offset,
+                                required_flags) ||
+                            !page_table_translate(root, user_buffer + offset,
+                                                  &physical_address, &flags)) {
+                                return false;
+                        }
                 }
                 if ((required_flags & VM_PAGE_WRITE) != 0U &&
                     (flags & VM_PAGE_WRITE) == 0U &&
@@ -1900,6 +2135,7 @@ static void process_commit_replacement(struct trap_frame *frame) {
         graphics_release_if_owned(active_process->pid);
         process_release_shared_memory(active_process);
         page_table_activate(new_address_space);
+        process_release_anonymous_mappings(active_process);
         process_release_image(&old_address_space, &active_process->loaded_image,
                               &old_stack_page, &old_heap_start,
                               &old_heap_break);
@@ -2670,6 +2906,173 @@ static uint64_t syscall_set_descriptor_flags(uint64_t descriptor,
         return 0U;
 }
 
+static struct process_anonymous_mapping *
+process_find_free_anonymous_mapping(struct process *process) {
+        for (size_t index = 0U; index < PROCESS_ANONYMOUS_MAPPING_LIMIT;
+             index++) {
+                if (!process->anonymous_mappings[index].used) {
+                        return &process->anonymous_mappings[index];
+                }
+        }
+        return NULL;
+}
+
+static bool address_ranges_overlap(uintptr_t first_start, uintptr_t first_end,
+                                   uintptr_t second_start,
+                                   uintptr_t second_end) {
+        return first_start < second_end && second_start < first_end;
+}
+
+/* Reserve the first fitting address interval without allocating page-table or
+ * physical pages. Fault handling materializes each page independently. */
+static uint64_t syscall_mmap(size_t length, uint32_t protection) {
+        const uint32_t valid_protection = USER_MEMORY_PROTECTION_READ |
+                                          USER_MEMORY_PROTECTION_WRITE |
+                                          USER_MEMORY_PROTECTION_EXECUTE;
+
+        if (length == 0U || length > UINTPTR_MAX - (PAGE_SIZE - 1U) ||
+            (protection & ~valid_protection) != 0U ||
+            ((protection & USER_MEMORY_PROTECTION_WRITE) != 0U &&
+             (protection & USER_MEMORY_PROTECTION_READ) == 0U) ||
+            (protection &
+             (USER_MEMORY_PROTECTION_WRITE | USER_MEMORY_PROTECTION_EXECUTE)) ==
+                (USER_MEMORY_PROTECTION_WRITE |
+                 USER_MEMORY_PROTECTION_EXECUTE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+
+        size_t rounded_length = (size_t)align_up_to_page(length);
+        if (rounded_length > USER_MMAP_END - USER_MMAP_BASE) {
+                return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
+        }
+
+        struct process_anonymous_mapping *slot =
+            process_find_free_anonymous_mapping(active_process);
+        if (slot == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
+        }
+
+        uintptr_t candidate = USER_MMAP_BASE;
+        while (candidate <= USER_MMAP_END - rounded_length) {
+                bool collision = false;
+                uintptr_t candidate_end = candidate + rounded_length;
+
+                for (size_t index = 0U; index < PROCESS_ANONYMOUS_MAPPING_LIMIT;
+                     index++) {
+                        const struct process_anonymous_mapping *mapping =
+                            &active_process->anonymous_mappings[index];
+
+                        if (!mapping->used ||
+                            !address_ranges_overlap(candidate, candidate_end,
+                                                    mapping->start,
+                                                    mapping->end)) {
+                                continue;
+                        }
+                        candidate = mapping->end;
+                        collision = true;
+                        break;
+                }
+                if (!collision) {
+                        *slot = (struct process_anonymous_mapping){
+                            .used = true,
+                            .start = candidate,
+                            .end = candidate_end,
+                            .protection = protection,
+                        };
+                        return candidate;
+                }
+        }
+
+        return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
+}
+
+/* Linux-compatible hole handling keeps munmap idempotent. Cutting the middle
+ * of one VMA consumes a second fixed metadata slot; prefix/suffix removals do
+ * not. Only resident pages have PTEs and physical ownership to release. */
+static uint64_t syscall_munmap(uintptr_t address, size_t length) {
+        if ((address & (PAGE_SIZE - 1U)) != 0U || length == 0U ||
+            length > UINTPTR_MAX - (PAGE_SIZE - 1U)) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+
+        size_t rounded_length = (size_t)align_up_to_page(length);
+        if (address < USER_MMAP_BASE || address > USER_MMAP_END ||
+            rounded_length > USER_MMAP_END - address) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+        uintptr_t end = address + rounded_length;
+
+        struct process_anonymous_mapping *split_mapping = NULL;
+        for (size_t index = 0U; index < PROCESS_ANONYMOUS_MAPPING_LIMIT;
+             index++) {
+                struct process_anonymous_mapping *mapping =
+                    &active_process->anonymous_mappings[index];
+
+                if (mapping->used && address > mapping->start &&
+                    end < mapping->end) {
+                        split_mapping = mapping;
+                        break;
+                }
+        }
+
+        struct process_anonymous_mapping *split_slot = NULL;
+        if (split_mapping != NULL) {
+                split_slot =
+                    process_find_free_anonymous_mapping(active_process);
+                if (split_slot == NULL) {
+                        return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
+                }
+        }
+
+        uintptr_t split_start = 0U;
+        uintptr_t split_end = 0U;
+        uint32_t split_protection = 0U;
+
+        for (size_t index = 0U; index < PROCESS_ANONYMOUS_MAPPING_LIMIT;
+             index++) {
+                struct process_anonymous_mapping *mapping =
+                    &active_process->anonymous_mappings[index];
+
+                if (!mapping->used ||
+                    !address_ranges_overlap(address, end, mapping->start,
+                                            mapping->end)) {
+                        continue;
+                }
+
+                uintptr_t overlap_start =
+                    address > mapping->start ? address : mapping->start;
+                uintptr_t overlap_end = end < mapping->end ? end : mapping->end;
+                for (uintptr_t page = overlap_start; page < overlap_end;
+                     page += PAGE_SIZE) {
+                        process_release_anonymous_page(active_process, page);
+                }
+
+                if (overlap_start == mapping->start &&
+                    overlap_end == mapping->end) {
+                        bytes_zero(mapping, sizeof(*mapping));
+                } else if (overlap_start == mapping->start) {
+                        mapping->start = overlap_end;
+                } else if (overlap_end == mapping->end) {
+                        mapping->end = overlap_start;
+                } else {
+                        split_start = overlap_end;
+                        split_end = mapping->end;
+                        split_protection = mapping->protection;
+                        mapping->end = overlap_start;
+                }
+        }
+
+        if (split_mapping != NULL) {
+                *split_slot = (struct process_anonymous_mapping){
+                    .used = true,
+                    .start = split_start,
+                    .end = split_end,
+                    .protection = split_protection,
+                };
+        }
+        return 0U;
+}
+
 /* Move the end of the process data segment. Heap pages are materialized
  * eagerly so a successful return guarantees that every byte below the new
  * break is writable. Growth is transactional; shrink releases complete pages
@@ -2798,8 +3201,7 @@ static uint64_t syscall_input_read(uintptr_t user_event) {
         return 1U;
 }
 
-static struct shared_memory_object *
-shared_memory_find(uint32_t identifier) {
+static struct shared_memory_object *shared_memory_find(uint32_t identifier) {
         if (identifier == 0U) {
                 return NULL;
         }
@@ -2835,8 +3237,9 @@ static size_t process_shared_memory_free_slot(void) {
         return SHARED_MEMORY_PROCESS_LIMIT;
 }
 
-static bool process_shared_memory_map_object(struct shared_memory_object *object,
-                                             size_t slot) {
+static bool
+process_shared_memory_map_object(struct shared_memory_object *object,
+                                 size_t slot) {
         uintptr_t address =
             USER_SHARED_MEMORY_BASE + slot * USER_SHARED_MEMORY_STRIDE;
         size_t mapped = 0U;
@@ -2852,7 +3255,8 @@ static bool process_shared_memory_map_object(struct shared_memory_object *object
                                 if (!page_table_unmap(
                                         active_process->address_space,
                                         address + mapped * PAGE_SIZE)) {
-                                        panic("Shared-memory map rollback failed");
+                                        panic("Shared-memory map rollback "
+                                              "failed");
                                 }
                         }
                         return false;
@@ -3960,31 +4364,41 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 return;
 
         case USER_SYSCALL_SHARED_MEMORY_CREATE:
-                frame->a0 = syscall_shared_memory_create(
-                    (size_t)frame->a0, (uintptr_t)frame->a1);
+                frame->a0 = syscall_shared_memory_create((size_t)frame->a0,
+                                                         (uintptr_t)frame->a1);
                 frame->sepc += 4U;
                 return;
 
         case USER_SYSCALL_SHARED_MEMORY_MAP:
-                frame->a0 = syscall_shared_memory_map(
-                    (uint32_t)frame->a0, (uintptr_t)frame->a1);
+                frame->a0 = syscall_shared_memory_map((uint32_t)frame->a0,
+                                                      (uintptr_t)frame->a1);
                 frame->sepc += 4U;
                 return;
 
         case USER_SYSCALL_SHARED_MEMORY_UNMAP:
-                frame->a0 =
-                    syscall_shared_memory_unmap((uint32_t)frame->a0);
+                frame->a0 = syscall_shared_memory_unmap((uint32_t)frame->a0);
                 frame->sepc += 4U;
                 return;
 
         case USER_SYSCALL_OPEN_PSEUDO_TERMINAL:
-                frame->a0 =
-                    syscall_open_pseudo_terminal((uintptr_t)frame->a0);
+                frame->a0 = syscall_open_pseudo_terminal((uintptr_t)frame->a0);
                 frame->sepc += 4U;
                 return;
 
         case USER_SYSCALL_SYSTEM_INFO:
                 frame->a0 = syscall_system_info((uintptr_t)frame->a0);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_MMAP:
+                frame->a0 =
+                    syscall_mmap((size_t)frame->a0, (uint32_t)frame->a1);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_MUNMAP:
+                frame->a0 =
+                    syscall_munmap((uintptr_t)frame->a0, (size_t)frame->a1);
                 frame->sepc += 4U;
                 return;
 
@@ -4018,6 +4432,20 @@ void user_process_handle_fault(struct trap_frame *frame, uint64_t cause) {
             process_resolve_copy_on_write(active_process,
                                           (uintptr_t)frame->stval)) {
                 copy_on_write_faults++;
+                return;
+        }
+
+        uint64_t required_flags = 0U;
+        if (cause == SCAUSE_LOAD_PAGE_FAULT) {
+                required_flags = VM_PAGE_READ;
+        } else if (cause == SCAUSE_STORE_PAGE_FAULT) {
+                required_flags = VM_PAGE_WRITE;
+        } else if (cause == SCAUSE_INSTRUCTION_PAGE_FAULT) {
+                required_flags = VM_PAGE_EXECUTE;
+        }
+        if (required_flags != 0U &&
+            process_materialize_anonymous_page(
+                active_process, (uintptr_t)frame->stval, required_flags)) {
                 return;
         }
 

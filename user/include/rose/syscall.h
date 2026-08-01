@@ -50,6 +50,11 @@ long rose_tcgetpgrp(int descriptor);
  * success returns the resulting break and failure returns a negative error. */
 long rose_brk(uintptr_t address);
 
+/* Reserve a private anonymous range and release page-aligned portions of it.
+ * Physical pages are allocated lazily on first access. */
+long rose_mmap(size_t length, uint32_t protection);
+long rose_munmap(uintptr_t address, size_t length);
+
 /* Claim the 2D scanout, publish its mapped framebuffer, flush changed pixels,
  * and consume nonblocking keyboard/pointer events. */
 long rose_graphics_map(struct user_graphics_info *information);

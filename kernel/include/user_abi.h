@@ -43,6 +43,8 @@
 #define USER_SYSCALL_SHARED_MEMORY_UNMAP 37
 #define USER_SYSCALL_OPEN_PSEUDO_TERMINAL 38
 #define USER_SYSCALL_SYSTEM_INFO 39
+#define USER_SYSCALL_MMAP 40
+#define USER_SYSCALL_MUNMAP 41
 
 #else
 
@@ -87,6 +89,8 @@ enum user_syscall_number {
         USER_SYSCALL_SHARED_MEMORY_UNMAP = 37,
         USER_SYSCALL_OPEN_PSEUDO_TERMINAL = 38,
         USER_SYSCALL_SYSTEM_INFO = 39,
+        USER_SYSCALL_MMAP = 40,
+        USER_SYSCALL_MUNMAP = 41,
 };
 
 /* Stable negative error values returned in a0 by failed system calls. */
@@ -135,6 +139,16 @@ enum user_seek_whence {
         USER_SEEK_SET,
         USER_SEEK_CURRENT,
         USER_SEEK_END,
+};
+
+/* The first mmap ABI is intentionally anonymous and private. Writable mappings
+ * must also be readable on RISC-V, and writable/executable mappings are
+ * rejected to preserve W^X. */
+enum user_memory_protection {
+        USER_MEMORY_PROTECTION_NONE = 0,
+        USER_MEMORY_PROTECTION_READ = (1U << 0),
+        USER_MEMORY_PROTECTION_WRITE = (1U << 1),
+        USER_MEMORY_PROTECTION_EXECUTE = (1U << 2),
 };
 
 enum user_wait_options {
