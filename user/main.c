@@ -31,6 +31,7 @@ static void signal_test_handler(int signal) {
 /* Linked only into /bin/sh; constant program selection removes the reference
  * from every other independently linked user image. */
 int rose_shell_main(char **environment);
+int rose_desktop_main(int argc, char **argv);
 
 /* Small libc replacements keep the user executable completely freestanding. */
 static size_t string_length(const char *text) {
@@ -68,8 +69,7 @@ static int run_init(void) {
         print("ROSE init: writable disk root online\n");
 
         char *arguments[] = {"/bin/sh", NULL};
-        char *environment[] = {
-            "HOME=/", "PATH=/bin:/sbin", "TERM=rose", NULL};
+        char *environment[] = {"HOME=/", "PATH=/bin:/sbin", "TERM=rose", NULL};
         long shell_pid = rose_spawn("/bin/sh", arguments, environment);
 
         if (shell_pid < 0) {
@@ -132,8 +132,7 @@ static int run_syscall_test(void) {
         if (rose_getcwd(current_directory, sizeof(current_directory)) != 2 ||
             !strings_equal(current_directory, "/") ||
             rose_getcwd(current_directory, 1U) != -USER_ERROR_RANGE ||
-            rose_getcwd((char *)kernel_address,
-                        sizeof(current_directory)) !=
+            rose_getcwd((char *)kernel_address, sizeof(current_directory)) !=
                 -USER_ERROR_BAD_ADDRESS ||
             rose_chdir((const char *)kernel_address) !=
                 -USER_ERROR_BAD_ADDRESS ||
@@ -170,15 +169,13 @@ static int run_syscall_test(void) {
             rose_dup2((int)original, (int)original) != original ||
             rose_dup(99) != -USER_ERROR_BAD_FILE_DESCRIPTOR ||
             rose_dup2(99, 6) != -USER_ERROR_BAD_FILE_DESCRIPTOR ||
-            rose_dup2((int)original, 8) !=
-                -USER_ERROR_BAD_FILE_DESCRIPTOR ||
+            rose_dup2((int)original, 8) != -USER_ERROR_BAD_FILE_DESCRIPTOR ||
             rose_read((int)original, &characters[0], 1U) != 1 ||
             rose_read((int)duplicate, &characters[1], 1U) != 1 ||
             rose_read((int)replacement, &characters[2], 1U) != 1 ||
-            rose_read(7, &characters[3], 1U) != 1 ||
-            characters[0] != 'W' || characters[1] != 'e' ||
-            characters[2] != 'l' || characters[3] != 'c' ||
-            rose_close((int)original) != 0 ||
+            rose_read(7, &characters[3], 1U) != 1 || characters[0] != 'W' ||
+            characters[1] != 'e' || characters[2] != 'l' ||
+            characters[3] != 'c' || rose_close((int)original) != 0 ||
             rose_read((int)duplicate, &characters[4], 1U) != 1 ||
             characters[4] != 'o' || rose_close((int)duplicate) != 0 ||
             rose_close((int)replacement) != 0 || rose_close(7) != 0 ||
@@ -221,7 +218,8 @@ static int run_syscall_test(void) {
             rose_close((int)descriptor) != 0) {
                 return 17;
         }
-        /* The raw wrapper lets this test issue a deliberately unknown number. */
+        /* The raw wrapper lets this test issue a deliberately unknown number.
+         */
         if (rose_syscall(UINT64_C(0xffff), 0U, 0U, 0U) !=
             -USER_ERROR_NOT_IMPLEMENTED) {
                 return 5;
@@ -238,8 +236,7 @@ static int run_syscall_test(void) {
         uintptr_t heap_start = (uintptr_t)heap_query;
         uintptr_t heap_end = heap_start + UINT64_C(8192) + 37U;
 
-        if (rose_brk(heap_start - 1U) !=
-                -USER_ERROR_INVALID_ARGUMENT ||
+        if (rose_brk(heap_start - 1U) != -USER_ERROR_INVALID_ARGUMENT ||
             rose_brk(UINTPTR_MAX) != -USER_ERROR_OUT_OF_MEMORY ||
             rose_brk(0U) != heap_query ||
             rose_brk(heap_end) != (long)heap_end) {
@@ -348,8 +345,7 @@ static int run_syscall_test(void) {
             rose_sigaction(USER_SIGNAL_USER_1, &signal_action,
                            &old_signal_action) != 0 ||
             old_signal_action.handler != USER_SIGNAL_DEFAULT ||
-            old_signal_action.flags != 0U ||
-            rose_kill(-1, 0) != 0 ||
+            old_signal_action.flags != 0U || rose_kill(-1, 0) != 0 ||
             rose_kill(INT64_MAX, 0) != -USER_ERROR_NO_PROCESS ||
             rose_kill(parent_pid, USER_SIGNAL_MAX + 1) !=
                 -USER_ERROR_INVALID_ARGUMENT ||
@@ -434,11 +430,9 @@ static int run_syscall_test(void) {
                 return 67;
         }
         if (signal_child == 0) {
-                char *signal_arguments[] = {
-                    "/bin/signal-exec-test", NULL};
+                char *signal_arguments[] = {"/bin/signal-exec-test", NULL};
                 char *signal_environment[] = {NULL};
-                (void)rose_execve("/bin/signal-exec-test",
-                                  signal_arguments,
+                (void)rose_execve("/bin/signal-exec-test", signal_arguments,
                                   signal_environment);
                 rose_exit(68U);
         }
@@ -466,18 +460,16 @@ static int run_syscall_test(void) {
         int wait_status = -1;
 
         if (child_pid <= 0 || child_pid == parent_pid ||
-            rose_waitpid(child_pid, (int *)kernel_address,
-                         USER_WAIT_NO_HANG) != -USER_ERROR_BAD_ADDRESS) {
+            rose_waitpid(child_pid, (int *)kernel_address, USER_WAIT_NO_HANG) !=
+                -USER_ERROR_BAD_ADDRESS) {
                 return 31;
         }
 
-        long waited_pid =
-            rose_waitpid(-1, &wait_status, USER_WAIT_NO_HANG);
+        long waited_pid = rose_waitpid(-1, &wait_status, USER_WAIT_NO_HANG);
         if (waited_pid == 0) {
                 waited_pid = rose_waitpid(-1, &wait_status, 0U);
         }
-        if (waited_pid != child_pid ||
-            !USER_WAIT_STATUS_EXITED(wait_status) ||
+        if (waited_pid != child_pid || !USER_WAIT_STATUS_EXITED(wait_status) ||
             USER_WAIT_STATUS_EXIT_CODE(wait_status) != 0U ||
             rose_waitpid(child_pid, NULL, USER_WAIT_NO_HANG) !=
                 -USER_ERROR_NO_CHILD) {
@@ -507,8 +499,7 @@ static int run_syscall_test(void) {
                 }
         }
         if (rose_setpgid(stopped_child, stopped_child) != 0 ||
-            rose_waitpid(0, NULL, USER_WAIT_NO_HANG) !=
-                -USER_ERROR_NO_CHILD ||
+            rose_waitpid(0, NULL, USER_WAIT_NO_HANG) != -USER_ERROR_NO_CHILD ||
             rose_kill(-stopped_child, 0) != 0 ||
             rose_kill(-stopped_child, USER_SIGNAL_STOP) != 0) {
                 (void)rose_kill(stopped_child, USER_SIGNAL_KILL);
@@ -516,26 +507,24 @@ static int run_syscall_test(void) {
         }
 
         int stopped_status = 0;
-        if (rose_waitpid(stopped_child, &stopped_status,
-                         USER_WAIT_UNTRACED) != stopped_child ||
+        if (rose_waitpid(stopped_child, &stopped_status, USER_WAIT_UNTRACED) !=
+                stopped_child ||
             !USER_WAIT_STATUS_STOPPED(stopped_status) ||
-            USER_WAIT_STATUS_STOP_SIGNAL(stopped_status) !=
-                USER_SIGNAL_STOP ||
+            USER_WAIT_STATUS_STOP_SIGNAL(stopped_status) != USER_SIGNAL_STOP ||
             rose_waitpid(stopped_child, NULL,
                          USER_WAIT_NO_HANG | USER_WAIT_UNTRACED) != 0) {
                 (void)rose_kill(stopped_child, USER_SIGNAL_KILL);
                 return 73;
         }
         if (rose_kill(-stopped_child, USER_SIGNAL_CONTINUE) != 0 ||
-            rose_waitpid(stopped_child, &stopped_status,
-                         USER_WAIT_CONTINUED) != stopped_child ||
+            rose_waitpid(stopped_child, &stopped_status, USER_WAIT_CONTINUED) !=
+                stopped_child ||
             !USER_WAIT_STATUS_CONTINUED(stopped_status) ||
             rose_kill(-stopped_child, USER_SIGNAL_TERMINATE) != 0) {
                 (void)rose_kill(stopped_child, USER_SIGNAL_KILL);
                 return 74;
         }
-        if (rose_waitpid(stopped_child, &stopped_status, 0U) !=
-                stopped_child ||
+        if (rose_waitpid(stopped_child, &stopped_status, 0U) != stopped_child ||
             !USER_WAIT_STATUS_SIGNALED(stopped_status) ||
             USER_WAIT_STATUS_TERMINATION_SIGNAL(stopped_status) !=
                 USER_SIGNAL_TERMINATE) {
@@ -629,8 +618,7 @@ static int run_ls(int argc, char **argv) {
         }
 
         const char *path = argc == 2 ? argv[1] : ".";
-        long descriptor =
-            rose_open(path, USER_OPEN_READ | USER_OPEN_DIRECTORY);
+        long descriptor = rose_open(path, USER_OPEN_READ | USER_OPEN_DIRECTORY);
         if (descriptor < 0) {
                 print("ls: unable to open directory: ");
                 print(path);
@@ -812,15 +800,13 @@ static int run_execve_test(void) {
         const void *kernel_address =
             (const void *)(uintptr_t)UINT64_C(0x80200000);
         long descriptor = rose_open("/etc/motd", USER_OPEN_READ);
-        long close_on_exec_descriptor =
-            rose_open("/etc/motd", USER_OPEN_READ);
+        long close_on_exec_descriptor = rose_open("/etc/motd", USER_OPEN_READ);
         char first_character;
         long heap_query = rose_brk(0U);
 
         if (descriptor != 3 || close_on_exec_descriptor != 4 ||
-            rose_set_descriptor_flags(
-                (int)close_on_exec_descriptor,
-                USER_DESCRIPTOR_CLOSE_ON_EXEC) != 0 ||
+            rose_set_descriptor_flags((int)close_on_exec_descriptor,
+                                      USER_DESCRIPTOR_CLOSE_ON_EXEC) != 0 ||
             rose_read((int)descriptor, &first_character, 1U) != 1 ||
             first_character != 'W' || heap_query <= 0 ||
             rose_brk((uintptr_t)heap_query + 1U) != heap_query + 1) {
@@ -835,21 +821,19 @@ static int run_execve_test(void) {
         }
 
         /* Every failure must return to this unchanged image. */
-        if (rose_execve((const char *)kernel_address, arguments,
-                        environment) != -USER_ERROR_BAD_ADDRESS ||
+        if (rose_execve((const char *)kernel_address, arguments, environment) !=
+                -USER_ERROR_BAD_ADDRESS ||
             rose_execve("/missing", arguments, environment) !=
                 -USER_ERROR_NO_ENTRY ||
             rose_execve("/etc/motd", arguments, environment) !=
                 -USER_ERROR_EXEC_FORMAT ||
-            rose_execve("/bin/execve-target",
-                        (char *const *)kernel_address,
+            rose_execve("/bin/execve-target", (char *const *)kernel_address,
                         environment) != -USER_ERROR_BAD_ADDRESS ||
             rose_execve("/bin/execve-target", arguments,
                         (char *const *)kernel_address) !=
                 -USER_ERROR_BAD_ADDRESS ||
             rose_execve("/bin/execve-target", too_many_arguments,
-                        environment) !=
-                -USER_ERROR_ARGUMENT_LIST_TOO_LONG) {
+                        environment) != -USER_ERROR_ARGUMENT_LIST_TOO_LONG) {
                 return 26;
         }
         if (rose_brk(0U) != heap_query + 1 || heap[0] != UINT8_C(0x5a)) {
@@ -862,8 +846,7 @@ static int run_execve_test(void) {
         if (rose_chdir("/bin") != 0) {
                 return 41;
         }
-        long result =
-            rose_execve("execve-target", arguments, environment);
+        long result = rose_execve("execve-target", arguments, environment);
         return result < 0 ? 27 : 28;
 }
 
@@ -919,10 +902,9 @@ static int run_filesystem_test(void) {
                 return 19;
         }
 
-        long descriptor = rose_open("/tmp/state", USER_OPEN_READ |
-                                                      USER_OPEN_WRITE |
-                                                      USER_OPEN_CREATE |
-                                                      USER_OPEN_TRUNCATE);
+        long descriptor =
+            rose_open("/tmp/state", USER_OPEN_READ | USER_OPEN_WRITE |
+                                        USER_OPEN_CREATE | USER_OPEN_TRUNCATE);
         static const char payload[] = "persistent ext2\n";
         if (descriptor < 0 ||
             rose_write((int)descriptor, payload, sizeof(payload) - 1U) !=
@@ -940,7 +922,8 @@ static int run_filesystem_test(void) {
         long count = rose_read((int)descriptor, buffer, sizeof(payload) - 1U);
         buffer[sizeof(payload) - 1U] = '\0';
         if (count != (long)(sizeof(payload) - 1U) ||
-            !strings_equal(buffer, payload) || rose_close((int)descriptor) != 0) {
+            !strings_equal(buffer, payload) ||
+            rose_close((int)descriptor) != 0) {
                 return 21;
         }
 
@@ -959,9 +942,8 @@ static int run_filesystem_test(void) {
                         large_buffer[index] =
                             (uint8_t)((position + index) * 37U + 11U);
                 }
-                if (descriptor < 0 ||
-                    rose_write((int)descriptor, large_buffer, transfer) !=
-                        (long)transfer) {
+                if (descriptor < 0 || rose_write((int)descriptor, large_buffer,
+                                                 transfer) != (long)transfer) {
                         return 42;
                 }
                 position += transfer;
@@ -994,8 +976,8 @@ static int run_filesystem_test(void) {
                 return 44;
         }
 
-        descriptor = rose_open("/tmp/state", USER_OPEN_WRITE |
-                                                 USER_OPEN_TRUNCATE);
+        descriptor =
+            rose_open("/tmp/state", USER_OPEN_WRITE | USER_OPEN_TRUNCATE);
         if (descriptor < 0 || rose_stat("/tmp/state", &status) != 0 ||
             status.size != 0U || rose_close((int)descriptor) != 0) {
                 return 45;
@@ -1046,8 +1028,7 @@ static int run_pipe_test(void) {
 
         if (rose_pipe((int *)kernel_address) != -USER_ERROR_BAD_ADDRESS ||
             rose_pipe(descriptors) != 0 || descriptors[0] != 3 ||
-            descriptors[1] != 4 ||
-            rose_fstat(descriptors[0], &status) != 0 ||
+            descriptors[1] != 4 || rose_fstat(descriptors[0], &status) != 0 ||
             status.type != USER_FILE_PIPE ||
             rose_lseek(descriptors[0], 0, USER_SEEK_SET) !=
                 -USER_ERROR_INVALID_ARGUMENT ||
@@ -1070,8 +1051,7 @@ static int run_pipe_test(void) {
         size_t received = 0U;
         while (received < 2048U) {
                 long streaming_count = rose_read(
-                    descriptors[0], streaming_buffer,
-                    sizeof(streaming_buffer));
+                    descriptors[0], streaming_buffer, sizeof(streaming_buffer));
                 if (streaming_count <= 0 ||
                     (size_t)streaming_count > 2048U - received) {
                         return 44;
@@ -1104,10 +1084,8 @@ static int run_pipe_test(void) {
                 return 47;
         }
 
-        if (rose_pipe(descriptors) != 0 ||
-            rose_close(descriptors[0]) != 0 ||
-            rose_write(descriptors[1], "x", 1U) !=
-                -USER_ERROR_BROKEN_PIPE ||
+        if (rose_pipe(descriptors) != 0 || rose_close(descriptors[0]) != 0 ||
+            rose_write(descriptors[1], "x", 1U) != -USER_ERROR_BROKEN_PIPE ||
             rose_close(descriptors[1]) != 0) {
                 return 48;
         }
@@ -1230,6 +1208,9 @@ int user_main(int argc, char **argv,
 
         case USER_PROGRAM_SIGNAL_EXEC_TEST:
                 return run_signal_exec_test();
+
+        case USER_PROGRAM_DESKTOP:
+                return rose_desktop_main(argc, argv);
 
         default:
                 return 2;

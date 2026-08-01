@@ -35,6 +35,9 @@
 #define USER_SYSCALL_GET_PROCESS_GROUP 29
 #define USER_SYSCALL_TERMINAL_SET_FOREGROUND_GROUP 30
 #define USER_SYSCALL_TERMINAL_GET_FOREGROUND_GROUP 31
+#define USER_SYSCALL_GRAPHICS_MAP 32
+#define USER_SYSCALL_GRAPHICS_FLUSH 33
+#define USER_SYSCALL_INPUT_READ 34
 
 #else
 
@@ -71,6 +74,9 @@ enum user_syscall_number {
         USER_SYSCALL_GET_PROCESS_GROUP = 29,
         USER_SYSCALL_TERMINAL_SET_FOREGROUND_GROUP = 30,
         USER_SYSCALL_TERMINAL_GET_FOREGROUND_GROUP = 31,
+        USER_SYSCALL_GRAPHICS_MAP = 32,
+        USER_SYSCALL_GRAPHICS_FLUSH = 33,
+        USER_SYSCALL_INPUT_READ = 34,
 };
 
 /* Stable negative error values returned in a0 by failed system calls. */
@@ -127,16 +133,13 @@ enum user_wait_options {
 };
 
 #define USER_WAIT_STATUS_EXITED(status) (((uint32_t)(status) & 0x7fU) == 0U)
-#define USER_WAIT_STATUS_EXIT_CODE(status) \
-        (((uint32_t)(status) >> 8U) & 0xffU)
-#define USER_WAIT_STATUS_SIGNALED(status) \
-        ((((uint32_t)(status) & 0x7fU) != 0U) && \
+#define USER_WAIT_STATUS_EXIT_CODE(status) (((uint32_t)(status) >> 8U) & 0xffU)
+#define USER_WAIT_STATUS_SIGNALED(status)                                      \
+        ((((uint32_t)(status) & 0x7fU) != 0U) &&                               \
          (((uint32_t)(status) & 0x7fU) != 0x7fU))
-#define USER_WAIT_STATUS_TERMINATION_SIGNAL(status) \
-        ((uint32_t)(status) & 0x7fU)
-#define USER_WAIT_STATUS_STOPPED(status) \
-        (((uint32_t)(status) & 0xffU) == 0x7fU)
-#define USER_WAIT_STATUS_STOP_SIGNAL(status) \
+#define USER_WAIT_STATUS_TERMINATION_SIGNAL(status) ((uint32_t)(status) & 0x7fU)
+#define USER_WAIT_STATUS_STOPPED(status) (((uint32_t)(status) & 0xffU) == 0x7fU)
+#define USER_WAIT_STATUS_STOP_SIGNAL(status)                                   \
         (((uint32_t)(status) >> 8U) & 0xffU)
 #define USER_WAIT_STATUS_CONTINUED(status) ((uint32_t)(status) == 0xffffU)
 
@@ -185,6 +188,39 @@ struct user_directory_entry {
         char name[USER_DIRECTORY_NAME_MAX];
 };
 
+enum user_graphics_pixel_format {
+        USER_GRAPHICS_PIXEL_XRGB8888 = 1,
+};
+
+struct user_graphics_info {
+        uintptr_t framebuffer;
+        uint64_t framebuffer_size;
+        uint32_t width;
+        uint32_t height;
+        uint32_t stride;
+        uint32_t pixel_format;
+};
+
+enum user_input_event_type {
+        USER_INPUT_EVENT_KEY = 1,
+        USER_INPUT_EVENT_POINTER = 2,
+};
+
+enum user_pointer_button {
+        USER_POINTER_BUTTON_LEFT = (1U << 0),
+        USER_POINTER_BUTTON_RIGHT = (1U << 1),
+        USER_POINTER_BUTTON_MIDDLE = (1U << 2),
+};
+
+struct user_input_event {
+        uint32_t type;
+        uint32_t code;
+        int32_t value;
+        int32_t x;
+        int32_t y;
+        uint32_t buttons;
+};
+
 enum user_standard_file_descriptor {
         USER_STDIN_FILENO = 0,
         USER_STDOUT_FILENO = 1,
@@ -216,6 +252,7 @@ enum user_program {
         USER_PROGRAM_RM,
         USER_PROGRAM_DESCRIPTOR_TEST,
         USER_PROGRAM_SIGNAL_EXEC_TEST,
+        USER_PROGRAM_DESKTOP,
 };
 
 #endif

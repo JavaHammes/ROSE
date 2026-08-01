@@ -314,6 +314,36 @@ rose_brk:
     ret
 .size rose_brk, . - rose_brk
 
+.section .text.rose_graphics_map,"ax",@progbits
+.align 2
+.globl rose_graphics_map
+.type rose_graphics_map, @function
+rose_graphics_map:
+    li a7, USER_SYSCALL_GRAPHICS_MAP
+    ecall
+    ret
+.size rose_graphics_map, . - rose_graphics_map
+
+.section .text.rose_graphics_flush,"ax",@progbits
+.align 2
+.globl rose_graphics_flush
+.type rose_graphics_flush, @function
+rose_graphics_flush:
+    li a7, USER_SYSCALL_GRAPHICS_FLUSH
+    ecall
+    ret
+.size rose_graphics_flush, . - rose_graphics_flush
+
+.section .text.rose_input_read,"ax",@progbits
+.align 2
+.globl rose_input_read
+.type rose_input_read, @function
+rose_input_read:
+    li a7, USER_SYSCALL_INPUT_READ
+    ecall
+    ret
+.size rose_input_read, . - rose_input_read
+
 .section .text.rose_exit,"ax",@progbits
 .align 2
 .globl rose_exit

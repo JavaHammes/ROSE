@@ -22,6 +22,16 @@ scheduling, and automated emulator tests.
   reclamation.
 - Validated ELF64 RISC-V loader with `PT_LOAD` support, BSS zeroing, overlapping
   segment handling, W^X enforcement, and complete unload ownership tracking.
+- Reusable modern VirtIO-MMIO transport shared by block, GPU, keyboard, and
+  tablet drivers. The 2D GPU driver discovers the scanout, creates an
+  XRGB8888-backed resource, and performs bounded dirty-rectangle transfers and
+  flushes. A graphical console mirrors `/dev/console` output while UART remains
+  available for diagnostics and headless automation.
+- A userspace graphics ABI maps the framebuffer into one owning process and
+  exposes validated flush and nonblocking input-event calls. `/bin/desktop` is
+  a small userspace compositor with a panel, movable window, status card, and
+  pointer. Screen/input ownership is reclaimed automatically on exit, fault,
+  or `execve`, restoring the graphical terminal.
 - Generic sector-device interface, modern VirtIO-MMIO block driver, and a
   sixteen-entry write-through cache for 1 KiB filesystem blocks.
 - Writable ext2 root filesystem containing `/sbin/init`, `/bin/sh`, programs,
@@ -129,6 +139,16 @@ make -j4
 make run
 ```
 
+For the graphical machine, launch QEMU with the GPU, keyboard, and tablet:
+
+```sh
+make run-gui
+```
+
+The shell is visible in both the QEMU window and the serial terminal. Run
+`desktop` to enter the userspace desktop; drag its title bar with the tablet
+and press `Q` or Escape to return to the shell.
+
 After `/sbin/init` launches `/bin/sh` and waits for it, the shell starts at
 `rose>`.
 Useful commands are:
@@ -150,6 +170,7 @@ Useful commands are:
 | `console-read` | Block a child until one byte arrives on standard input. |
 | `fs-test` | Exercise writable files, directories, stat, and seek. |
 | `pipe-test` | Exercise inherited descriptors and blocking anonymous pipes. |
+| `desktop` | Enter the graphical userspace desktop (`Q` or Escape returns). |
 | `env` | Show environment variables inherited by new programs. |
 | `setenv NAME VALUE` | Set an inherited environment variable. |
 | `unsetenv NAME` | Remove an inherited environment variable. |
@@ -178,6 +199,13 @@ discovery:
 make test-platform
 ```
 
+Boot the VirtIO GPU/input configuration and exercise the userspace mapping and
+flush path without opening a host window:
+
+```sh
+make test-graphics
+```
+
 Run static analysis and both emulator configurations:
 
 ```sh
@@ -195,7 +223,7 @@ The same clean verification runs automatically on pushes and pull requests.
 The local pre-commit configuration formats C sources, runs static analysis,
 and executes host-side tests for changes in `tests/` or `tools/`.
 
-The smoke test covers disk-root boot through `/sbin/init` into `/bin/sh`,
+The smoke tests cover disk-root boot through `/sbin/init` into `/bin/sh`,
 userspace line parsing and built-ins, `PATH` execution, VirtIO-backed ext2
 mutation, directory utilities, input/output redirection, multi-stage pipelines,
 user/kernel isolation, syscall validation, working-directory resolution,
@@ -205,7 +233,9 @@ isolation, caught/ignored/default signal delivery, signal wakeup of blocked
 processes, fork inheritance and exec reset of dispositions, blocking UART and
 pipe I/O, process-group signal delivery, stop/continue wait events, Ctrl-C and
 Ctrl-Z foreground handling, background commands, `jobs`/`fg`, child creation
-and waiting, memory reclamation, fallback-ramfs shell boot, and clean shutdown.
+and waiting, memory reclamation, fallback-ramfs shell boot, graphical transport
+discovery, userspace framebuffer mapping and flushing, automatic graphical
+console restoration, and clean shutdown.
 
 The host-side image tests additionally validate filesystem metadata, output
 determinism, atomic replacement, guest path constraints, and malformed tree

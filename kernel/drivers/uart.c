@@ -164,6 +164,15 @@ static bool uart_rx_buffer_push(char character) {
         return true;
 }
 
+void uart_receive_character(char character) {
+        if (user_process_handle_console_control(character)) {
+                return;
+        }
+        if (uart_rx_buffer_push(character)) {
+                (void)scheduler_wake_one(SCHEDULER_WAIT_UART_RX);
+        }
+}
+
 /*
  * Read one character from the UART receive ring buffer.
  *
@@ -350,19 +359,7 @@ void uart_handle_interrupt(void) {
          */
         while ((UART_REGISTERS[UART_LSR] & UART_LSR_DATA_READY) != 0U) {
                 char character = (char)UART_REGISTERS[UART_RBR];
-
-                if (user_process_handle_console_control(character)) {
-                        continue;
-                }
-
-                /*
-                 * Drop the character if the software buffer is full.
-                 *
-                 * Later, we may want to use a larger buffer.
-                 */
-                if (uart_rx_buffer_push(character)) {
-                        (void)scheduler_wake_one(SCHEDULER_WAIT_UART_RX);
-                }
+                uart_receive_character(character);
         }
 
         /* THRE is level-triggered. Disable it before waking writers so the

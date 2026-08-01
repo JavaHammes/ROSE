@@ -1,7 +1,6 @@
 #include <stdint.h>
 
 #include "panic.h"
-#include "platform.h"
 #include "plic.h"
 #include "timer.h"
 #include "trap.h"
@@ -69,24 +68,6 @@ static const char *exception_name(uint64_t code) {
         }
 }
 
-static void handle_external_interrupt(void) {
-        uint32_t interrupt_id = plic_claim();
-
-        if (interrupt_id == 0) {
-                /*
-                 * A notification can become stale before this hart claims
-                 * the interrupt, so claim returning zero is valid.
-                 */
-                return;
-        }
-
-        if (interrupt_id == platform_uart_interrupt()) {
-                uart_handle_interrupt();
-        }
-
-        plic_complete(interrupt_id);
-}
-
 /*
  * Handle an asynchronous supervisor-mode interrupt.
  */
@@ -101,7 +82,7 @@ static void handle_interrupt(struct trap_frame *frame, uint64_t code) {
                 panic_trap("Unhandled supervisor software interrupt", frame);
 
         case SCAUSE_SUPERVISOR_EXTERNAL:
-                handle_external_interrupt();
+                plic_dispatch();
                 return;
 
         default:

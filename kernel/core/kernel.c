@@ -1,5 +1,6 @@
 #include "block_device.h"
 #include "ext2.h"
+#include "graphics_console.h"
 #include "interrupt.h"
 #include "page_allocator.h"
 #include "panic.h"
@@ -13,6 +14,8 @@
 #include "user_process.h"
 #include "vfs.h"
 #include "virtio_block.h"
+#include "virtio_gpu.h"
+#include "virtio_input.h"
 #include "virtual_memory.h"
 
 void kernel_main(unsigned long hart_id, const void *dtb) {
@@ -25,7 +28,8 @@ void kernel_main(unsigned long hart_id, const void *dtb) {
         platform_init(dtb);
         trap_init();
 
-        /* Physical allocation must exist before Sv39 can allocate table pages. */
+        /* Physical allocation must exist before Sv39 can allocate table pages.
+         */
         page_allocator_init();
         page_allocator_self_test();
         virtual_memory_init();
@@ -33,8 +37,23 @@ void kernel_main(unsigned long hart_id, const void *dtb) {
         if (virtio_block_init()) {
                 (void)ext2_mount(block_device_primary());
         }
+        if (virtio_gpu_init()) {
+                uart_puts("ROSE graphics: ");
+                uart_put_uint64(virtio_gpu_width());
+                uart_putc('x');
+                uart_put_uint64(virtio_gpu_height());
+                uart_putc('\n');
+                graphics_console_init();
+        }
+        if (virtio_input_init()) {
+                uart_puts("ROSE input: VirtIO keyboard/tablet online\n");
+        }
 
         /* Configure the device-to-PLIC path before globally enabling traps. */
+        if (!plic_register_handler(platform_uart_interrupt(),
+                                   uart_handle_interrupt)) {
+                panic("Could not register UART interrupt");
+        }
         plic_init();
         uart_interrupts_enable();
 

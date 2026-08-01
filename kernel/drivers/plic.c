@@ -31,10 +31,11 @@
  * "virt" machine.
  */
 
+#include <stdbool.h>
 #include <stdint.h>
 
-#include "plic.h"
 #include "platform.h"
+#include "plic.h"
 
 /*
  * Base address of the Platform-Level Interrupt Controller on QEMU's
@@ -113,6 +114,11 @@
  */
 #define PLIC_THRESHOLD_OFFSET 0x0UL
 #define PLIC_CLAIM_COMPLETE_OFFSET 0x4UL
+
+enum { PLIC_HANDLER_COUNT = 128 };
+
+static plic_interrupt_handler handlers[PLIC_HANDLER_COUNT];
+static bool initialized;
 
 /*
  * Convert a physical MMIO address into a pointer to a 32-bit PLIC register.
@@ -233,6 +239,34 @@ void plic_complete(uint32_t interrupt_id) {
         *plic_register(address) = interrupt_id;
 }
 
+bool plic_register_handler(uint32_t interrupt_id,
+                           plic_interrupt_handler handler) {
+        if (interrupt_id == 0U || interrupt_id >= PLIC_HANDLER_COUNT ||
+            handler == NULL || handlers[interrupt_id] != NULL) {
+                return false;
+        }
+
+        handlers[interrupt_id] = handler;
+        if (initialized) {
+                plic_set_priority(interrupt_id, UINT32_C(1));
+                plic_enable(interrupt_id);
+        }
+        return true;
+}
+
+void plic_dispatch(void) {
+        uint32_t interrupt_id = plic_claim();
+
+        if (interrupt_id == 0U) {
+                return;
+        }
+        if (interrupt_id < PLIC_HANDLER_COUNT &&
+            handlers[interrupt_id] != NULL) {
+                handlers[interrupt_id]();
+        }
+        plic_complete(interrupt_id);
+}
+
 /*
  * Initialize the PLIC for the current single-hart supervisor-mode kernel.
  *
@@ -252,16 +286,12 @@ void plic_init(void) {
 
         *plic_register(threshold_address) = UINT32_C(0);
 
-        /*
-         * Give UART0 the lowest active priority.
-         *
-         * Priority zero would disable the source, so priority one is the
-         * smallest usable value.
-         */
-        plic_set_priority(platform_uart_interrupt(), UINT32_C(1));
-
-        /*
-         * Enable UART0 for hart 0's supervisor-mode PLIC context.
-         */
-        plic_enable(platform_uart_interrupt());
+        initialized = true;
+        for (uint32_t interrupt_id = 1U; interrupt_id < PLIC_HANDLER_COUNT;
+             interrupt_id++) {
+                if (handlers[interrupt_id] != NULL) {
+                        plic_set_priority(interrupt_id, UINT32_C(1));
+                        plic_enable(interrupt_id);
+                }
+        }
 }

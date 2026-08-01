@@ -72,6 +72,25 @@ class QemuSession:
         self.process.stdin.flush()
         return before_input + self.read_until(b"rose> ", timeout)
 
+    def graphical_keyboard_exit(self) -> str:
+        """Launch the desktop and exit it through the emulated keyboard."""
+        assert self.process.stdin is not None
+        self.process.stdin.write(b"desktop\n")
+        self.process.stdin.flush()
+        time.sleep(0.2)
+
+        # -nographic multiplexes the serial port and HMP monitor. Switching to
+        # HMP lets this test exercise VirtIO keyboard input instead of UART.
+        self.process.stdin.write(b"\x01c")
+        self.process.stdin.flush()
+        output = self.read_until(b"(qemu) ", 5.0)
+        self.process.stdin.write(b"sendkey q\n")
+        self.process.stdin.flush()
+        output += self.read_until(b"rose> ", 5.0)
+        self.process.stdin.write(b"\x01c")
+        self.process.stdin.flush()
+        return output
+
     def shutdown(self) -> None:
         """Exercise the guest exit command and require a successful QEMU exit."""
         assert self.process.stdin is not None
@@ -134,6 +153,8 @@ def main() -> int:
         os.environ.get("ROOT_IMAGE", repository / "kernel/build/root.ext2")
     )
     memory = os.environ.get("QEMU_MEMORY", "128M")
+    graphics = os.environ.get("QEMU_GRAPHICS") == "1"
+    graphics_only = os.environ.get("QEMU_GRAPHICS_ONLY") == "1"
     initial_free_counts = ext2_free_counts(root_image)
     base_command = [
         qemu,
@@ -157,6 +178,15 @@ def main() -> int:
         "-global",
         "virtio-mmio.force-legacy=false",
     ]
+    if graphics:
+        command += [
+            "-device",
+            "virtio-gpu-device",
+            "-device",
+            "virtio-keyboard-device",
+            "-device",
+            "virtio-tablet-device",
+        ]
 
     session = QemuSession(command)
     try:
@@ -166,6 +196,26 @@ def main() -> int:
             "ROSE init: writable disk root online",
             "ROSE userspace shell",
         )
+        if graphics:
+            require(
+                boot,
+                "ROSE graphics: 1024x768",
+                "ROSE input: VirtIO keyboard/tablet online",
+            )
+            require(
+                session.command("desktop --test", timeout=15.0),
+                "Graphics userspace test passed",
+            )
+            require(session.graphical_keyboard_exit(), "rose> ")
+
+        if graphics_only:
+            session.shutdown()
+            if ext2_free_counts(root_image) != initial_free_counts:
+                raise AssertionError(
+                    "graphics guest test leaked blocks or inodes"
+                )
+            print(f"QEMU graphics smoke test passed ({memory})")
+            return 0
 
         # The prompt, line editor, quote/backslash parser, and built-ins now run
         # in /bin/sh rather than supervisor mode.

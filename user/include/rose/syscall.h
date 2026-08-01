@@ -50,6 +50,13 @@ long rose_tcgetpgrp(int descriptor);
  * success returns the resulting break and failure returns a negative error. */
 long rose_brk(uintptr_t address);
 
+/* Claim the 2D scanout, publish its mapped framebuffer, flush changed pixels,
+ * and consume nonblocking keyboard/pointer events. */
+long rose_graphics_map(struct user_graphics_info *information);
+long rose_graphics_flush(uint32_t x, uint32_t y, uint32_t width,
+                         uint32_t height);
+long rose_input_read(struct user_input_event *event);
+
 /* Terminate the calling process or voluntarily give another process a turn. */
 _Noreturn void rose_exit(uint64_t status);
 void rose_yield(void);

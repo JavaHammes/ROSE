@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "graphics_console.h"
 #include "uart.h"
 #include "vfs.h"
 
@@ -10,9 +11,17 @@ static const struct vfs_node *fallback_root;
 static void *root_context;
 static const struct vfs_filesystem_operations *root_operations;
 
+static bool console_write_byte(char character) {
+        if (!uart_tx_submit(character)) {
+                return false;
+        }
+        graphics_console_putc(character);
+        return true;
+}
+
 static const struct vfs_character_device_operations console_operations = {
     .read_byte = uart_getc,
-    .write_byte = uart_tx_submit,
+    .write_byte = console_write_byte,
 };
 
 static void copy_bytes(void *destination, const void *source, size_t length) {
@@ -81,8 +90,7 @@ static const struct vfs_node *fallback_lookup(const char *path) {
                 while (cursor[length] != '\0' && cursor[length] != '/') {
                         length++;
                 }
-                if (length == 0U ||
-                    (length == 1U && segment[0] == '.') ||
+                if (length == 0U || (length == 1U && segment[0] == '.') ||
                     (length == 2U && segment[0] == '.' && segment[1] == '.') ||
                     node->type != VFS_NODE_DIRECTORY) {
                         return NULL;
@@ -131,8 +139,8 @@ int vfs_open(const char *path, uint32_t flags, struct vfs_file *file) {
                 return open_console(flags, file);
         }
         if (root_operations != NULL) {
-                int result = root_operations->open(root_context, path, flags,
-                                                   file);
+                int result =
+                    root_operations->open(root_context, path, flags, file);
                 if (result == 0) {
                         file->filesystem_context = root_context;
                         file->filesystem_operations = root_operations;
@@ -144,8 +152,8 @@ int vfs_open(const char *path, uint32_t flags, struct vfs_file *file) {
         if (node == NULL) {
                 return -VFS_ERROR_NO_ENTRY;
         }
-        if ((flags & (VFS_OPEN_WRITE | VFS_OPEN_CREATE |
-                      VFS_OPEN_TRUNCATE)) != 0U) {
+        if ((flags & (VFS_OPEN_WRITE | VFS_OPEN_CREATE | VFS_OPEN_TRUNCATE)) !=
+            0U) {
                 return -VFS_ERROR_READ_ONLY;
         }
         if (((flags & VFS_OPEN_DIRECTORY) != 0U) !=
@@ -199,8 +207,7 @@ long vfs_write(struct vfs_file *file, uint64_t offset, const void *buffer,
                 return -VFS_ERROR_READ_ONLY;
         }
         return file->filesystem_operations->write(file->filesystem_context,
-                                                  file, offset, buffer,
-                                                  length);
+                                                  file, offset, buffer, length);
 }
 
 int vfs_stat_file(struct vfs_file *file, struct vfs_stat *status) {
@@ -211,9 +218,8 @@ int vfs_stat_file(struct vfs_file *file, struct vfs_stat *status) {
                 return file->filesystem_operations->stat(
                     file->filesystem_context, file, status);
         }
-        *status = (struct vfs_stat){.inode = file->inode,
-                                    .size = file->size,
-                                    .type = file->type};
+        *status = (struct vfs_stat){
+            .inode = file->inode, .size = file->size, .type = file->type};
         return 0;
 }
 
@@ -221,8 +227,8 @@ int vfs_stat_path(const char *path, struct vfs_stat *status) {
         struct vfs_file file;
         int result = vfs_open(path, VFS_OPEN_READ, &file);
         if (result == -VFS_ERROR_IS_DIRECTORY) {
-                result = vfs_open(path, VFS_OPEN_READ | VFS_OPEN_DIRECTORY,
-                                  &file);
+                result =
+                    vfs_open(path, VFS_OPEN_READ | VFS_OPEN_DIRECTORY, &file);
         }
         return result == 0 ? vfs_stat_file(&file, status) : result;
 }
@@ -257,7 +263,8 @@ long vfs_read_directory(struct vfs_file *directory, uint64_t offset,
 }
 
 int vfs_make_directory(const char *path) {
-        if (root_operations == NULL || root_operations->make_directory == NULL) {
+        if (root_operations == NULL ||
+            root_operations->make_directory == NULL) {
                 return -VFS_ERROR_READ_ONLY;
         }
         return root_operations->make_directory(root_context, path);

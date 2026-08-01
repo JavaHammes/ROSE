@@ -16,6 +16,8 @@
 #include <stdint.h>
 
 #include "elf_loader.h"
+#include "graphics_console.h"
+#include "input.h"
 #include "interrupt.h"
 #include "page_allocator.h"
 #include "panic.h"
@@ -26,6 +28,7 @@
 #include "user_abi.h"
 #include "user_process.h"
 #include "vfs.h"
+#include "virtio_gpu.h"
 #include "virtual_memory.h"
 
 enum {
@@ -82,6 +85,7 @@ _Static_assert((uint32_t)USER_OPEN_READ == (uint32_t)VFS_OPEN_READ &&
 #define USER_STACK_GUARD_ADDRESS UINT64_C(0x007ff000)
 #define USER_STACK_ADDRESS UINT64_C(0x00800000)
 #define USER_STACK_TOP (USER_STACK_ADDRESS + PAGE_SIZE)
+#define USER_GRAPHICS_ADDRESS UINT64_C(0x01000000)
 
 extern char text_start[];
 
@@ -187,6 +191,7 @@ static struct process_open_file open_file_table[PROCESS_OPEN_FILE_LIMIT];
 static struct process *active_process;
 static struct process *uart_write_owner;
 static uint64_t next_pid = 1U;
+static uint64_t graphics_owner_pid;
 static uint64_t terminal_foreground_process_group;
 static uint64_t scheduler_preemptions;
 static uint64_t scheduler_context_switches;
@@ -204,6 +209,16 @@ static void bytes_zero(void *destination, size_t size) {
         for (size_t index = 0U; index < size; index++) {
                 bytes[index] = 0U;
         }
+}
+
+static void graphics_release_if_owned(uint64_t pid) {
+        if (pid == 0U || graphics_owner_pid != pid) {
+                return;
+        }
+        graphics_owner_pid = 0U;
+        input_event_clear();
+        input_set_console_captured(false);
+        graphics_console_init();
 }
 
 static struct process_pipe *process_pipe_allocate(void) {
@@ -286,9 +301,8 @@ static struct process_open_file *process_open_file_allocate(void) {
         return NULL;
 }
 
-static void process_descriptor_install(
-    struct process_descriptor *descriptor,
-    struct process_open_file *open_file) {
+static void process_descriptor_install(struct process_descriptor *descriptor,
+                                       struct process_open_file *open_file) {
         if (descriptor->open_file != NULL || open_file == NULL ||
             !open_file->used ||
             open_file->references >= PROCESS_OPEN_FILE_LIMIT) {
@@ -330,8 +344,8 @@ static bool process_descriptors_initialize(struct process *process) {
                 return false;
         }
 
-        for (size_t descriptor = 0U;
-             descriptor <= USER_STDERR_FILENO; descriptor++) {
+        for (size_t descriptor = 0U; descriptor <= USER_STDERR_FILENO;
+             descriptor++) {
                 struct process_open_file *open_file =
                     process_open_file_allocate();
 
@@ -366,8 +380,7 @@ static bool process_descriptors_clone(struct process *destination,
                 }
 
                 process_descriptor_install(
-                    &destination->descriptors[descriptor],
-                    source_open_file);
+                    &destination->descriptors[descriptor], source_open_file);
         }
 
         return true;
@@ -423,8 +436,7 @@ static void process_signals_reset_on_exec(struct process *process) {
         }
 
         process->signal_active = false;
-        bytes_zero(&process->signal_context,
-                   sizeof(process->signal_context));
+        bytes_zero(&process->signal_context, sizeof(process->signal_context));
 }
 
 /* Assert an expected user mapping during process construction. */
@@ -451,8 +463,8 @@ static uintptr_t align_up_to_page(uintptr_t address) {
 
 /* The heap starts on the first page not owned by the ELF loader. Keeping the
  * two ownership regions disjoint makes shrinking and image teardown exact. */
-static uintptr_t process_heap_start(
-    const struct elf_loaded_image *loaded_image) {
+static uintptr_t
+process_heap_start(const struct elf_loaded_image *loaded_image) {
         uintptr_t heap_start = USER_ADDRESS_MIN;
 
         for (size_t index = 0U; index < loaded_image->page_count; index++) {
@@ -471,8 +483,7 @@ static uintptr_t process_heap_start(
  * table can never retain a translation to returned memory. */
 static void process_free_heap_pages(struct page_table *root, uintptr_t start,
                                     uintptr_t end) {
-        for (uintptr_t address = start; address < end;
-             address += PAGE_SIZE) {
+        for (uintptr_t address = start; address < end; address += PAGE_SIZE) {
                 uintptr_t physical_address;
                 uint64_t flags;
 
@@ -490,8 +501,7 @@ static void process_free_heap_pages(struct page_table *root, uintptr_t start,
         }
 }
 
-static void process_release_heap(struct page_table *root,
-                                 uintptr_t heap_start,
+static void process_release_heap(struct page_table *root, uintptr_t heap_start,
                                  uintptr_t *heap_break) {
         if (root == NULL || heap_break == NULL) {
                 return;
@@ -505,21 +515,20 @@ static void process_release_heap(struct page_table *root,
 
 /* Release one user image without touching the process identity, descriptors,
  * or supervisor trap stack. This is shared by exit and execve rollback. */
-static void process_release_image(
-    struct page_table **address_space, struct elf_loaded_image *loaded_image,
-    void **stack_page, uintptr_t *heap_start, uintptr_t *heap_break) {
+static void process_release_image(struct page_table **address_space,
+                                  struct elf_loaded_image *loaded_image,
+                                  void **stack_page, uintptr_t *heap_start,
+                                  uintptr_t *heap_break) {
         if (*address_space != NULL) {
                 process_release_heap(*address_space, *heap_start, heap_break);
 
                 if (*stack_page != NULL) {
                         uintptr_t stack_physical_address;
 
-                        if (page_table_translate(*address_space,
-                                                 USER_STACK_ADDRESS,
-                                                 &stack_physical_address,
-                                                 NULL) &&
-                            (stack_physical_address !=
-                                 (uintptr_t)*stack_page ||
+                        if (page_table_translate(
+                                *address_space, USER_STACK_ADDRESS,
+                                &stack_physical_address, NULL) &&
+                            (stack_physical_address != (uintptr_t)*stack_page ||
                              !page_table_unmap(*address_space,
                                                USER_STACK_ADDRESS))) {
                                 panic("User stack ownership mismatch");
@@ -556,7 +565,8 @@ static void process_release_resources(struct process *process) {
 }
 
 /* Exited processes are zombies until reaped and therefore do not count as free
- * slots. This makes lifecycle state visible instead of silently discarding it. */
+ * slots. This makes lifecycle state visible instead of silently discarding it.
+ */
 static struct process *process_find_available_slot(void) {
         for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
                 struct process *process = &process_table[index];
@@ -601,8 +611,7 @@ static bool stack_copy_string(void *stack_page, uintptr_t *cursor,
         }
 
         *cursor -= length;
-        char *destination =
-            (char *)stack_page + (*cursor - USER_STACK_ADDRESS);
+        char *destination = (char *)stack_page + (*cursor - USER_STACK_ADDRESS);
 
         for (size_t index = 0U; index < length; index++) {
                 destination[index] = text[index];
@@ -621,9 +630,10 @@ static bool stack_copy_string(void *stack_page, uintptr_t *cursor,
  * 16-byte aligned for the RISC-V C ABI. A missing startup description creates
  * the usual single argv[0] entry from the executable path.
  */
-static bool process_build_initial_stack(
-    void *stack_page, struct trap_frame *context, const char *path,
-    const struct user_process_startup *startup) {
+static bool
+process_build_initial_stack(void *stack_page, struct trap_frame *context,
+                            const char *path,
+                            const struct user_process_startup *startup) {
         const char *default_arguments[] = {path};
         size_t argument_count = 1U;
         const char *const *arguments = default_arguments;
@@ -681,8 +691,8 @@ static bool process_build_initial_stack(
                 return false;
         }
 
-        uint64_t *words = (uint64_t *)((uint8_t *)stack_page +
-                                       stack_pointer - USER_STACK_ADDRESS);
+        uint64_t *words = (uint64_t *)((uint8_t *)stack_page + stack_pointer -
+                                       USER_STACK_ADDRESS);
         size_t word = 0U;
 
         words[word++] = argument_count;
@@ -700,8 +710,7 @@ static bool process_build_initial_stack(
         context->sp = stack_pointer;
         context->a0 = argument_count;
         context->a1 = stack_pointer + sizeof(uint64_t);
-        context->a2 = context->a1 +
-                      (argument_count + 1U) * sizeof(uint64_t);
+        context->a2 = context->a1 + (argument_count + 1U) * sizeof(uint64_t);
         return true;
 }
 
@@ -723,7 +732,8 @@ static void process_verify_address_space(const struct page_table *root,
                             VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE,
                             VM_PAGE_EXECUTE);
 
-        /* Kernel text is mapped in every process but remains supervisor-only. */
+        /* Kernel text is mapped in every process but remains supervisor-only.
+         */
         uintptr_t kernel_text_physical;
         uint64_t kernel_text_flags;
 
@@ -774,15 +784,16 @@ static uint64_t process_create(struct process *process, const char *path,
                                      ? process->pid
                                      : descriptor_source->process_group;
         process->state = PROCESS_READY;
-        /* SPIE causes sret to enable supervisor interrupts while U-mode runs. */
+        /* SPIE causes sret to enable supervisor interrupts while U-mode runs.
+         */
         process->context.sstatus = SSTATUS_SPIE;
         process->exit_status = UINT64_MAX;
         process->current_directory[0] = '/';
         process->current_directory[1] = '\0';
-        bool descriptors_ready = descriptor_source == NULL
-                                     ? process_descriptors_initialize(process)
-                                     : process_descriptors_clone(
-                                           process, descriptor_source);
+        bool descriptors_ready =
+            descriptor_source == NULL
+                ? process_descriptors_initialize(process)
+                : process_descriptors_clone(process, descriptor_source);
         if (!descriptors_ready) {
                 panic("Initial process descriptors are unavailable");
         }
@@ -808,13 +819,12 @@ static uint64_t process_create(struct process *process, const char *path,
 
         struct page_table *root = process->address_space;
 
-        if (!process_build_initial_stack(process->stack_page,
-                                         &process->context, path, startup)) {
+        if (!process_build_initial_stack(process->stack_page, &process->context,
+                                         path, startup)) {
                 process_release_resources(process);
                 process->state = PROCESS_EXITED;
                 process->exit_status = 1U;
-                return (uint64_t)-(int64_t)
-                    USER_ERROR_ARGUMENT_LIST_TOO_LONG;
+                return (uint64_t)-(int64_t)USER_ERROR_ARGUMENT_LIST_TOO_LONG;
         }
         if (!page_table_map(root, USER_STACK_ADDRESS,
                             (uintptr_t)process->stack_page,
@@ -845,8 +855,7 @@ static void page_copy(void *destination, const void *source) {
         uint64_t *destination_words = destination;
         const uint64_t *source_words = source;
 
-        for (size_t index = 0U; index < PAGE_SIZE / sizeof(uint64_t);
-             index++) {
+        for (size_t index = 0U; index < PAGE_SIZE / sizeof(uint64_t); index++) {
                 destination_words[index] = source_words[index];
         }
 }
@@ -877,10 +886,9 @@ static bool process_fork_loaded_image(struct process *child,
                 destination_page->physical_page = physical_page;
                 destination_page->flags = source_page->flags;
 
-                if (!page_table_map(child->address_space,
-                                    destination_page->virtual_address,
-                                    (uintptr_t)physical_page,
-                                    destination_page->flags)) {
+                if (!page_table_map(
+                        child->address_space, destination_page->virtual_address,
+                        (uintptr_t)physical_page, destination_page->flags)) {
                         return false;
                 }
         }
@@ -957,8 +965,7 @@ static uint64_t syscall_fork(const struct trap_frame *frame) {
                                 &parent->signal_context);
         }
 
-        size_t directory_length =
-            string_length(parent->current_directory) + 1U;
+        size_t directory_length = string_length(parent->current_directory) + 1U;
         for (size_t index = 0U; index < directory_length; index++) {
                 child->current_directory[index] =
                     parent->current_directory[index];
@@ -983,8 +990,7 @@ static uint64_t syscall_fork(const struct trap_frame *frame) {
         }
 
         process_descriptors_fork(child, parent);
-        process_verify_address_space(child->address_space,
-                                     child->stack_page);
+        process_verify_address_space(child->address_space, child->stack_page);
 
         child->pid = next_pid;
         next_pid++;
@@ -1095,9 +1101,7 @@ static bool signal_number_is_valid(int64_t signal) {
         return signal > 0 && signal <= USER_SIGNAL_MAX;
 }
 
-static uint64_t signal_bit(uint32_t signal) {
-        return UINT64_C(1) << signal;
-}
+static uint64_t signal_bit(uint32_t signal) { return UINT64_C(1) << signal; }
 
 static struct process *process_find_pid(uint64_t pid) {
         for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
@@ -1152,14 +1156,12 @@ static void process_queue_signal(struct process *target, uint32_t signal) {
                         (void)scheduler_wake_all(SCHEDULER_WAIT_CHILD);
                 }
         } else if (process_signal_stops_by_default(signal)) {
-                target->pending_signals &=
-                    ~signal_bit(USER_SIGNAL_CONTINUE);
+                target->pending_signals &= ~signal_bit(USER_SIGNAL_CONTINUE);
         }
 
         target->pending_signals |= signal_bit(signal);
         if (target->state == PROCESS_BLOCKED ||
-            (target->state == PROCESS_STOPPED &&
-             signal == USER_SIGNAL_KILL)) {
+            (target->state == PROCESS_STOPPED && signal == USER_SIGNAL_KILL)) {
                 target->state = PROCESS_READY;
                 target->wait_channel = SCHEDULER_WAIT_NONE;
         }
@@ -1173,14 +1175,14 @@ static bool process_has_deliverable_signal(const struct process *process) {
                 return true;
         }
 
-        return (process->pending_signals &
-                (signal_bit(USER_SIGNAL_KILL) |
-                 signal_bit(USER_SIGNAL_STOP))) != 0U;
+        return (process->pending_signals & (signal_bit(USER_SIGNAL_KILL) |
+                                            signal_bit(USER_SIGNAL_STOP))) !=
+               0U;
 }
 
-static uint64_t syscall_signal_action(
-    int64_t signal, uintptr_t user_action, uintptr_t user_old_action,
-    uintptr_t user_restorer) {
+static uint64_t syscall_signal_action(int64_t signal, uintptr_t user_action,
+                                      uintptr_t user_old_action,
+                                      uintptr_t user_restorer) {
         if (!signal_number_is_valid(signal)) {
                 return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
         }
@@ -1189,16 +1191,14 @@ static uint64_t syscall_signal_action(
         if (user_action != 0U) {
                 if (!user_range_is_valid(user_action, sizeof(new_action),
                                          VM_PAGE_READ)) {
-                        return (uint64_t)-(int64_t)
-                            USER_ERROR_BAD_ADDRESS;
+                        return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
                 }
                 user_copy_from((uint8_t *)&new_action, user_action,
                                sizeof(new_action));
 
-                if (signal == USER_SIGNAL_KILL ||
-                    signal == USER_SIGNAL_STOP || new_action.flags != 0U) {
-                        return (uint64_t)-(int64_t)
-                            USER_ERROR_INVALID_ARGUMENT;
+                if (signal == USER_SIGNAL_KILL || signal == USER_SIGNAL_STOP ||
+                    new_action.flags != 0U) {
+                        return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
                 }
                 if (new_action.handler != USER_SIGNAL_DEFAULT &&
                     new_action.handler != USER_SIGNAL_IGNORE &&
@@ -1206,8 +1206,7 @@ static uint64_t syscall_signal_action(
                                           VM_PAGE_EXECUTE) ||
                      !user_range_is_valid(user_restorer, 1U,
                                           VM_PAGE_EXECUTE))) {
-                        return (uint64_t)-(int64_t)
-                            USER_ERROR_BAD_ADDRESS;
+                        return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
                 }
         }
         if (user_old_action != 0U &&
@@ -1229,9 +1228,9 @@ static uint64_t syscall_signal_action(
         }
         if (user_action != 0U) {
                 disposition->handler = new_action.handler;
-                disposition->restorer =
-                    new_action.handler > USER_SIGNAL_IGNORE ? user_restorer
-                                                            : 0U;
+                disposition->restorer = new_action.handler > USER_SIGNAL_IGNORE
+                                            ? user_restorer
+                                            : 0U;
                 if (new_action.handler == USER_SIGNAL_IGNORE) {
                         active_process->pending_signals &=
                             ~signal_bit((uint32_t)signal);
@@ -1247,9 +1246,9 @@ static uint64_t syscall_kill(int64_t pid, int64_t signal) {
         }
 
         bool matched = false;
-        uint64_t selected_group = pid == 0
-                                      ? active_process->process_group
-                                      : pid < -1 ? (uint64_t)-pid : 0U;
+        uint64_t selected_group = pid == 0   ? active_process->process_group
+                                  : pid < -1 ? (uint64_t)-pid
+                                             : 0U;
 
         for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
                 struct process *target = &process_table[index];
@@ -1276,19 +1275,16 @@ static uint64_t syscall_kill(int64_t pid, int64_t signal) {
                 }
         }
 
-        return matched ? 0U
-                       : (uint64_t)-(int64_t)USER_ERROR_NO_PROCESS;
+        return matched ? 0U : (uint64_t)-(int64_t)USER_ERROR_NO_PROCESS;
 }
 
-static uint64_t syscall_set_process_group(int64_t pid,
-                                          int64_t process_group) {
+static uint64_t syscall_set_process_group(int64_t pid, int64_t process_group) {
         if (pid < 0 || process_group < 0) {
                 return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
         }
 
-        struct process *target = pid == 0
-                                     ? active_process
-                                     : process_find_pid((uint64_t)pid);
+        struct process *target =
+            pid == 0 ? active_process : process_find_pid((uint64_t)pid);
         if (target == NULL) {
                 return (uint64_t)-(int64_t)USER_ERROR_NO_PROCESS;
         }
@@ -1297,9 +1293,8 @@ static uint64_t syscall_set_process_group(int64_t pid,
                 return (uint64_t)-(int64_t)USER_ERROR_PERMISSION;
         }
 
-        uint64_t requested_group = process_group == 0
-                                       ? target->pid
-                                       : (uint64_t)process_group;
+        uint64_t requested_group =
+            process_group == 0 ? target->pid : (uint64_t)process_group;
         if (requested_group != target->pid &&
             !process_group_exists(requested_group)) {
                 return (uint64_t)-(int64_t)USER_ERROR_PERMISSION;
@@ -1321,8 +1316,8 @@ static bool process_descriptor_is_console(uint64_t descriptor) {
                open_file->file.device == VFS_DEVICE_CONSOLE;
 }
 
-static uint64_t syscall_terminal_set_foreground_group(
-    uint64_t descriptor, int64_t process_group) {
+static uint64_t syscall_terminal_set_foreground_group(uint64_t descriptor,
+                                                      int64_t process_group) {
         if (!process_descriptor_is_console(descriptor)) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
         }
@@ -1393,8 +1388,7 @@ static uint64_t user_copy_raw_path(uintptr_t user_path,
                 uintptr_t address;
 
                 if (user_path > UINTPTR_MAX - index ||
-                    !user_range_is_valid(user_path + index, 1U,
-                                         VM_PAGE_READ) ||
+                    !user_range_is_valid(user_path + index, 1U, VM_PAGE_READ) ||
                     !page_table_translate(active_process->address_space,
                                           user_path + index, &address, NULL)) {
                         return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
@@ -1454,8 +1448,7 @@ static uint64_t process_resolve_path(const char *path,
                 }
                 if (segment_length == 2U && segment[0] == '.' &&
                     segment[1] == '.') {
-                        while (length > 1U &&
-                               resolved[length - 1U] != '/') {
+                        while (length > 1U && resolved[length - 1U] != '/') {
                                 length--;
                         }
                         if (length > 1U) {
@@ -1466,10 +1459,9 @@ static uint64_t process_resolve_path(const char *path,
 
                 size_t separator_length = length == 1U ? 0U : 1U;
                 if (length + separator_length >= USER_PATH_MAX ||
-                    segment_length > USER_PATH_MAX - length -
-                                         separator_length - 1U) {
-                        return (uint64_t)-(int64_t)
-                            USER_ERROR_NAME_TOO_LONG;
+                    segment_length >
+                        USER_PATH_MAX - length - separator_length - 1U) {
+                        return (uint64_t)-(int64_t)USER_ERROR_NAME_TOO_LONG;
                 }
                 if (separator_length != 0U) {
                         resolved[length] = '/';
@@ -1485,8 +1477,7 @@ static uint64_t process_resolve_path(const char *path,
         return 0U;
 }
 
-static uint64_t user_copy_path(uintptr_t user_path,
-                               char path[USER_PATH_MAX]) {
+static uint64_t user_copy_path(uintptr_t user_path, char path[USER_PATH_MAX]) {
         char raw_path[USER_PATH_MAX];
         uint64_t result = user_copy_raw_path(user_path, raw_path);
 
@@ -1506,8 +1497,8 @@ static uint64_t user_copy_startup_string(uintptr_t user_string,
                     !user_range_is_valid(user_string + source_offset, 1U,
                                          VM_PAGE_READ) ||
                     !page_table_translate(active_process->address_space,
-                                          user_string + source_offset,
-                                          &address, NULL)) {
+                                          user_string + source_offset, &address,
+                                          NULL)) {
                         return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
                 }
 
@@ -1527,12 +1518,10 @@ static uint64_t user_copy_startup_string(uintptr_t user_string,
 /* Copy a null-terminated argv or envp array without directly dereferencing
  * either its user pointers or strings. The slot after the fixed limit is read
  * only to distinguish a valid terminator from E2BIG. */
-static uint64_t user_copy_startup_vector(uintptr_t user_vector,
-                                         const char **destination,
-                                         size_t destination_limit,
-                                         bool require_entry,
-                                         size_t *entry_count,
-                                         size_t *buffer_offset) {
+static uint64_t
+user_copy_startup_vector(uintptr_t user_vector, const char **destination,
+                         size_t destination_limit, bool require_entry,
+                         size_t *entry_count, size_t *buffer_offset) {
         for (size_t index = 0U; index <= destination_limit; index++) {
                 size_t pointer_offset = index * sizeof(uintptr_t);
                 uintptr_t user_string;
@@ -1549,15 +1538,15 @@ static uint64_t user_copy_startup_vector(uintptr_t user_vector,
 
                 if (user_string == 0U) {
                         if (require_entry && index == 0U) {
-                                return (uint64_t)-(int64_t)
-                                    USER_ERROR_INVALID_ARGUMENT;
+                                return (uint64_t)-(
+                                    int64_t)USER_ERROR_INVALID_ARGUMENT;
                         }
                         *entry_count = index;
                         return 0U;
                 }
                 if (index == destination_limit) {
-                        return (uint64_t)-(int64_t)
-                            USER_ERROR_ARGUMENT_LIST_TOO_LONG;
+                        return (uint64_t)-(
+                            int64_t)USER_ERROR_ARGUMENT_LIST_TOO_LONG;
                 }
 
                 destination[index] = &startup_string_buffer[*buffer_offset];
@@ -1573,20 +1562,19 @@ static uint64_t user_copy_startup_vector(uintptr_t user_vector,
 }
 
 static void process_release_replacement(void) {
-        process_release_image(&exec_replacement.address_space,
-                              &exec_replacement.loaded_image,
-                              &exec_replacement.stack_page,
-                              &exec_replacement.heap_start,
-                              &exec_replacement.heap_break);
-        bytes_zero(&exec_replacement.context,
-                   sizeof(exec_replacement.context));
+        process_release_image(
+            &exec_replacement.address_space, &exec_replacement.loaded_image,
+            &exec_replacement.stack_page, &exec_replacement.heap_start,
+            &exec_replacement.heap_break);
+        bytes_zero(&exec_replacement.context, sizeof(exec_replacement.context));
 }
 
 /* Read and fully construct a replacement without modifying the running image.
  * Every failure releases only the candidate, leaving execve able to return to
  * its caller with registers, mappings, and descriptors unchanged. */
-static uint64_t process_prepare_replacement(
-    const char *path, const struct user_process_startup *startup) {
+static uint64_t
+process_prepare_replacement(const char *path,
+                            const struct user_process_startup *startup) {
         struct vfs_file executable;
         int open_result = vfs_open(path, VFS_OPEN_READ, &executable);
 
@@ -1615,8 +1603,7 @@ static uint64_t process_prepare_replacement(
 
         bytes_zero(&exec_replacement, sizeof(exec_replacement));
         exec_replacement.context.sstatus = SSTATUS_SPIE;
-        exec_replacement.address_space =
-            virtual_memory_create_address_space();
+        exec_replacement.address_space = virtual_memory_create_address_space();
         exec_replacement.stack_page = page_alloc();
 
         if (exec_replacement.address_space == NULL ||
@@ -1631,8 +1618,7 @@ static uint64_t process_prepare_replacement(
                                          &exec_replacement.context, path,
                                          startup)) {
                 process_release_replacement();
-                return (uint64_t)-(int64_t)
-                    USER_ERROR_ARGUMENT_LIST_TOO_LONG;
+                return (uint64_t)-(int64_t)USER_ERROR_ARGUMENT_LIST_TOO_LONG;
         }
         if (!page_table_map(root, USER_STACK_ADDRESS,
                             (uintptr_t)exec_replacement.stack_page,
@@ -1640,9 +1626,8 @@ static uint64_t process_prepare_replacement(
                 process_release_replacement();
                 return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
         }
-        if (!elf_load_image(root, executable_buffer,
-                            (size_t)executable.size, USER_ADDRESS_MIN,
-                            USER_STACK_GUARD_ADDRESS,
+        if (!elf_load_image(root, executable_buffer, (size_t)executable.size,
+                            USER_ADDRESS_MIN, USER_STACK_GUARD_ADDRESS,
                             &exec_replacement.loaded_image)) {
                 process_release_replacement();
                 return (uint64_t)-(int64_t)USER_ERROR_EXEC_FORMAT;
@@ -1678,17 +1663,16 @@ static void loaded_image_move(struct elf_loaded_image *destination,
  * descriptors, PID, scheduling state, and the current supervisor trap stack
  * intentionally remain properties of the same process. */
 static void process_commit_replacement(struct trap_frame *frame) {
-        struct page_table *new_address_space =
-            exec_replacement.address_space;
+        struct page_table *new_address_space = exec_replacement.address_space;
         void *new_stack_page = exec_replacement.stack_page;
         struct page_table *old_address_space = active_process->address_space;
         void *old_stack_page = active_process->stack_page;
         uintptr_t old_heap_start = active_process->heap_start;
         uintptr_t old_heap_break = active_process->heap_break;
 
+        graphics_release_if_owned(active_process->pid);
         page_table_activate(new_address_space);
-        process_release_image(&old_address_space,
-                              &active_process->loaded_image,
+        process_release_image(&old_address_space, &active_process->loaded_image,
                               &old_stack_page, &old_heap_start,
                               &old_heap_break);
 
@@ -1703,11 +1687,9 @@ static void process_commit_replacement(struct trap_frame *frame) {
         loaded_image_move(&active_process->loaded_image,
                           &exec_replacement.loaded_image);
 
-        trap_frame_copy(&active_process->context,
-                        &exec_replacement.context);
+        trap_frame_copy(&active_process->context, &exec_replacement.context);
         trap_frame_copy(frame, &exec_replacement.context);
-        bytes_zero(&exec_replacement.context,
-                   sizeof(exec_replacement.context));
+        bytes_zero(&exec_replacement.context, sizeof(exec_replacement.context));
         process_signals_reset_on_exec(active_process);
 }
 
@@ -1796,8 +1778,8 @@ static uint64_t syscall_spawn(uintptr_t user_path, uintptr_t user_arguments,
         };
         uint64_t parent_pid = active_process->pid;
 
-        result = process_create(child, path, &startup, parent_pid,
-                                active_process);
+        result =
+            process_create(child, path, &startup, parent_pid, active_process);
         if (result != 0U) {
                 bytes_zero(child, sizeof(*child));
                 return result;
@@ -1827,8 +1809,7 @@ static bool process_is_waitable_child(const struct process *process,
                 return true;
         }
         if (requested_pid == 0) {
-                return process->process_group ==
-                       active_process->process_group;
+                return process->process_group == active_process->process_group;
         }
 
         return requested_pid != INT64_MIN &&
@@ -1836,17 +1817,16 @@ static bool process_is_waitable_child(const struct process *process,
 }
 
 /* Leave sepc at ECALL while blocking. A child exit wakes the parent, which
- * re-enters this function and atomically consumes the retained zombie status. */
+ * re-enters this function and atomically consumes the retained zombie status.
+ */
 static void syscall_waitpid(struct trap_frame *frame, int64_t requested_pid,
                             uintptr_t user_status, uint32_t options) {
-        const uint32_t supported_options =
-            (uint32_t)USER_WAIT_NO_HANG |
-            (uint32_t)USER_WAIT_UNTRACED |
-            (uint32_t)USER_WAIT_CONTINUED;
+        const uint32_t supported_options = (uint32_t)USER_WAIT_NO_HANG |
+                                           (uint32_t)USER_WAIT_UNTRACED |
+                                           (uint32_t)USER_WAIT_CONTINUED;
         if ((options & ~supported_options) != 0U ||
             requested_pid == INT64_MIN) {
-                frame->a0 =
-                    (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+                frame->a0 = (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
                 frame->sepc += 4U;
                 return;
         }
@@ -1862,19 +1842,17 @@ static void syscall_waitpid(struct trap_frame *frame, int64_t requested_pid,
 
                 bool exited = child->state == PROCESS_EXITED;
                 bool stopped = child->stop_event &&
-                               (options &
-                                (uint32_t)USER_WAIT_UNTRACED) != 0U;
-                bool continued = child->continued_event &&
-                                 (options &
-                                  (uint32_t)USER_WAIT_CONTINUED) != 0U;
+                               (options & (uint32_t)USER_WAIT_UNTRACED) != 0U;
+                bool continued =
+                    child->continued_event &&
+                    (options & (uint32_t)USER_WAIT_CONTINUED) != 0U;
                 if (!exited && !stopped && !continued) {
                         continue;
                 }
                 if (user_status != 0U &&
                     !user_range_is_valid(user_status, sizeof(int),
                                          VM_PAGE_WRITE)) {
-                        frame->a0 =
-                            (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+                        frame->a0 = (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
                         frame->sepc += 4U;
                         return;
                 }
@@ -1882,23 +1860,20 @@ static void syscall_waitpid(struct trap_frame *frame, int64_t requested_pid,
                 uint64_t child_pid = child->pid;
                 int wait_status;
                 if (exited) {
-                        wait_status = child->termination_signal != 0U
-                                          ? (int)(child->termination_signal &
-                                                  0x7fU)
-                                          : (int)((child->exit_status &
-                                                   UINT64_C(0xff))
-                                                  << 8U);
+                        wait_status =
+                            child->termination_signal != 0U
+                                ? (int)(child->termination_signal & 0x7fU)
+                                : (int)((child->exit_status & UINT64_C(0xff))
+                                        << 8U);
                 } else if (stopped) {
                         wait_status =
-                            (int)((child->stop_signal & 0xffU) << 8U) |
-                            0x7f;
+                            (int)((child->stop_signal & 0xffU) << 8U) | 0x7f;
                 } else {
                         wait_status = 0xffff;
                 }
 
                 if (user_status != 0U) {
-                        user_copy_to(user_status,
-                                     (const uint8_t *)&wait_status,
+                        user_copy_to(user_status, (const uint8_t *)&wait_status,
                                      sizeof(wait_status));
                 }
                 if (exited) {
@@ -1952,8 +1927,7 @@ static uint64_t syscall_write_begin(uint64_t descriptor, uintptr_t user_buffer,
         }
         struct process_open_file *open_file =
             active_process->descriptors[(size_t)descriptor].open_file;
-        if (open_file == NULL ||
-            (open_file->access & DESCRIPTOR_WRITE) == 0U) {
+        if (open_file == NULL || (open_file->access & DESCRIPTOR_WRITE) == 0U) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
         }
         if (length > USER_IO_MAX) {
@@ -2067,8 +2041,7 @@ static uint64_t syscall_open(uintptr_t user_path, uint32_t flags) {
                 access |= DESCRIPTOR_WRITE;
         }
 
-        struct process_open_file *open_file =
-            process_open_file_allocate();
+        struct process_open_file *open_file = process_open_file_allocate();
         if (open_file == NULL) {
                 panic("Descriptor exists without open-file capacity");
         }
@@ -2090,15 +2063,14 @@ static uint64_t syscall_close(uint64_t descriptor) {
         return 0U;
 }
 
-static uint64_t syscall_read_begin(uint64_t descriptor,
-                                   uintptr_t user_buffer, size_t length) {
+static uint64_t syscall_read_begin(uint64_t descriptor, uintptr_t user_buffer,
+                                   size_t length) {
         if (descriptor >= PROCESS_DESCRIPTOR_LIMIT) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
         }
         struct process_open_file *open_file =
             active_process->descriptors[(size_t)descriptor].open_file;
-        if (open_file == NULL ||
-            (open_file->access & DESCRIPTOR_READ) == 0U) {
+        if (open_file == NULL || (open_file->access & DESCRIPTOR_READ) == 0U) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
         }
         if (length > USER_IO_MAX) {
@@ -2123,10 +2095,10 @@ static uint64_t syscall_read_begin(uint64_t descriptor,
                 long result = vfs_read(&open_file->file, open_file->offset,
                                        active_process->write_buffer, length);
                 if (result > 0) {
-                        user_copy_to(user_buffer,
-                                     (const uint8_t *)active_process
-                                         ->write_buffer,
-                                     (size_t)result);
+                        user_copy_to(
+                            user_buffer,
+                            (const uint8_t *)active_process->write_buffer,
+                            (size_t)result);
                         open_file->offset += (uint64_t)result;
                 }
                 return (uint64_t)(int64_t)result;
@@ -2178,9 +2150,8 @@ static uint64_t syscall_stat(uintptr_t user_path, uintptr_t user_status) {
         }
         struct vfs_stat status;
         int result = vfs_stat_path(path, &status);
-        return result == 0
-                   ? user_copy_file_status(&status, user_status)
-                   : (uint64_t)(int64_t)result;
+        return result == 0 ? user_copy_file_status(&status, user_status)
+                           : (uint64_t)(int64_t)result;
 }
 
 static uint64_t syscall_fstat(uint64_t descriptor, uintptr_t user_status) {
@@ -2210,9 +2181,8 @@ static uint64_t syscall_fstat(uint64_t descriptor, uintptr_t user_status) {
 
         struct vfs_stat status;
         int result = vfs_stat_file(&open_file->file, &status);
-        return result == 0
-                   ? user_copy_file_status(&status, user_status)
-                   : (uint64_t)(int64_t)result;
+        return result == 0 ? user_copy_file_status(&status, user_status)
+                           : (uint64_t)(int64_t)result;
 }
 
 static uint64_t syscall_lseek(uint64_t descriptor, int64_t adjustment,
@@ -2268,8 +2238,7 @@ static uint64_t syscall_read_directory(uint64_t descriptor,
         }
         struct process_open_file *directory =
             active_process->descriptors[(size_t)descriptor].open_file;
-        if (directory == NULL ||
-            (directory->access & DESCRIPTOR_READ) == 0U) {
+        if (directory == NULL || (directory->access & DESCRIPTOR_READ) == 0U) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
         }
         if (directory->pipe != NULL) {
@@ -2282,8 +2251,8 @@ static uint64_t syscall_read_directory(uint64_t descriptor,
         }
         struct vfs_directory_entry entry;
         bytes_zero(&entry, sizeof(entry));
-        long next = vfs_read_directory(&directory->file, directory->offset,
-                                       &entry);
+        long next =
+            vfs_read_directory(&directory->file, directory->offset, &entry);
         if (next <= 0) {
                 return (uint64_t)(int64_t)next;
         }
@@ -2299,14 +2268,15 @@ static uint64_t syscall_read_directory(uint64_t descriptor,
         return 1U;
 }
 
-static uint64_t syscall_path_operation(uintptr_t user_path, bool make_directory) {
+static uint64_t syscall_path_operation(uintptr_t user_path,
+                                       bool make_directory) {
         char path[USER_PATH_MAX];
         uint64_t copy_result = user_copy_path(user_path, path);
         if (copy_result != 0U) {
                 return copy_result;
         }
-        int result = make_directory ? vfs_make_directory(path)
-                                    : vfs_unlink(path);
+        int result =
+            make_directory ? vfs_make_directory(path) : vfs_unlink(path);
         return (uint64_t)(int64_t)result;
 }
 
@@ -2336,8 +2306,7 @@ static uint64_t syscall_chdir(uintptr_t user_path) {
 /* Like Linux's raw getcwd syscall, success returns the byte count including
  * the terminating null character. */
 static uint64_t syscall_getcwd(uintptr_t user_buffer, size_t size) {
-        size_t length =
-            string_length(active_process->current_directory) + 1U;
+        size_t length = string_length(active_process->current_directory) + 1U;
         if (size < length) {
                 return (uint64_t)-(int64_t)USER_ERROR_RANGE;
         }
@@ -2370,13 +2339,12 @@ static uint64_t syscall_dup(uint64_t old_descriptor) {
                 return (uint64_t)-(int64_t)USER_ERROR_TOO_MANY_FILES;
         }
 
-        process_descriptor_install(
-            &active_process->descriptors[new_descriptor], open_file);
+        process_descriptor_install(&active_process->descriptors[new_descriptor],
+                                   open_file);
         return new_descriptor;
 }
 
-static uint64_t syscall_dup2(uint64_t old_descriptor,
-                             uint64_t new_descriptor) {
+static uint64_t syscall_dup2(uint64_t old_descriptor, uint64_t new_descriptor) {
         if (old_descriptor >= PROCESS_DESCRIPTOR_LIMIT ||
             active_process->descriptors[(size_t)old_descriptor].open_file ==
                 NULL ||
@@ -2424,20 +2392,16 @@ static uint64_t syscall_pipe(uintptr_t user_descriptors) {
                 }
         }
         if (free_open_files < 2U) {
-                return (uint64_t)-(int64_t)
-                    USER_ERROR_FILE_TABLE_OVERFLOW;
+                return (uint64_t)-(int64_t)USER_ERROR_FILE_TABLE_OVERFLOW;
         }
 
         struct process_pipe *pipe = process_pipe_allocate();
         if (pipe == NULL) {
-                return (uint64_t)-(int64_t)
-                    USER_ERROR_FILE_TABLE_OVERFLOW;
+                return (uint64_t)-(int64_t)USER_ERROR_FILE_TABLE_OVERFLOW;
         }
 
-        struct process_open_file *read_end =
-            process_open_file_allocate();
-        struct process_open_file *write_end =
-            process_open_file_allocate();
+        struct process_open_file *read_end = process_open_file_allocate();
+        struct process_open_file *write_end = process_open_file_allocate();
         if (read_end == NULL || write_end == NULL) {
                 panic("Reserved pipe open-file records disappeared");
         }
@@ -2453,10 +2417,8 @@ static uint64_t syscall_pipe(uintptr_t user_descriptors) {
         process_descriptor_install(
             &active_process->descriptors[descriptor_pair[1]], write_end);
 
-        int result[2] = {(int)descriptor_pair[0],
-                         (int)descriptor_pair[1]};
-        user_copy_to(user_descriptors, (const uint8_t *)result,
-                     sizeof(result));
+        int result[2] = {(int)descriptor_pair[0], (int)descriptor_pair[1]};
+        user_copy_to(user_descriptors, (const uint8_t *)result, sizeof(result));
         return 0U;
 }
 
@@ -2490,8 +2452,7 @@ static uint64_t syscall_brk(uintptr_t requested_break) {
                 return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
         }
 
-        uintptr_t old_mapped_end =
-            align_up_to_page(active_process->heap_break);
+        uintptr_t old_mapped_end = align_up_to_page(active_process->heap_break);
         uintptr_t new_mapped_end = align_up_to_page(requested_break);
 
         if (new_mapped_end < old_mapped_end) {
@@ -2507,19 +2468,19 @@ static uint64_t syscall_brk(uintptr_t requested_break) {
                                 process_free_heap_pages(
                                     active_process->address_space,
                                     old_mapped_end, mapped_end);
-                                return (uint64_t)-(int64_t)
-                                    USER_ERROR_OUT_OF_MEMORY;
+                                return (uint64_t)-(
+                                    int64_t)USER_ERROR_OUT_OF_MEMORY;
                         }
-                        if (!page_table_map(
-                                active_process->address_space, mapped_end,
-                                (uintptr_t)page,
-                                VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE)) {
+                        if (!page_table_map(active_process->address_space,
+                                            mapped_end, (uintptr_t)page,
+                                            VM_PAGE_USER | VM_PAGE_READ |
+                                                VM_PAGE_WRITE)) {
                                 page_free(page);
                                 process_free_heap_pages(
                                     active_process->address_space,
                                     old_mapped_end, mapped_end);
-                                return (uint64_t)-(int64_t)
-                                    USER_ERROR_OUT_OF_MEMORY;
+                                return (uint64_t)-(
+                                    int64_t)USER_ERROR_OUT_OF_MEMORY;
                         }
 
                         mapped_end += PAGE_SIZE;
@@ -2528,6 +2489,80 @@ static uint64_t syscall_brk(uintptr_t requested_break) {
 
         active_process->heap_break = requested_break;
         return requested_break;
+}
+
+static uint64_t syscall_graphics_map(uintptr_t user_information) {
+        if (!virtio_gpu_available()) {
+                return (uint64_t)-(int64_t)USER_ERROR_NO_ENTRY;
+        }
+        if (!user_range_is_valid(user_information,
+                                 sizeof(struct user_graphics_info),
+                                 VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        if (graphics_owner_pid != 0U &&
+            graphics_owner_pid != active_process->pid) {
+                return (uint64_t)-(int64_t)USER_ERROR_TRY_AGAIN;
+        }
+
+        uintptr_t framebuffer = (uintptr_t)virtio_gpu_framebuffer();
+        uintptr_t existing;
+        if (page_table_translate(active_process->address_space,
+                                 USER_GRAPHICS_ADDRESS, &existing, NULL)) {
+                if (existing != framebuffer) {
+                        return (uint64_t)-(int64_t)USER_ERROR_EXISTS;
+                }
+        } else if (!page_table_map_range(
+                       active_process->address_space, USER_GRAPHICS_ADDRESS,
+                       framebuffer, virtio_gpu_framebuffer_size(),
+                       VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
+        }
+
+        struct user_graphics_info information;
+        bytes_zero(&information, sizeof(information));
+        information.framebuffer = USER_GRAPHICS_ADDRESS;
+        information.framebuffer_size =
+            (uint64_t)virtio_gpu_stride() * virtio_gpu_height();
+        information.width = virtio_gpu_width();
+        information.height = virtio_gpu_height();
+        information.stride = virtio_gpu_stride();
+        information.pixel_format = USER_GRAPHICS_PIXEL_XRGB8888;
+        graphics_owner_pid = active_process->pid;
+        graphics_console_suspend();
+        input_event_clear();
+        input_set_console_captured(true);
+        user_copy_to(user_information, (const uint8_t *)&information,
+                     sizeof(information));
+        return 0U;
+}
+
+static uint64_t syscall_graphics_flush(uint32_t x, uint32_t y, uint32_t width,
+                                       uint32_t height) {
+        if (graphics_owner_pid != active_process->pid) {
+                return (uint64_t)-(int64_t)USER_ERROR_PERMISSION;
+        }
+        if (!virtio_gpu_flush(x, y, width, height)) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+        return 0U;
+}
+
+static uint64_t syscall_input_read(uintptr_t user_event) {
+        if (graphics_owner_pid != active_process->pid) {
+                return (uint64_t)-(int64_t)USER_ERROR_PERMISSION;
+        }
+        if (!user_range_is_valid(user_event, sizeof(struct user_input_event),
+                                 VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+
+        struct user_input_event event;
+        if (!input_event_pop(&event)) {
+                return 0U;
+        }
+        user_copy_to(user_event, (const uint8_t *)&event, sizeof(event));
+        return 1U;
 }
 
 /* Select the first READY slot after the current process, wrapping once. */
@@ -2638,7 +2673,8 @@ bool scheduler_wake_one(enum scheduler_wait_channel channel) {
 }
 
 /* Advance one resumable write. While it is blocked, sepc continues to point at
- * ECALL; waking the process safely re-enters this continuation in a fresh trap. */
+ * ECALL; waking the process safely re-enters this continuation in a fresh trap.
+ */
 static void process_continue_write(struct trap_frame *frame) {
         struct process *process = active_process;
 
@@ -2658,14 +2694,13 @@ static void process_continue_write(struct trap_frame *frame) {
 
                 if (pipe->readers == 0U) {
                         process->pending_write = false;
-                        frame->a0 = (uint64_t)-(int64_t)
-                            USER_ERROR_BROKEN_PIPE;
+                        frame->a0 = (uint64_t)-(int64_t)USER_ERROR_BROKEN_PIPE;
                         frame->sepc += 4U;
                         return;
                 }
                 if (process->write_length > PIPE_BUFFER_SIZE - pipe->count) {
-                        scheduler_block_current(
-                            frame, SCHEDULER_WAIT_PIPE_WRITE);
+                        scheduler_block_current(frame,
+                                                SCHEDULER_WAIT_PIPE_WRITE);
                         return;
                 }
 
@@ -2741,8 +2776,8 @@ static void process_continue_read(struct trap_frame *frame) {
                                 return;
                         }
 
-                        scheduler_block_current(
-                            frame, SCHEDULER_WAIT_PIPE_READ);
+                        scheduler_block_current(frame,
+                                                SCHEDULER_WAIT_PIPE_READ);
                         return;
                 }
 
@@ -2817,9 +2852,10 @@ static void scheduler_reschedule(struct trap_frame *frame,
 }
 
 /*
- * Convert the active process into an EXITED zombie. If no READY process remains,
- * redirect trap return to user_mode_resume in supervisor mode. That assembly
- * continuation restores the kernel call context saved by user_mode_enter.
+ * Convert the active process into an EXITED zombie. If no READY process
+ * remains, redirect trap return to user_mode_resume in supervisor mode. That
+ * assembly continuation restores the kernel call context saved by
+ * user_mode_enter.
  */
 static void user_process_finish(struct trap_frame *frame, uint64_t status) {
         if (active_process == NULL ||
@@ -2828,6 +2864,7 @@ static void user_process_finish(struct trap_frame *frame, uint64_t status) {
                 panic_trap("Invalid user process return state", frame);
         }
 
+        graphics_release_if_owned(active_process->pid);
         if (uart_write_owner == active_process) {
                 uart_write_owner = NULL;
                 (void)scheduler_wake_all(SCHEDULER_WAIT_UART_TX);
@@ -2884,8 +2921,7 @@ static void process_stop_current(struct trap_frame *frame, uint32_t signal) {
 }
 
 static uint32_t process_next_pending_signal(const struct process *process) {
-        if ((process->pending_signals &
-             signal_bit(USER_SIGNAL_KILL)) != 0U) {
+        if ((process->pending_signals & signal_bit(USER_SIGNAL_KILL)) != 0U) {
                 return USER_SIGNAL_KILL;
         }
 
@@ -2907,8 +2943,7 @@ static void process_deliver_pending_signals(struct trap_frame *frame) {
                 uint32_t signal = process_next_pending_signal(process);
 
                 if (signal == 0U ||
-                    (process->signal_active &&
-                     signal != USER_SIGNAL_KILL &&
+                    (process->signal_active && signal != USER_SIGNAL_KILL &&
                      signal != USER_SIGNAL_STOP)) {
                         return;
                 }
@@ -2918,8 +2953,7 @@ static void process_deliver_pending_signals(struct trap_frame *frame) {
                     &process->signal_dispositions[signal];
 
                 if (disposition->handler == USER_SIGNAL_IGNORE &&
-                    signal != USER_SIGNAL_KILL &&
-                    signal != USER_SIGNAL_STOP) {
+                    signal != USER_SIGNAL_KILL && signal != USER_SIGNAL_STOP) {
                         continue;
                 }
                 if (signal == USER_SIGNAL_CONTINUE &&
@@ -3076,9 +3110,9 @@ static bool scheduler_run_ready(void) {
                  * timer deadline. */
                 timer_schedule_next();
                 page_table_activate(active_process->address_space);
-                user_mode_enter(
-                    &active_process->context,
-                    (uintptr_t)active_process->kernel_trap_stack + PAGE_SIZE);
+                user_mode_enter(&active_process->context,
+                                (uintptr_t)active_process->kernel_trap_stack +
+                                    PAGE_SIZE);
 
                 if (active_process != NULL) {
                         panic("Scheduler returned while a process was running");
@@ -3182,7 +3216,8 @@ void user_process_handle_timer(struct trap_frame *frame) {
 }
 
 /* Dispatch the small user ABI. Blocking write deliberately retains ECALL in
- * sepc until its continuation has completed; other calls advance immediately. */
+ * sepc until its continuation has completed; other calls advance immediately.
+ */
 void user_process_handle_syscall(struct trap_frame *frame) {
         if (!user_process_is_active()) {
                 panic_trap("U-mode syscall without an active process", frame);
@@ -3197,8 +3232,7 @@ void user_process_handle_syscall(struct trap_frame *frame) {
         case USER_SYSCALL_WRITE: {
                 if (!active_process->pending_write) {
                         uint64_t result = syscall_write_begin(
-                            frame->a0, (uintptr_t)frame->a1,
-                            (size_t)frame->a2);
+                            frame->a0, (uintptr_t)frame->a1, (size_t)frame->a2);
 
                         if (!active_process->pending_write) {
                                 frame->a0 = result;
@@ -3214,8 +3248,7 @@ void user_process_handle_syscall(struct trap_frame *frame) {
         case USER_SYSCALL_READ: {
                 if (!active_process->pending_read) {
                         uint64_t result = syscall_read_begin(
-                            frame->a0, (uintptr_t)frame->a1,
-                            (size_t)frame->a2);
+                            frame->a0, (uintptr_t)frame->a1, (size_t)frame->a2);
 
                         if (!active_process->pending_read) {
                                 frame->a0 = result;
@@ -3243,14 +3276,13 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 return;
 
         case USER_SYSCALL_STAT:
-                frame->a0 = syscall_stat((uintptr_t)frame->a0,
-                                         (uintptr_t)frame->a1);
+                frame->a0 =
+                    syscall_stat((uintptr_t)frame->a0, (uintptr_t)frame->a1);
                 frame->sepc += 4U;
                 return;
 
         case USER_SYSCALL_FSTAT:
-                frame->a0 = syscall_fstat(frame->a0,
-                                          (uintptr_t)frame->a1);
+                frame->a0 = syscall_fstat(frame->a0, (uintptr_t)frame->a1);
                 frame->sepc += 4U;
                 return;
 
@@ -3261,8 +3293,8 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 return;
 
         case USER_SYSCALL_READ_DIRECTORY:
-                frame->a0 = syscall_read_directory(frame->a0,
-                                                   (uintptr_t)frame->a1);
+                frame->a0 =
+                    syscall_read_directory(frame->a0, (uintptr_t)frame->a1);
                 frame->sepc += 4U;
                 return;
 
@@ -3282,8 +3314,8 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 return;
 
         case USER_SYSCALL_GETCWD:
-                frame->a0 = syscall_getcwd((uintptr_t)frame->a0,
-                                           (size_t)frame->a1);
+                frame->a0 =
+                    syscall_getcwd((uintptr_t)frame->a0, (size_t)frame->a1);
                 frame->sepc += 4U;
                 return;
 
@@ -3303,15 +3335,15 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 return;
 
         case USER_SYSCALL_SET_DESCRIPTOR_FLAGS:
-                frame->a0 = syscall_set_descriptor_flags(
-                    frame->a0, (uint32_t)frame->a1);
+                frame->a0 = syscall_set_descriptor_flags(frame->a0,
+                                                         (uint32_t)frame->a1);
                 frame->sepc += 4U;
                 return;
 
         case USER_SYSCALL_EXECVE: {
-                uint64_t result = syscall_execve(
-                    frame, (uintptr_t)frame->a0, (uintptr_t)frame->a1,
-                    (uintptr_t)frame->a2);
+                uint64_t result =
+                    syscall_execve(frame, (uintptr_t)frame->a0,
+                                   (uintptr_t)frame->a1, (uintptr_t)frame->a2);
 
                 /* Success installed an entirely new frame and begins at its
                  * ELF entry. Only failure resumes after the original ECALL. */
@@ -3328,15 +3360,14 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 return;
 
         case USER_SYSCALL_WAITPID:
-                syscall_waitpid(frame, (int64_t)frame->a0,
-                                (uintptr_t)frame->a1,
+                syscall_waitpid(frame, (int64_t)frame->a0, (uintptr_t)frame->a1,
                                 (uint32_t)frame->a2);
                 return;
 
         case USER_SYSCALL_SPAWN:
-                frame->a0 = syscall_spawn((uintptr_t)frame->a0,
-                                          (uintptr_t)frame->a1,
-                                          (uintptr_t)frame->a2);
+                frame->a0 =
+                    syscall_spawn((uintptr_t)frame->a0, (uintptr_t)frame->a1,
+                                  (uintptr_t)frame->a2);
                 frame->sepc += 4U;
                 return;
 
@@ -3353,8 +3384,8 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 return;
 
         case USER_SYSCALL_KILL:
-                frame->a0 = syscall_kill((int64_t)frame->a0,
-                                         (int64_t)frame->a1);
+                frame->a0 =
+                    syscall_kill((int64_t)frame->a0, (int64_t)frame->a1);
                 frame->sepc += 4U;
                 return;
 
@@ -3368,8 +3399,8 @@ void user_process_handle_syscall(struct trap_frame *frame) {
         }
 
         case USER_SYSCALL_SET_PROCESS_GROUP:
-                frame->a0 = syscall_set_process_group(
-                    (int64_t)frame->a0, (int64_t)frame->a1);
+                frame->a0 = syscall_set_process_group((int64_t)frame->a0,
+                                                      (int64_t)frame->a1);
                 frame->sepc += 4U;
                 return;
 
@@ -3385,8 +3416,24 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 return;
 
         case USER_SYSCALL_TERMINAL_GET_FOREGROUND_GROUP:
-                frame->a0 =
-                    syscall_terminal_get_foreground_group(frame->a0);
+                frame->a0 = syscall_terminal_get_foreground_group(frame->a0);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_GRAPHICS_MAP:
+                frame->a0 = syscall_graphics_map((uintptr_t)frame->a0);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_GRAPHICS_FLUSH:
+                frame->a0 = syscall_graphics_flush(
+                    (uint32_t)frame->a0, (uint32_t)frame->a1,
+                    (uint32_t)frame->a2, (uint32_t)frame->a3);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_INPUT_READ:
+                frame->a0 = syscall_input_read((uintptr_t)frame->a0);
                 frame->sepc += 4U;
                 return;
 
@@ -3407,8 +3454,7 @@ void user_process_handle_syscall(struct trap_frame *frame) {
 
         default:
                 frame->sepc += 4U;
-                frame->a0 =
-                    (uint64_t)-(int64_t)USER_ERROR_NOT_IMPLEMENTED;
+                frame->a0 = (uint64_t)-(int64_t)USER_ERROR_NOT_IMPLEMENTED;
                 return;
         }
 }
