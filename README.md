@@ -26,9 +26,9 @@ scheduling, and automated emulator tests.
   sixteen-entry write-through cache for 1 KiB filesystem blocks.
 - Writable ext2 root filesystem containing `/sbin/init`, `/bin/sh`, programs,
   and data.
-  The supported ext2 profile uses one block group, direct blocks, 1 KiB blocks,
-  128-byte inodes, and file-type directory entries. A linker-embedded ramfs is
-  retained as a boot-diagnostic fallback.
+  The supported ext2 profile uses one block group, direct and singly indirect
+  blocks, 1 KiB blocks, 128-byte inodes, and file-type directory entries. A
+  linker-embedded ramfs is retained as a boot-diagnostic fallback.
 - VFS regular files, directories, and character devices with canonical path
   lookup, create/truncate, stat, seek, directory iteration, mkdir, and unlink.
 - Eight-entry per-process descriptor tables backed by a bounded global
@@ -248,11 +248,11 @@ ROSE currently targets one hart and one QEMU `virt` platform. The shell has no
 append redirection, descriptor number syntax, expansion, `bg` command, session
 management, or scripting language. The ext2
 implementation is synchronous,
-write-through, limited to one block group and twelve direct blocks per inode
-(12 KiB files), and does not yet provide journaling or crash recovery. The
-VirtIO queue is polled synchronously; it is not yet connected to a scheduler
-completion channel. `fork` currently copies pages eagerly rather than using
-copy-on-write. Signals do not yet have masks, alternate stacks, sessions,
-or realtime queues. There are no
+write-through, limited to one block group and direct plus singly indirect block
+addressing (268 KiB files), and does not yet provide journaling or crash
+recovery. The VirtIO queue is polled synchronously; it is not yet connected to
+a scheduler completion channel. `fork` currently copies pages eagerly rather
+than using copy-on-write. Signals do not yet have masks, alternate stacks,
+sessions, or realtime queues. There are no
 general-purpose kernel threads, ASIDs, networking, users, or permissions
 enforcement.

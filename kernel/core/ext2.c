@@ -2,10 +2,10 @@
  * Compact writable ext2 implementation for the first ROSE disk format.
  *
  * The supported profile is deliberately narrow: one block group, 1 KiB
- * blocks, 128-byte inodes, file-type directory entries, and twelve direct
- * blocks per inode. Those constraints are validated at mount time. The image
- * generator emits exactly this profile, while retaining standard ext2 on-disk
- * structures so ordinary ext2 tools can inspect the disk.
+ * blocks, 128-byte inodes, file-type directory entries, and direct plus singly
+ * indirect block addressing. Those constraints are validated at mount time.
+ * The image generator emits exactly this profile, while retaining standard
+ * ext2 on-disk structures so ordinary ext2 tools can inspect the disk.
  */
 #include <stdbool.h>
 #include <stddef.h>
@@ -20,6 +20,12 @@ enum {
         EXT2_MAGIC = 0xef53,
         EXT2_ROOT_INODE = 2,
         EXT2_DIRECT_BLOCKS = 12,
+        EXT2_INDIRECT_BLOCK_ENTRIES =
+            BLOCK_CACHE_BLOCK_SIZE / sizeof(uint32_t),
+        EXT2_MAX_DATA_BLOCKS =
+            EXT2_DIRECT_BLOCKS + EXT2_INDIRECT_BLOCK_ENTRIES,
+        EXT2_SECTORS_PER_BLOCK =
+            BLOCK_CACHE_BLOCK_SIZE / BLOCK_DEVICE_SECTOR_SIZE,
         EXT2_INODE_SIZE = 128,
         EXT2_PATH_MAX = 64,
         EXT2_DIRECTORY_HEADER_SIZE = 8,
@@ -69,7 +75,8 @@ struct ext2_inode {
         uint16_t link_count;
         uint32_t size;
         uint32_t block_count;
-        uint32_t blocks[EXT2_DIRECT_BLOCKS];
+        uint32_t direct_blocks[EXT2_DIRECT_BLOCKS];
+        uint32_t indirect_block;
 };
 
 struct ext2_filesystem {
@@ -183,10 +190,13 @@ static bool read_inode(struct ext2_filesystem *fs, uint32_t number,
         inode->link_count = read_u16(&bytes[offset + INODE_LINK_COUNT]);
         inode->block_count = read_u32(&bytes[offset + INODE_BLOCK_COUNT]);
         for (size_t pointer = 0U; pointer < EXT2_DIRECT_BLOCKS; pointer++) {
-                inode->blocks[pointer] = read_u32(
+                inode->direct_blocks[pointer] = read_u32(
                     &bytes[offset + INODE_BLOCK_POINTERS +
                            pointer * sizeof(uint32_t)]);
         }
+        inode->indirect_block = read_u32(
+            &bytes[offset + INODE_BLOCK_POINTERS +
+                   EXT2_DIRECT_BLOCKS * sizeof(uint32_t)]);
         return inode->mode != 0U;
 }
 
@@ -216,8 +226,11 @@ static bool write_inode(struct ext2_filesystem *fs, uint32_t number,
         for (size_t pointer = 0U; pointer < EXT2_DIRECT_BLOCKS; pointer++) {
                 write_u32(&bytes[offset + INODE_BLOCK_POINTERS +
                                  pointer * sizeof(uint32_t)],
-                          inode->blocks[pointer]);
+                          inode->direct_blocks[pointer]);
         }
+        write_u32(&bytes[offset + INODE_BLOCK_POINTERS +
+                         EXT2_DIRECT_BLOCKS * sizeof(uint32_t)],
+                  inode->indirect_block);
         return block_cache_write(block, bytes);
 }
 
@@ -298,6 +311,95 @@ static bool release_block(struct ext2_filesystem *fs, uint32_t block) {
         return write_free_counts(fs);
 }
 
+/* Resolve one file-relative data block without treating an unallocated block
+ * as an error. The singly indirect table contains 256 little-endian block
+ * numbers in the supported 1 KiB ext2 profile. */
+static bool inode_data_block(const struct ext2_inode *inode, size_t index,
+                             uint32_t *block_number) {
+        if (inode == NULL || block_number == NULL ||
+            index >= EXT2_MAX_DATA_BLOCKS) {
+                return false;
+        }
+        if (index < EXT2_DIRECT_BLOCKS) {
+                *block_number = inode->direct_blocks[index];
+                return true;
+        }
+
+        *block_number = 0U;
+        if (inode->indirect_block == 0U) {
+                return true;
+        }
+
+        static uint8_t pointers[BLOCK_CACHE_BLOCK_SIZE];
+        if (!block_cache_read(inode->indirect_block, pointers)) {
+                return false;
+        }
+        size_t indirect_index = index - EXT2_DIRECT_BLOCKS;
+        *block_number =
+            read_u32(&pointers[indirect_index * sizeof(uint32_t)]);
+        return true;
+}
+
+/* Allocate a missing data block and, when necessary, its singly indirect
+ * pointer block. allocate_block zeroes both kinds of block before exposure. */
+static bool inode_ensure_data_block(struct ext2_filesystem *fs,
+                                    struct ext2_inode *inode, size_t index,
+                                    uint32_t *block_number) {
+        if (!inode_data_block(inode, index, block_number)) {
+                return false;
+        }
+        if (*block_number != 0U) {
+                return true;
+        }
+
+        if (index < EXT2_DIRECT_BLOCKS) {
+                uint32_t allocated = allocate_block(fs);
+                if (allocated == 0U) {
+                        return false;
+                }
+                inode->direct_blocks[index] = allocated;
+                inode->block_count += EXT2_SECTORS_PER_BLOCK;
+                *block_number = allocated;
+                return true;
+        }
+
+        bool created_indirect = false;
+        if (inode->indirect_block == 0U) {
+                inode->indirect_block = allocate_block(fs);
+                if (inode->indirect_block == 0U) {
+                        return false;
+                }
+                inode->block_count += EXT2_SECTORS_PER_BLOCK;
+                created_indirect = true;
+        }
+
+        static uint8_t pointers[BLOCK_CACHE_BLOCK_SIZE];
+        if (!block_cache_read(inode->indirect_block, pointers)) {
+                goto fail;
+        }
+        size_t indirect_index = index - EXT2_DIRECT_BLOCKS;
+        uint32_t allocated = allocate_block(fs);
+        if (allocated == 0U) {
+                goto fail;
+        }
+        write_u32(&pointers[indirect_index * sizeof(uint32_t)], allocated);
+        if (!block_cache_write(inode->indirect_block, pointers)) {
+                (void)release_block(fs, allocated);
+                goto fail;
+        }
+
+        inode->block_count += EXT2_SECTORS_PER_BLOCK;
+        *block_number = allocated;
+        return true;
+
+fail:
+        if (created_indirect && release_block(fs, inode->indirect_block)) {
+                inode->indirect_block = 0U;
+                inode->block_count -= EXT2_SECTORS_PER_BLOCK;
+        }
+        return false;
+}
+
 static uint32_t allocate_inode(struct ext2_filesystem *fs) {
         static uint8_t bitmap[BLOCK_CACHE_BLOCK_SIZE];
         if (fs->free_inodes == 0U ||
@@ -360,9 +462,10 @@ static int lookup_child(struct ext2_filesystem *fs, uint32_t directory_number,
         while (position < directory.size) {
                 size_t block_index = (size_t)(position / BLOCK_CACHE_BLOCK_SIZE);
                 size_t within = (size_t)(position % BLOCK_CACHE_BLOCK_SIZE);
-                if (block_index >= EXT2_DIRECT_BLOCKS ||
-                    directory.blocks[block_index] == 0U ||
-                    !block_cache_read(directory.blocks[block_index], block)) {
+                uint32_t block_number;
+                if (!inode_data_block(&directory, block_index, &block_number) ||
+                    block_number == 0U ||
+                    !block_cache_read(block_number, block)) {
                         return -VFS_ERROR_IO;
                 }
 
@@ -472,16 +575,18 @@ static int add_directory_entry(struct ext2_filesystem *fs,
         size_t needed = directory_record_size(name_length);
         static uint8_t block[BLOCK_CACHE_BLOCK_SIZE];
 
-        for (size_t block_index = 0U; block_index < EXT2_DIRECT_BLOCKS;
+        for (size_t block_index = 0U; block_index < EXT2_MAX_DATA_BLOCKS;
              block_index++) {
-                if (directory.blocks[block_index] == 0U) {
-                        uint32_t allocated = allocate_block(fs);
-                        if (allocated == 0U) {
+                uint32_t block_number;
+                if (!inode_data_block(&directory, block_index,
+                                      &block_number)) {
+                        return -VFS_ERROR_IO;
+                }
+                if (block_number == 0U) {
+                        if (!inode_ensure_data_block(
+                                fs, &directory, block_index, &block_number)) {
                                 return -VFS_ERROR_NO_SPACE;
                         }
-                        directory.blocks[block_index] = allocated;
-                        directory.block_count +=
-                            BLOCK_CACHE_BLOCK_SIZE / BLOCK_DEVICE_SECTOR_SIZE;
                         directory.size += BLOCK_CACHE_BLOCK_SIZE;
                         zero_bytes(block, sizeof(block));
                         write_u32(&block[0], child_number);
@@ -489,14 +594,14 @@ static int add_directory_entry(struct ext2_filesystem *fs,
                         block[6] = (uint8_t)name_length;
                         block[7] = directory_type(child_type);
                         copy_bytes(&block[8], name, name_length);
-                        if (!block_cache_write(allocated, block) ||
+                        if (!block_cache_write(block_number, block) ||
                             !write_inode(fs, directory_number, &directory)) {
                                 return -VFS_ERROR_IO;
                         }
                         return 0;
                 }
 
-                if (!block_cache_read(directory.blocks[block_index], block)) {
+                if (!block_cache_read(block_number, block)) {
                         return -VFS_ERROR_IO;
                 }
                 size_t within = 0U;
@@ -514,8 +619,7 @@ static int add_directory_entry(struct ext2_filesystem *fs,
                                 block[within + 7U] = directory_type(child_type);
                                 copy_bytes(&block[within + 8U], name,
                                            name_length);
-                                return block_cache_write(
-                                           directory.blocks[block_index], block)
+                                return block_cache_write(block_number, block)
                                            ? 0
                                            : -VFS_ERROR_IO;
                         }
@@ -532,8 +636,7 @@ static int add_directory_entry(struct ext2_filesystem *fs,
                                 block[inserted + 7U] = directory_type(child_type);
                                 copy_bytes(&block[inserted + 8U], name,
                                            name_length);
-                                return block_cache_write(
-                                           directory.blocks[block_index], block)
+                                return block_cache_write(block_number, block)
                                            ? 0
                                            : -VFS_ERROR_IO;
                         }
@@ -551,10 +654,14 @@ static int remove_directory_entry(struct ext2_filesystem *fs,
                 return -VFS_ERROR_IO;
         }
         static uint8_t block[BLOCK_CACHE_BLOCK_SIZE];
-        for (size_t block_index = 0U; block_index < EXT2_DIRECT_BLOCKS &&
-                                      directory.blocks[block_index] != 0U;
+        for (size_t block_index = 0U;
+             block_index < EXT2_MAX_DATA_BLOCKS &&
+             block_index * BLOCK_CACHE_BLOCK_SIZE < directory.size;
              block_index++) {
-                if (!block_cache_read(directory.blocks[block_index], block)) {
+                uint32_t block_number;
+                if (!inode_data_block(&directory, block_index, &block_number) ||
+                    block_number == 0U ||
+                    !block_cache_read(block_number, block)) {
                         return -VFS_ERROR_IO;
                 }
                 size_t within = 0U;
@@ -580,8 +687,7 @@ static int remove_directory_entry(struct ext2_filesystem *fs,
                                 } else {
                                         write_u32(&block[within], 0U);
                                 }
-                                return block_cache_write(
-                                           directory.blocks[block_index], block)
+                                return block_cache_write(block_number, block)
                                            ? 0
                                            : -VFS_ERROR_IO;
                         }
@@ -597,12 +703,31 @@ static int remove_directory_entry(struct ext2_filesystem *fs,
 static int truncate_inode(struct ext2_filesystem *fs, uint32_t number,
                           struct ext2_inode *inode) {
         for (size_t index = 0U; index < EXT2_DIRECT_BLOCKS; index++) {
-                if (inode->blocks[index] != 0U) {
-                        if (!release_block(fs, inode->blocks[index])) {
+                if (inode->direct_blocks[index] != 0U) {
+                        if (!release_block(fs, inode->direct_blocks[index])) {
                                 return -VFS_ERROR_IO;
                         }
-                        inode->blocks[index] = 0U;
+                        inode->direct_blocks[index] = 0U;
                 }
+        }
+        if (inode->indirect_block != 0U) {
+                static uint8_t pointers[BLOCK_CACHE_BLOCK_SIZE];
+                if (!block_cache_read(inode->indirect_block, pointers)) {
+                        return -VFS_ERROR_IO;
+                }
+                for (size_t index = 0U; index < EXT2_INDIRECT_BLOCK_ENTRIES;
+                     index++) {
+                        uint32_t block_number =
+                            read_u32(&pointers[index * sizeof(uint32_t)]);
+                        if (block_number != 0U &&
+                            !release_block(fs, block_number)) {
+                                return -VFS_ERROR_IO;
+                        }
+                }
+                if (!release_block(fs, inode->indirect_block)) {
+                        return -VFS_ERROR_IO;
+                }
+                inode->indirect_block = 0U;
         }
         inode->size = 0U;
         inode->block_count = 0U;
@@ -716,9 +841,10 @@ static long ext2_read_file(void *context, struct vfs_file *file,
                 if (count > remaining) {
                         count = remaining;
                 }
-                if (block_index >= EXT2_DIRECT_BLOCKS ||
-                    inode.blocks[block_index] == 0U ||
-                    !block_cache_read(inode.blocks[block_index], block)) {
+                uint32_t block_number;
+                if (!inode_data_block(&inode, block_index, &block_number) ||
+                    block_number == 0U ||
+                    !block_cache_read(block_number, block)) {
                         return -VFS_ERROR_IO;
                 }
                 copy_bytes(output, &block[within], count);
@@ -734,7 +860,7 @@ static long ext2_write_file(void *context, struct vfs_file *file,
                             size_t length) {
         struct ext2_filesystem *fs = context;
         const uint64_t maximum_size =
-            (uint64_t)EXT2_DIRECT_BLOCKS * BLOCK_CACHE_BLOCK_SIZE;
+            (uint64_t)EXT2_MAX_DATA_BLOCKS * BLOCK_CACHE_BLOCK_SIZE;
         if (offset > maximum_size || length > maximum_size - offset) {
                 return -VFS_ERROR_NO_SPACE;
         }
@@ -754,19 +880,21 @@ static long ext2_write_file(void *context, struct vfs_file *file,
                 if (count > remaining) {
                         count = remaining;
                 }
-                if (inode.blocks[block_index] == 0U) {
-                        inode.blocks[block_index] = allocate_block(fs);
-                        if (inode.blocks[block_index] == 0U) {
+                uint32_t block_number;
+                if (!inode_data_block(&inode, block_index, &block_number)) {
+                        return -VFS_ERROR_IO;
+                }
+                if (block_number == 0U) {
+                        if (!inode_ensure_data_block(fs, &inode, block_index,
+                                                     &block_number)) {
                                 return -VFS_ERROR_NO_SPACE;
                         }
-                        inode.block_count +=
-                            BLOCK_CACHE_BLOCK_SIZE / BLOCK_DEVICE_SECTOR_SIZE;
                         zero_bytes(block, sizeof(block));
-                } else if (!block_cache_read(inode.blocks[block_index], block)) {
+                } else if (!block_cache_read(block_number, block)) {
                         return -VFS_ERROR_IO;
                 }
                 copy_bytes(&block[within], input, count);
-                if (!block_cache_write(inode.blocks[block_index], block)) {
+                if (!block_cache_write(block_number, block)) {
                         return -VFS_ERROR_IO;
                 }
                 input += count;
@@ -809,9 +937,10 @@ static long ext2_read_directory(void *context, struct vfs_file *file,
         while (offset < directory.size) {
                 size_t block_index = (size_t)(offset / BLOCK_CACHE_BLOCK_SIZE);
                 size_t within = (size_t)(offset % BLOCK_CACHE_BLOCK_SIZE);
-                if (block_index >= EXT2_DIRECT_BLOCKS ||
-                    directory.blocks[block_index] == 0U ||
-                    !block_cache_read(directory.blocks[block_index], block)) {
+                uint32_t block_number;
+                if (!inode_data_block(&directory, block_index, &block_number) ||
+                    block_number == 0U ||
+                    !block_cache_read(block_number, block)) {
                         return -VFS_ERROR_IO;
                 }
                 uint32_t inode = read_u32(&block[within]);
@@ -869,8 +998,8 @@ static int ext2_make_directory(void *context, const char *path) {
             .mode = EXT2_MODE_DIRECTORY | 0755U,
             .link_count = 2U,
             .size = BLOCK_CACHE_BLOCK_SIZE,
-            .block_count = BLOCK_CACHE_BLOCK_SIZE / BLOCK_DEVICE_SECTOR_SIZE,
-            .blocks = {block_number},
+            .block_count = EXT2_SECTORS_PER_BLOCK,
+            .direct_blocks = {block_number},
         };
         static uint8_t block[BLOCK_CACHE_BLOCK_SIZE];
         zero_bytes(block, sizeof(block));
@@ -911,9 +1040,10 @@ static bool directory_is_empty(const struct ext2_inode *directory) {
         while (offset < directory->size) {
                 size_t block_index = (size_t)(offset / BLOCK_CACHE_BLOCK_SIZE);
                 size_t within = (size_t)(offset % BLOCK_CACHE_BLOCK_SIZE);
-                if (block_index >= EXT2_DIRECT_BLOCKS ||
-                    directory->blocks[block_index] == 0U ||
-                    !block_cache_read(directory->blocks[block_index], block)) {
+                uint32_t block_number;
+                if (!inode_data_block(directory, block_index, &block_number) ||
+                    block_number == 0U ||
+                    !block_cache_read(block_number, block)) {
                         return false;
                 }
                 uint32_t inode = read_u32(&block[within]);

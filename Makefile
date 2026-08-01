@@ -71,8 +71,6 @@ USER_PROGRAM_mkdir := USER_PROGRAM_MKDIR
 USER_PROGRAM_rm := USER_PROGRAM_RM
 USER_PROGRAM_descriptor_test := USER_PROGRAM_DESCRIPTOR_TEST
 USER_PROGRAM_signal_exec_test := USER_PROGRAM_SIGNAL_EXEC_TEST
-# The shell must stay within ext2's twelve-direct-block file limit.
-USER_PROGRAM_CFLAGS_sh := -Os
 USER_ELFS := $(foreach program,$(USER_PROGRAMS),$(BUILD_DIR)/user/$(program)/program.elf)
 USER_LOAD_ELFS := $(USER_ELFS:.elf=.load.elf)
 USER_FALLBACK_PROGRAMS := hello fault process_a process_b syscall_test cat console_read sh ls echo pwd env mkdir rm descriptor_test signal_exec_test

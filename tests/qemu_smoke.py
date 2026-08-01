@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import select
+import struct
 import subprocess
 import sys
 import time
@@ -113,6 +114,16 @@ def require(output: str, *needles: str) -> None:
         raise AssertionError(f"missing {missing!r} in command output:\n{output}")
 
 
+def ext2_free_counts(path: Path) -> tuple[int, int]:
+    """Read the free block and inode counts from the 1 KiB ext2 superblock."""
+    with path.open("rb") as image:
+        image.seek(1024 + 12)
+        counts = image.read(8)
+    if len(counts) != 8:
+        raise AssertionError(f"short ext2 superblock in {path}")
+    return struct.unpack("<II", counts)
+
+
 def main() -> int:
     # Environment overrides mirror Makefile variables and keep the test usable
     # with differently named cross-toolchains or QEMU installations.
@@ -123,6 +134,7 @@ def main() -> int:
         os.environ.get("ROOT_IMAGE", repository / "kernel/build/root.ext2")
     )
     memory = os.environ.get("QEMU_MEMORY", "128M")
+    initial_free_counts = ext2_free_counts(root_image)
     base_command = [
         qemu,
         "-machine",
@@ -314,6 +326,10 @@ def main() -> int:
         )
 
         session.shutdown()
+        if ext2_free_counts(root_image) != initial_free_counts:
+            raise AssertionError(
+                "guest filesystem operations leaked blocks or inodes"
+            )
     finally:
         session.close()
 

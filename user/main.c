@@ -902,6 +902,10 @@ static int run_execve_target(int argc, char **argv, char **environment) {
 }
 
 static int run_filesystem_test(void) {
+        enum {
+                LARGE_FILE_SIZE = 13 * 1024 + 37,
+                FILESYSTEM_TRANSFER_SIZE = 257,
+        };
         struct user_file_status status;
         if (rose_stat("/etc/motd", &status) != 0 ||
             status.type != USER_FILE_REGULAR || status.size == 0U) {
@@ -938,6 +942,63 @@ static int run_filesystem_test(void) {
         if (count != (long)(sizeof(payload) - 1U) ||
             !strings_equal(buffer, payload) || rose_close((int)descriptor) != 0) {
                 return 21;
+        }
+
+        /* Cross both the twelfth direct-block boundary and unaligned block
+         * offsets, then reread the complete singly indirect file. */
+        descriptor = rose_open("/tmp/state", USER_OPEN_READ | USER_OPEN_WRITE |
+                                                 USER_OPEN_TRUNCATE);
+        static uint8_t large_buffer[FILESYSTEM_TRANSFER_SIZE];
+        size_t position = 0U;
+        while (position < LARGE_FILE_SIZE) {
+                size_t transfer = LARGE_FILE_SIZE - position;
+                if (transfer > sizeof(large_buffer)) {
+                        transfer = sizeof(large_buffer);
+                }
+                for (size_t index = 0U; index < transfer; index++) {
+                        large_buffer[index] =
+                            (uint8_t)((position + index) * 37U + 11U);
+                }
+                if (descriptor < 0 ||
+                    rose_write((int)descriptor, large_buffer, transfer) !=
+                        (long)transfer) {
+                        return 42;
+                }
+                position += transfer;
+        }
+        if (rose_stat("/tmp/state", &status) != 0 ||
+            status.size != LARGE_FILE_SIZE ||
+            rose_lseek((int)descriptor, 0, USER_SEEK_SET) != 0) {
+                return 43;
+        }
+        position = 0U;
+        while (position < LARGE_FILE_SIZE) {
+                size_t transfer = LARGE_FILE_SIZE - position;
+                if (transfer > sizeof(large_buffer)) {
+                        transfer = sizeof(large_buffer);
+                }
+                if (rose_read((int)descriptor, large_buffer, transfer) !=
+                    (long)transfer) {
+                        return 44;
+                }
+                for (size_t index = 0U; index < transfer; index++) {
+                        uint8_t expected =
+                            (uint8_t)((position + index) * 37U + 11U);
+                        if (large_buffer[index] != expected) {
+                                return 44;
+                        }
+                }
+                position += transfer;
+        }
+        if (rose_close((int)descriptor) != 0) {
+                return 44;
+        }
+
+        descriptor = rose_open("/tmp/state", USER_OPEN_WRITE |
+                                                 USER_OPEN_TRUNCATE);
+        if (descriptor < 0 || rose_stat("/tmp/state", &status) != 0 ||
+            status.size != 0U || rose_close((int)descriptor) != 0) {
+                return 45;
         }
 
         descriptor = rose_open("/tmp", USER_OPEN_READ | USER_OPEN_DIRECTORY);

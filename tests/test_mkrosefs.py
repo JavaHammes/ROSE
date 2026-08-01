@@ -20,10 +20,31 @@ class Ext2Image:
         mode = struct.unpack_from("<H", self.contents, offset)[0]
         size = struct.unpack_from("<I", self.contents, offset + 4)[0]
         sector_count = struct.unpack_from("<I", self.contents, offset + 28)[0]
-        blocks = struct.unpack_from(
+        direct_blocks = struct.unpack_from(
             f"<{mkrosefs.DIRECT_BLOCK_COUNT}I", self.contents, offset + 40
         )
-        return mode, size, sector_count, blocks
+        indirect_block = struct.unpack_from(
+            "<I", self.contents, offset + 40 + mkrosefs.DIRECT_BLOCK_COUNT * 4
+        )[0]
+        blocks = list(direct_blocks)
+        if indirect_block != 0:
+            blocks.extend(
+                struct.unpack_from(
+                    f"<{mkrosefs.INDIRECT_BLOCK_ENTRY_COUNT}I",
+                    self.contents,
+                    indirect_block * mkrosefs.BLOCK_SIZE,
+                )
+            )
+        return mode, size, sector_count, tuple(blocks)
+
+    def indirect_block(self, number: int) -> int:
+        offset = (
+            mkrosefs.INODE_TABLE_BLOCK * mkrosefs.BLOCK_SIZE
+            + (number - 1) * mkrosefs.INODE_SIZE
+            + 40
+            + mkrosefs.DIRECT_BLOCK_COUNT * 4
+        )
+        return struct.unpack_from("<I", self.contents, offset)[0]
 
     def children(self, inode_number: int) -> dict[str, int]:
         _, size, _, blocks = self.inode(inode_number)
@@ -111,6 +132,41 @@ class RootImageTests(unittest.TestCase):
         self.assertEqual(image.read_file("/etc/config"), b"configured\n")
         self.assertEqual(image.read_file("/empty"), b"")
 
+    def test_supports_direct_and_single_indirect_file_boundaries(self) -> None:
+        sizes = (
+            mkrosefs.DIRECT_BLOCK_COUNT * mkrosefs.BLOCK_SIZE,
+            mkrosefs.DIRECT_BLOCK_COUNT * mkrosefs.BLOCK_SIZE + 1,
+            mkrosefs.MAX_FILE_BLOCK_COUNT * mkrosefs.BLOCK_SIZE,
+        )
+        pattern = bytes(range(251))
+
+        for size in sizes:
+            with self.subTest(size=size):
+                with tempfile.TemporaryDirectory() as directory:
+                    payload = (
+                        pattern * ((size + len(pattern) - 1) // len(pattern))
+                    )[:size]
+                    output = Path(directory) / "root.ext2"
+                    mkrosefs.build_image(output, {"/large": payload})
+                    image = Ext2Image(output.read_bytes())
+                    inode_number = image.resolve("/large")
+                    _, inode_size, sector_count, _ = image.inode(inode_number)
+                    data_blocks = (
+                        size + mkrosefs.BLOCK_SIZE - 1
+                    ) // mkrosefs.BLOCK_SIZE
+                    has_indirect = data_blocks > mkrosefs.DIRECT_BLOCK_COUNT
+
+                    self.assertEqual(inode_size, size)
+                    self.assertEqual(image.read_file("/large"), payload)
+                    self.assertEqual(
+                        image.indirect_block(inode_number) != 0, has_indirect
+                    )
+                    self.assertEqual(
+                        sector_count,
+                        (data_blocks + int(has_indirect))
+                        * (mkrosefs.BLOCK_SIZE // 512),
+                    )
+
     def test_rejects_paths_the_guest_cannot_resolve(self) -> None:
         invalid_paths = (
             "relative",
@@ -147,9 +203,9 @@ class RootImageTests(unittest.TestCase):
             output = Path(directory) / "root.ext2"
             output.write_bytes(b"existing image")
             oversized = b"x" * (
-                mkrosefs.DIRECT_BLOCK_COUNT * mkrosefs.BLOCK_SIZE + 1
+                mkrosefs.MAX_FILE_BLOCK_COUNT * mkrosefs.BLOCK_SIZE + 1
             )
-            with self.assertRaisesRegex(ValueError, "direct-block"):
+            with self.assertRaisesRegex(ValueError, "single-indirect"):
                 mkrosefs.build_image(output, {"/oversized": oversized})
             self.assertEqual(output.read_bytes(), b"existing image")
 

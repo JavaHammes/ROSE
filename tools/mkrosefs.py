@@ -24,6 +24,8 @@ FIRST_CONTENT_BLOCK = INODE_TABLE_BLOCK + INODE_TABLE_BLOCKS
 FIRST_NORMAL_INODE = 11
 ROOT_INODE = 2
 DIRECT_BLOCK_COUNT = 12
+INDIRECT_BLOCK_ENTRY_COUNT = BLOCK_SIZE // 4
+MAX_FILE_BLOCK_COUNT = DIRECT_BLOCK_COUNT + INDIRECT_BLOCK_ENTRY_COUNT
 GUEST_PATH_MAX = 64
 # Keep this in sync with VFS_DIRECTORY_NAME_MAX. The guest reserves one byte
 # for the terminator, so valid on-disk names must be shorter than this value.
@@ -37,6 +39,7 @@ class Node:
     data: bytes = b""
     inode: int = 0
     blocks: list[int] = field(default_factory=list)
+    indirect_block: int = 0
 
     @property
     def name(self) -> str:
@@ -142,10 +145,18 @@ def allocate_blocks(nodes: dict[str, Node]) -> int:
     for path in sorted(nodes, key=lambda item: (item.count("/"), item)):
         node = nodes[path]
         count = 1 if node.directory else math.ceil(len(node.data) / BLOCK_SIZE)
+        if count > MAX_FILE_BLOCK_COUNT:
+            raise ValueError(f"{path} exceeds the single-indirect file limit")
+
+        direct_count = min(count, DIRECT_BLOCK_COUNT)
+        node.blocks = list(range(next_block, next_block + direct_count))
+        next_block += direct_count
         if count > DIRECT_BLOCK_COUNT:
-            raise ValueError(f"{path} exceeds the direct-block file limit")
-        node.blocks = list(range(next_block, next_block + count))
-        next_block += count
+            node.indirect_block = next_block
+            next_block += 1
+            indirect_count = count - DIRECT_BLOCK_COUNT
+            node.blocks.extend(range(next_block, next_block + indirect_count))
+            next_block += indirect_count
     if next_block > BLOCK_COUNT:
         raise ValueError("root image is full")
     return next_block
@@ -223,9 +234,20 @@ def write_inode(image: bytearray, node: Node, child_directory_count: int) -> Non
     put_u16(image, offset, mode)
     put_u32(image, offset + 4, size)
     put_u16(image, offset + 26, links)
-    put_u32(image, offset + 28, len(node.blocks) * (BLOCK_SIZE // 512))
-    for index, block in enumerate(node.blocks):
+    allocated_blocks = len(node.blocks) + (1 if node.indirect_block else 0)
+    put_u32(image, offset + 28, allocated_blocks * (BLOCK_SIZE // 512))
+    for index, block in enumerate(node.blocks[:DIRECT_BLOCK_COUNT]):
         put_u32(image, offset + 40 + index * 4, block)
+    put_u32(image, offset + 40 + DIRECT_BLOCK_COUNT * 4, node.indirect_block)
+
+
+def write_indirect_blocks(image: bytearray, nodes: dict[str, Node]) -> None:
+    for node in nodes.values():
+        if node.indirect_block == 0:
+            continue
+        offset = node.indirect_block * BLOCK_SIZE
+        for index, block in enumerate(node.blocks[DIRECT_BLOCK_COUNT:]):
+            put_u32(image, offset + index * 4, block)
 
 
 def write_directories(image: bytearray, nodes: dict[str, Node]) -> None:
@@ -283,6 +305,7 @@ def build_image(output: Path, files: dict[str, bytes]) -> None:
             for candidate in nodes.values()
         )
         write_inode(image, node, child_directories)
+    write_indirect_blocks(image, nodes)
     write_directories(image, nodes)
 
     output.parent.mkdir(parents=True, exist_ok=True)
