@@ -203,9 +203,10 @@ static int run_syscall_test(void) {
         }
 
         long descriptor = rose_open("/etc/motd", USER_OPEN_READ);
+        long parent_pid = rose_getpid();
         char byte;
 
-        if (descriptor != 3 ||
+        if (descriptor != 3 || parent_pid <= 0 ||
             rose_read(USER_STDOUT_FILENO, &byte, 1U) !=
                 -USER_ERROR_BAD_FILE_DESCRIPTOR ||
             rose_read((int)descriptor, (void *)kernel_address, 1U) !=
@@ -261,12 +262,60 @@ static int run_syscall_test(void) {
                 return 36;
         }
 
+        /* fork returns in both processes with private ELF, heap, and stack
+         * pages. Descriptor entries retain a shared open-file description, so
+         * the child advances the offset observed later by the parent. */
+        descriptor = rose_open("/etc/motd", USER_OPEN_READ);
+        char fork_character;
+        volatile uint64_t stack_cookie = UINT64_C(0x1020304050607080);
+        user_counter = UINT64_C(0x1122334455667788);
+        heap[0] = UINT8_C(0xa1);
+
+        if (descriptor != 3 ||
+            rose_read((int)descriptor, &fork_character, 1U) != 1 ||
+            fork_character != 'W') {
+                return 52;
+        }
+
+        long fork_pid = rose_fork();
+        if (fork_pid < 0) {
+                return 53;
+        }
+        if (fork_pid == 0) {
+                if (rose_getpid() == parent_pid ||
+                    user_counter != UINT64_C(0x1122334455667788) ||
+                    heap[0] != UINT8_C(0xa1) ||
+                    stack_cookie != UINT64_C(0x1020304050607080)) {
+                        rose_exit(54U);
+                }
+
+                user_counter = UINT64_C(0x8877665544332211);
+                heap[0] = UINT8_C(0xb2);
+                stack_cookie = UINT64_C(0x8070605040302010);
+                if (rose_read((int)descriptor, &fork_character, 1U) != 1 ||
+                    fork_character != 'e') {
+                        rose_exit(55U);
+                }
+                rose_exit(23U);
+        }
+
+        int fork_status = -1;
+        if (fork_pid == parent_pid ||
+            rose_waitpid(fork_pid, &fork_status, 0U) != fork_pid ||
+            !USER_WAIT_STATUS_EXITED(fork_status) ||
+            USER_WAIT_STATUS_EXIT_CODE(fork_status) != 23U ||
+            user_counter != UINT64_C(0x1122334455667788) ||
+            heap[0] != UINT8_C(0xa1) ||
+            stack_cookie != UINT64_C(0x1020304050607080) ||
+            rose_read((int)descriptor, &fork_character, 1U) != 1 ||
+            fork_character != 'l' || rose_close((int)descriptor) != 0) {
+                return 56;
+        }
+
         char *child_arguments[] = {"/bin/hello", NULL};
         char *child_environment[] = {NULL};
-        long parent_pid = rose_getpid();
 
-        if (parent_pid <= 0 ||
-            rose_waitpid(parent_pid, NULL, 0U) != -USER_ERROR_NO_CHILD ||
+        if (rose_waitpid(parent_pid, NULL, 0U) != -USER_ERROR_NO_CHILD ||
             rose_waitpid(-1, NULL, 2U) !=
                 -USER_ERROR_INVALID_ARGUMENT ||
             rose_spawn("/missing", child_arguments, child_environment) !=
@@ -321,6 +370,7 @@ static int run_syscall_test(void) {
         }
 
         print("Process hierarchy passed\n");
+        print("Fork semantics passed\n");
         print("Descriptor inheritance passed\n");
         print("Userspace heap passed\n");
         print("Syscall validation passed\n");

@@ -35,6 +35,7 @@ enum {
         PROCESS_DESCRIPTOR_LIMIT = 8,
         PROCESS_FIRST_OPEN_DESCRIPTOR = 3,
         PROCESS_LIMIT = 8,
+        PROCESS_OPEN_FILE_LIMIT = PROCESS_LIMIT * PROCESS_DESCRIPTOR_LIMIT,
         PIPE_LIMIT = 8,
         PIPE_BUFFER_SIZE = USER_IO_MAX,
         PROCESS_ARGUMENT_LIMIT = 16,
@@ -129,7 +130,6 @@ struct process {
         bool exit_reported;
         char current_directory[USER_PATH_MAX];
         struct process_descriptor descriptors[PROCESS_DESCRIPTOR_LIMIT];
-        struct process_open_file open_files[PROCESS_DESCRIPTOR_LIMIT];
 
         /* Blocking syscall continuation state. A process never returns to
          * U-mode while either pending flag is true. */
@@ -162,6 +162,7 @@ struct process_replacement {
 /* Fixed slots keep early process management independent of a kernel heap. */
 static struct process process_table[PROCESS_LIMIT];
 static struct process_pipe pipe_table[PIPE_LIMIT];
+static struct process_open_file open_file_table[PROCESS_OPEN_FILE_LIMIT];
 static struct process *active_process;
 static struct process *uart_write_owner;
 static uint64_t next_pid = 1U;
@@ -248,12 +249,11 @@ static void trap_frame_copy(struct trap_frame *destination,
         }
 }
 
-static struct process_open_file *process_open_file_allocate(
-    struct process *process) {
-        for (size_t index = 0U; index < PROCESS_DESCRIPTOR_LIMIT; index++) {
-                if (!process->open_files[index].used) {
+static struct process_open_file *process_open_file_allocate(void) {
+        for (size_t index = 0U; index < PROCESS_OPEN_FILE_LIMIT; index++) {
+                if (!open_file_table[index].used) {
                         struct process_open_file *open_file =
-                            &process->open_files[index];
+                            &open_file_table[index];
 
                         bytes_zero(open_file, sizeof(*open_file));
                         open_file->used = true;
@@ -269,7 +269,7 @@ static void process_descriptor_install(
     struct process_open_file *open_file) {
         if (descriptor->open_file != NULL || open_file == NULL ||
             !open_file->used ||
-            open_file->references >= PROCESS_DESCRIPTOR_LIMIT) {
+            open_file->references >= PROCESS_OPEN_FILE_LIMIT) {
                 panic("Invalid descriptor installation");
         }
 
@@ -311,7 +311,7 @@ static bool process_descriptors_initialize(struct process *process) {
         for (size_t descriptor = 0U;
              descriptor <= USER_STDERR_FILENO; descriptor++) {
                 struct process_open_file *open_file =
-                    process_open_file_allocate(process);
+                    process_open_file_allocate();
 
                 if (open_file == NULL) {
                         return false;
@@ -326,9 +326,9 @@ static bool process_descriptors_initialize(struct process *process) {
         return true;
 }
 
-/* Spawn inherits descriptors not marked close-on-exec. Each child receives
- * local open-file records so its descriptor table remains self-contained,
- * while aliases and underlying pipe endpoints are still shared correctly. */
+/* A new executable inherits descriptors not marked close-on-exec. The global
+ * open-file description is shared, matching exec/spawn semantics for offsets
+ * and pipe endpoint lifetime; close-on-exec remains descriptor-local. */
 static bool process_descriptors_clone(struct process *destination,
                                       const struct process *source) {
         for (size_t descriptor = 0U; descriptor < PROCESS_DESCRIPTOR_LIMIT;
@@ -343,45 +343,33 @@ static bool process_descriptors_clone(struct process *destination,
                         continue;
                 }
 
-                struct process_open_file *destination_open_file = NULL;
-                for (size_t previous = 0U; previous < descriptor; previous++) {
-                        if (source->descriptors[previous].open_file ==
-                            source_open_file &&
-                            destination->descriptors[previous].open_file !=
-                                NULL) {
-                                destination_open_file =
-                                    destination->descriptors[previous]
-                                        .open_file;
-                                break;
-                        }
-                }
+                process_descriptor_install(
+                    &destination->descriptors[descriptor],
+                    source_open_file);
+        }
 
-                if (destination_open_file == NULL) {
-                        destination_open_file =
-                            process_open_file_allocate(destination);
-                        if (destination_open_file == NULL) {
-                                return false;
-                        }
+        return true;
+}
 
-                        destination_open_file->access =
-                            source_open_file->access;
-                        destination_open_file->offset =
-                            source_open_file->offset;
-                        destination_open_file->pipe = source_open_file->pipe;
-                        destination_open_file->file = source_open_file->file;
-                        if (destination_open_file->pipe != NULL) {
-                                process_pipe_retain(
-                                    destination_open_file->pipe,
-                                    destination_open_file->access);
-                        }
+/* fork duplicates descriptor-table entries, including close-on-exec flags,
+ * while both tables continue to reference the same open-file descriptions. */
+static void process_descriptors_fork(struct process *destination,
+                                     const struct process *source) {
+        for (size_t descriptor = 0U; descriptor < PROCESS_DESCRIPTOR_LIMIT;
+             descriptor++) {
+                const struct process_descriptor *source_descriptor =
+                    &source->descriptors[descriptor];
+
+                if (source_descriptor->open_file == NULL) {
+                        continue;
                 }
 
                 process_descriptor_install(
                     &destination->descriptors[descriptor],
-                    destination_open_file);
+                    source_descriptor->open_file);
+                destination->descriptors[descriptor].close_on_exec =
+                    source_descriptor->close_on_exec;
         }
-
-        return true;
 }
 
 static void process_descriptors_close_all(struct process *process) {
@@ -807,6 +795,155 @@ static uint64_t process_create(struct process *process, const char *path,
         process_verify_address_space(root, process->stack_page);
 
         return 0U;
+}
+
+static void page_copy(void *destination, const void *source) {
+        uint64_t *destination_words = destination;
+        const uint64_t *source_words = source;
+
+        for (size_t index = 0U; index < PAGE_SIZE / sizeof(uint64_t);
+             index++) {
+                destination_words[index] = source_words[index];
+        }
+}
+
+/* Copy the ELF-owned leaves and reproduce their exact permissions. Each page
+ * is recorded before mapping so the ordinary image teardown also handles a
+ * partially constructed fork child. */
+static bool process_fork_loaded_image(struct process *child,
+                                      const struct process *parent) {
+        child->loaded_image.entry = parent->loaded_image.entry;
+
+        for (size_t index = 0U; index < parent->loaded_image.page_count;
+             index++) {
+                const struct elf_loaded_page *source_page =
+                    &parent->loaded_image.pages[index];
+                void *physical_page = page_alloc();
+
+                if (physical_page == NULL) {
+                        return false;
+                }
+
+                page_copy(physical_page, source_page->physical_page);
+                struct elf_loaded_page *destination_page =
+                    &child->loaded_image
+                         .pages[child->loaded_image.page_count++];
+                destination_page->virtual_address =
+                    source_page->virtual_address;
+                destination_page->physical_page = physical_page;
+                destination_page->flags = source_page->flags;
+
+                if (!page_table_map(child->address_space,
+                                    destination_page->virtual_address,
+                                    (uintptr_t)physical_page,
+                                    destination_page->flags)) {
+                        return false;
+                }
+        }
+
+        return true;
+}
+
+/* Heap pages are not part of ELF ownership metadata, so advance the candidate
+ * break after every mapping. That makes process_release_heap exact on any
+ * allocation failure. */
+static bool process_fork_heap(struct process *child,
+                              const struct process *parent) {
+        uintptr_t mapped_end = align_up_to_page(parent->heap_break);
+
+        for (uintptr_t address = parent->heap_start; address < mapped_end;
+             address += PAGE_SIZE) {
+                uintptr_t source_physical_address;
+                uint64_t flags;
+
+                if (!page_table_translate(parent->address_space, address,
+                                          &source_physical_address, &flags) ||
+                    (source_physical_address & (PAGE_SIZE - 1U)) != 0U ||
+                    (flags & (VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE)) !=
+                        (VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE) ||
+                    (flags & VM_PAGE_EXECUTE) != 0U) {
+                        panic("Fork source heap ownership mismatch");
+                }
+
+                void *physical_page = page_alloc();
+                if (physical_page == NULL) {
+                        return false;
+                }
+                page_copy(physical_page, (void *)source_physical_address);
+
+                if (!page_table_map(child->address_space, address,
+                                    (uintptr_t)physical_page, flags)) {
+                        page_free(physical_page);
+                        return false;
+                }
+                child->heap_break = address + PAGE_SIZE;
+        }
+
+        child->heap_break = parent->heap_break;
+        return true;
+}
+
+/* Eagerly clone the caller's complete user image. ROSE does not yet have page
+ * faults for copy-on-write, so fork pays the copy cost up front and produces
+ * fully private ELF, heap, and stack pages before the child becomes READY. */
+static uint64_t syscall_fork(const struct trap_frame *frame) {
+        struct process *parent = active_process;
+        struct process *child = process_find_available_slot();
+
+        if (child == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_TRY_AGAIN;
+        }
+
+        bytes_zero(child, sizeof(*child));
+        child->parent_pid = parent->pid;
+        child->exit_status = UINT64_MAX;
+        child->heap_start = parent->heap_start;
+        child->heap_break = parent->heap_start;
+        trap_frame_copy(&child->context, frame);
+        child->context.a0 = 0U;
+        child->context.sepc += 4U;
+
+        size_t directory_length =
+            string_length(parent->current_directory) + 1U;
+        for (size_t index = 0U; index < directory_length; index++) {
+                child->current_directory[index] =
+                    parent->current_directory[index];
+        }
+
+        child->address_space = virtual_memory_create_address_space();
+        child->stack_page = page_alloc();
+        child->kernel_trap_stack = page_alloc();
+
+        if (child->address_space == NULL || child->stack_page == NULL ||
+            child->kernel_trap_stack == NULL) {
+                goto out_of_memory;
+        }
+
+        page_copy(child->stack_page, parent->stack_page);
+        if (!page_table_map(child->address_space, USER_STACK_ADDRESS,
+                            (uintptr_t)child->stack_page,
+                            VM_PAGE_USER | VM_PAGE_READ | VM_PAGE_WRITE) ||
+            !process_fork_loaded_image(child, parent) ||
+            !process_fork_heap(child, parent)) {
+                goto out_of_memory;
+        }
+
+        process_descriptors_fork(child, parent);
+        process_verify_address_space(child->address_space,
+                                     child->stack_page);
+
+        child->pid = next_pid;
+        next_pid++;
+        if (next_pid == 0U) {
+                next_pid = 1U;
+        }
+        child->state = PROCESS_READY;
+        return child->pid;
+
+out_of_memory:
+        process_release_resources(child);
+        bytes_zero(child, sizeof(*child));
+        return (uint64_t)-(int64_t)USER_ERROR_OUT_OF_MEMORY;
 }
 
 /* Validate a complete user range with the requested leaf permissions. */
@@ -1537,7 +1674,7 @@ static uint64_t syscall_open(uintptr_t user_path, uint32_t flags) {
         }
 
         struct process_open_file *open_file =
-            process_open_file_allocate(active_process);
+            process_open_file_allocate();
         if (open_file == NULL) {
                 panic("Descriptor exists without open-file capacity");
         }
@@ -1870,19 +2007,26 @@ static uint64_t syscall_pipe(uintptr_t user_descriptors) {
 
         size_t descriptor_pair[2];
         size_t descriptor_count = 0U;
-        size_t free_open_files = 0U;
 
         for (size_t index = 0U; index < PROCESS_DESCRIPTOR_LIMIT; index++) {
                 if (active_process->descriptors[index].open_file == NULL &&
                     descriptor_count < 2U) {
                         descriptor_pair[descriptor_count++] = index;
                 }
-                if (!active_process->open_files[index].used) {
+        }
+        if (descriptor_count != 2U) {
+                return (uint64_t)-(int64_t)USER_ERROR_TOO_MANY_FILES;
+        }
+
+        size_t free_open_files = 0U;
+        for (size_t index = 0U; index < PROCESS_OPEN_FILE_LIMIT; index++) {
+                if (!open_file_table[index].used) {
                         free_open_files++;
                 }
         }
-        if (descriptor_count != 2U || free_open_files < 2U) {
-                return (uint64_t)-(int64_t)USER_ERROR_TOO_MANY_FILES;
+        if (free_open_files < 2U) {
+                return (uint64_t)-(int64_t)
+                    USER_ERROR_FILE_TABLE_OVERFLOW;
         }
 
         struct process_pipe *pipe = process_pipe_allocate();
@@ -1892,9 +2036,9 @@ static uint64_t syscall_pipe(uintptr_t user_descriptors) {
         }
 
         struct process_open_file *read_end =
-            process_open_file_allocate(active_process);
+            process_open_file_allocate();
         struct process_open_file *write_end =
-            process_open_file_allocate(active_process);
+            process_open_file_allocate();
         if (read_end == NULL || write_end == NULL) {
                 panic("Reserved pipe open-file records disappeared");
         }
@@ -2648,6 +2792,11 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 frame->a0 = syscall_spawn((uintptr_t)frame->a0,
                                           (uintptr_t)frame->a1,
                                           (uintptr_t)frame->a2);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_FORK:
+                frame->a0 = syscall_fork(frame);
                 frame->sepc += 4U;
                 return;
 

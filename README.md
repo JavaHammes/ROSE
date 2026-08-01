@@ -31,23 +31,27 @@ scheduling, and automated emulator tests.
   retained as a boot-diagnostic fallback.
 - VFS regular files, directories, and character devices with canonical path
   lookup, create/truncate, stat, seek, directory iteration, mkdir, and unlink.
-- Eight-entry per-process descriptor tables with standard input, output, and
-  error attached to `/dev/console`; `dup` and `dup2` aliases share their file
-  offset and remain usable until the final alias is closed. Anonymous pipes
-  provide buffered interprocess byte streams, blocking reads and writes, EOF
+- Eight-entry per-process descriptor tables backed by a bounded global
+  open-file table, with standard input, output, and error attached to
+  `/dev/console`; aliases inherited by `dup`, `fork`, and `spawn` share their
+  file offset and remain usable until the final alias is closed. Anonymous
+  pipes provide buffered interprocess byte streams, blocking reads and writes, EOF
   and broken-pipe handling, descriptor inheritance across `spawn`, and endpoint
   lifetime tracking across descriptor aliases. Per-descriptor close-on-exec
   flags keep shell-private pipe ends and saved descriptors out of child images.
 - U-mode C runtime with descriptor I/O, `open`, `close`, `stat`, `fstat`,
   `lseek`, `dup`, `dup2`, directory iteration, `mkdir`, `unlink`, `chdir`,
-  `getcwd`, `pipe`, descriptor flags, `spawn`, `execve`, `getpid`, `waitpid`,
-  `brk`, `exit`, and `yield`
+  `getcwd`, `pipe`, descriptor flags, `fork`, `spawn`, `execve`, `getpid`,
+  `waitpid`, `brk`, `exit`, and `yield`
   system calls. Relative paths resolve from a canonical per-process working
   directory. `brk` provides a private, zero-filled, growable userspace heap
   between the ELF image and stack guard; shrinking or process teardown returns
   its physical pages. A successful `execve` atomically replaces the user image
   while preserving the process identity, working directory, and descriptors
-  not marked close-on-exec. `spawn` creates a child with copied arguments,
+  not marked close-on-exec. `fork` eagerly copies the caller's ELF, heap, and
+  stack pages into an isolated child address space, returns in both processes,
+  and preserves shared open-file descriptions and descriptor flags. `spawn`
+  creates a child with copied arguments,
   environment, working directory, and inheritable descriptors; `waitpid`
   supports a specific child or any child and optional nonblocking polling.
   Programs start with conventional `argc`, `argv`, and `envp` values copied to
@@ -165,9 +169,10 @@ The smoke test covers disk-root boot through `/sbin/init` into `/bin/sh`,
 userspace line parsing and built-ins, `PATH` execution, VirtIO-backed ext2
 mutation, directory utilities, input/output redirection, multi-stage pipelines,
 user/kernel isolation, syscall validation, working-directory resolution,
-shared duplicate-descriptor offsets, close-on-exec inheritance, userspace heap
-growth and shrinkage, blocking UART and pipe I/O, child creation and waiting,
-memory reclamation, fallback-ramfs shell boot, and clean shutdown.
+shared descriptor offsets across aliases and processes, close-on-exec
+inheritance, userspace heap growth and shrinkage, eager `fork` address-space
+isolation, blocking UART and pipe I/O, child creation and waiting, memory
+reclamation, fallback-ramfs shell boot, and clean shutdown.
 
 For source-level debugging, use `make debug` in one terminal and `make gdb` in
 another. `make disassemble` writes an annotated disassembly to
@@ -207,5 +212,6 @@ implementation is synchronous,
 write-through, limited to one block group and twelve direct blocks per inode
 (12 KiB files), and does not yet provide journaling or crash recovery. The
 VirtIO queue is polled synchronously; it is not yet connected to a scheduler
-completion channel. There is no `fork`, signals, general-purpose kernel threads,
-ASIDs, networking, users, or permissions enforcement.
+completion channel. `fork` currently copies pages eagerly rather than using
+copy-on-write. There are no signals, general-purpose kernel threads, ASIDs,
+networking, users, or permissions enforcement.

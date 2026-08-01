@@ -27,6 +27,7 @@
 #define USER_SYSCALL_DUP2 21
 #define USER_SYSCALL_PIPE 22
 #define USER_SYSCALL_SET_DESCRIPTOR_FLAGS 23
+#define USER_SYSCALL_FORK 24
 
 #else
 
@@ -55,6 +56,7 @@ enum user_syscall_number {
         USER_SYSCALL_DUP2 = 21,
         USER_SYSCALL_PIPE = 22,
         USER_SYSCALL_SET_DESCRIPTOR_FLAGS = 23,
+        USER_SYSCALL_FORK = 24,
 };
 
 /* Stable negative error values returned in a0 by failed system calls. */

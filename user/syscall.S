@@ -196,6 +196,17 @@ rose_spawn:
     ret
 .size rose_spawn, . - rose_spawn
 
+.section .text.rose_fork,"ax",@progbits
+.align 2
+.globl rose_fork
+.type rose_fork, @function
+rose_fork:
+    /* The child resumes after this ECALL with zero; the parent receives PID. */
+    li a7, USER_SYSCALL_FORK
+    ecall
+    ret
+.size rose_fork, . - rose_fork
+
 .section .text.rose_getpid,"ax",@progbits
 .align 2
 .globl rose_getpid

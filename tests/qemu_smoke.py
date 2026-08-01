@@ -192,6 +192,7 @@ def main() -> int:
             "Working directory passed",
             "Descriptor duplication passed",
             "Descriptor inheritance passed",
+            "Fork semantics passed",
             "Process hierarchy passed",
             "Userspace heap passed",
             "Syscall validation passed",
@@ -291,6 +292,7 @@ def main() -> int:
         require(
             fallback.command("syscall-test"),
             "Descriptor inheritance passed",
+            "Fork semantics passed",
             "Syscall validation passed",
         )
         fallback.shutdown()

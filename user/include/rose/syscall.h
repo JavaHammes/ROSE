@@ -28,7 +28,8 @@ long rose_set_descriptor_flags(int descriptor, uint32_t flags);
 long rose_execve(const char *path, char *const arguments[],
                  char *const environment[]);
 
-/* Create a child process and wait for child state changes. */
+/* Clone the calling process, create a child image, and wait for children. */
+long rose_fork(void);
 long rose_spawn(const char *path, char *const arguments[],
                 char *const environment[]);
 long rose_getpid(void);
