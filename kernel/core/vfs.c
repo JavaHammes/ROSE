@@ -122,7 +122,9 @@ static const struct vfs_node *fallback_lookup(const char *path) {
 static int open_console(uint32_t flags, struct vfs_file *file) {
         if ((flags & (VFS_OPEN_CREATE | VFS_OPEN_TRUNCATE |
                       VFS_OPEN_DIRECTORY)) != 0U ||
-            (flags & (VFS_OPEN_READ | VFS_OPEN_WRITE)) == 0U) {
+            (flags & (VFS_OPEN_READ | VFS_OPEN_WRITE)) == 0U ||
+            ((flags & VFS_OPEN_APPEND) != 0U &&
+             (flags & VFS_OPEN_WRITE) == 0U)) {
                 return -VFS_ERROR_INVALID;
         }
         *file = (struct vfs_file){.type = VFS_NODE_CHARACTER_DEVICE,
@@ -132,7 +134,14 @@ static int open_console(uint32_t flags, struct vfs_file *file) {
 }
 
 int vfs_open(const char *path, uint32_t flags, struct vfs_file *file) {
-        if (path == NULL || file == NULL || path[0] != '/') {
+        const uint32_t valid_flags = VFS_OPEN_READ | VFS_OPEN_WRITE |
+                                     VFS_OPEN_CREATE | VFS_OPEN_TRUNCATE |
+                                     VFS_OPEN_DIRECTORY | VFS_OPEN_APPEND;
+        if (path == NULL || file == NULL || path[0] != '/' ||
+            (flags & ~valid_flags) != 0U ||
+            (flags & (VFS_OPEN_READ | VFS_OPEN_WRITE)) == 0U ||
+            ((flags & (VFS_OPEN_TRUNCATE | VFS_OPEN_APPEND)) != 0U &&
+             (flags & VFS_OPEN_WRITE) == 0U)) {
                 return -VFS_ERROR_INVALID;
         }
         if (strings_equal(path, "/dev/console")) {
@@ -152,8 +161,8 @@ int vfs_open(const char *path, uint32_t flags, struct vfs_file *file) {
         if (node == NULL) {
                 return -VFS_ERROR_NO_ENTRY;
         }
-        if ((flags & (VFS_OPEN_WRITE | VFS_OPEN_CREATE | VFS_OPEN_TRUNCATE)) !=
-            0U) {
+        if ((flags & (VFS_OPEN_WRITE | VFS_OPEN_CREATE | VFS_OPEN_TRUNCATE |
+                      VFS_OPEN_APPEND)) != 0U) {
                 return -VFS_ERROR_READ_ONLY;
         }
         if (((flags & VFS_OPEN_DIRECTORY) != 0U) !=

@@ -27,6 +27,7 @@ struct shell_command {
         int argument_count;
         char *input_path;
         char *output_path;
+        bool output_append;
 };
 
 struct shell_pipeline {
@@ -301,6 +302,7 @@ static bool shell_parse_pipeline(const char *line,
                 pipeline->commands[index].arguments[0] = NULL;
                 pipeline->commands[index].input_path = NULL;
                 pipeline->commands[index].output_path = NULL;
+                pipeline->commands[index].output_append = false;
         }
         pipeline->command_count = 0U;
         pipeline->background = false;
@@ -323,6 +325,11 @@ static bool shell_parse_pipeline(const char *line,
                 if (shell_is_operator(*source)) {
                         char operator = *source++;
                         saw_token = true;
+
+                        bool append = operator == '>' && *source == '>';
+                        if (append) {
+                                source++;
+                        }
 
                         if (operator == '&') {
                                 while (*source == ' ' || *source == '\t') {
@@ -358,7 +365,7 @@ static bool shell_parse_pipeline(const char *line,
                              command->output_path != NULL)) {
                                 return false;
                         }
-                        pending_redirection = operator;
+                        pending_redirection = append ? 'a' : operator;
                         continue;
                 }
 
@@ -415,8 +422,10 @@ static bool shell_parse_pipeline(const char *line,
                 if (pending_redirection == '<') {
                         command->input_path = word;
                         pending_redirection = '\0';
-                } else if (pending_redirection == '>') {
+                } else if (pending_redirection == '>' ||
+                           pending_redirection == 'a') {
                         command->output_path = word;
+                        command->output_append = pending_redirection == 'a';
                         pending_redirection = '\0';
                 } else {
                         command->arguments[command->argument_count++] = word;
@@ -732,7 +741,7 @@ static int run_foreground(char **arguments, bool report_status) {
 static void shell_help(void) {
         print("Built-ins: cd pwd echo env setenv unsetenv jobs fg clear help exit\n");
         print("Commands: ls cat echo pwd env mkdir rm\n");
-        print("Syntax: command [ARG...] [< FILE] [> FILE] [| command...] [&]\n");
+        print("Syntax: command [ARG...] [< FILE] [> FILE|>> FILE] [| command...] [&]\n");
 }
 
 static void shell_list_jobs(void) {
@@ -997,9 +1006,11 @@ static bool shell_apply_redirections(const struct shell_command *command) {
         }
 
         if (command->output_path != NULL) {
+                uint32_t flags = USER_OPEN_WRITE | USER_OPEN_CREATE;
+                flags |= command->output_append ? USER_OPEN_APPEND
+                                                : USER_OPEN_TRUNCATE;
                 long descriptor = rose_open(
-                    command->output_path,
-                    USER_OPEN_WRITE | USER_OPEN_CREATE | USER_OPEN_TRUNCATE);
+                    command->output_path, flags);
                 if (descriptor < 0) {
                         print("sh: unable to open output: ");
                         print(command->output_path);

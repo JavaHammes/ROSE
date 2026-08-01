@@ -1382,6 +1382,37 @@ static int run_filesystem_test(void) {
                 return 21;
         }
 
+        static const char suffix[] = "appended\n";
+        if (rose_open("/tmp/state", USER_OPEN_READ | USER_OPEN_APPEND) !=
+            -USER_ERROR_INVALID_ARGUMENT) {
+                return 46;
+        }
+        descriptor = rose_open("/tmp/state",
+                               USER_OPEN_WRITE | USER_OPEN_APPEND);
+        if (descriptor < 0 ||
+            rose_lseek((int)descriptor, 0, USER_SEEK_SET) != 0 ||
+            rose_write((int)descriptor, suffix, sizeof(suffix) - 1U) !=
+                (long)(sizeof(suffix) - 1U) ||
+            rose_lseek((int)descriptor, 0, USER_SEEK_CURRENT) !=
+                (long)(sizeof(payload) + sizeof(suffix) - 2U) ||
+            rose_close((int)descriptor) != 0) {
+                return 46;
+        }
+        descriptor = rose_open("/tmp/state", USER_OPEN_READ);
+        if (descriptor < 0 ||
+            rose_lseek((int)descriptor, (int64_t)(sizeof(payload) - 1U),
+                       USER_SEEK_SET) != (long)(sizeof(payload) - 1U)) {
+                return 46;
+        }
+        char suffix_buffer[sizeof(suffix)];
+        count = rose_read((int)descriptor, suffix_buffer, sizeof(suffix) - 1U);
+        suffix_buffer[sizeof(suffix) - 1U] = '\0';
+        if (count != (long)(sizeof(suffix) - 1U) ||
+            !strings_equal(suffix_buffer, suffix) ||
+            rose_close((int)descriptor) != 0) {
+                return 46;
+        }
+
         /* Cross both the twelfth direct-block boundary and unaligned block
          * offsets, then reread the complete singly indirect file. */
         descriptor = rose_open("/tmp/state", USER_OPEN_READ | USER_OPEN_WRITE |

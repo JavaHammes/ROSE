@@ -288,8 +288,13 @@ def main() -> int:
 
         require(session.command("mkdir /tmp"), "rose> ")
         session.command("echo redirection works > /tmp/message")
+        session.command("echo append works >> /tmp/message")
         require(session.command("ls /tmp"), "message")
-        require(session.command("cat < /tmp/message"), "redirection works")
+        require(
+            session.command("cat < /tmp/message"),
+            "redirection works",
+            "append works",
+        )
         session.command("echo two-stage-data | cat > /tmp/two-stage")
         require(session.command("cat /tmp/two-stage"), "two-stage-data")
         session.command("echo three-stage-data | cat | cat > /tmp/three-stage")

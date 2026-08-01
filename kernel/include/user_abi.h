@@ -130,6 +130,7 @@ enum user_open_flags {
         USER_OPEN_CREATE = (1U << 2),
         USER_OPEN_TRUNCATE = (1U << 3),
         USER_OPEN_DIRECTORY = (1U << 4),
+        USER_OPEN_APPEND = (1U << 5),
 };
 
 enum user_descriptor_flags {

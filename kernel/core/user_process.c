@@ -72,7 +72,9 @@ _Static_assert((uint32_t)USER_OPEN_READ == (uint32_t)VFS_OPEN_READ &&
                    (uint32_t)USER_OPEN_TRUNCATE ==
                        (uint32_t)VFS_OPEN_TRUNCATE &&
                    (uint32_t)USER_OPEN_DIRECTORY ==
-                       (uint32_t)VFS_OPEN_DIRECTORY,
+                       (uint32_t)VFS_OPEN_DIRECTORY &&
+                   (uint32_t)USER_OPEN_APPEND ==
+                       (uint32_t)VFS_OPEN_APPEND,
                "User and VFS open flags must match");
 
 /*
@@ -109,6 +111,7 @@ extern uintptr_t user_saved_kernel_context_sp;
 struct process_open_file {
         bool used;
         uint8_t access;
+        bool append;
         size_t references;
         uint64_t offset;
         struct process_pipe *read_pipe;
@@ -2437,12 +2440,22 @@ static uint64_t syscall_write_begin(uint64_t descriptor, uintptr_t user_buffer,
         }
 
         if (open_file->file.type == VFS_NODE_REGULAR) {
+                uint64_t write_offset = open_file->offset;
+                if (open_file->append) {
+                        struct vfs_stat status;
+                        int stat_result =
+                            vfs_stat_file(&open_file->file, &status);
+                        if (stat_result != 0) {
+                                return (uint64_t)(int64_t)stat_result;
+                        }
+                        write_offset = status.size;
+                }
                 user_copy_from((uint8_t *)active_process->write_buffer,
                                user_buffer, length);
-                long result = vfs_write(&open_file->file, open_file->offset,
+                long result = vfs_write(&open_file->file, write_offset,
                                         active_process->write_buffer, length);
                 if (result > 0) {
-                        open_file->offset += (uint64_t)result;
+                        open_file->offset = write_offset + (uint64_t)result;
                 }
                 return (uint64_t)(int64_t)result;
         }
@@ -2534,6 +2547,7 @@ static uint64_t syscall_open(uintptr_t user_path, uint32_t flags) {
                 panic("Descriptor exists without open-file capacity");
         }
         open_file->access = access;
+        open_file->append = (flags & VFS_OPEN_APPEND) != 0U;
         open_file->file = file;
         process_descriptor_install(&active_process->descriptors[descriptor],
                                    open_file);

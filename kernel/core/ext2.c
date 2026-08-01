@@ -777,10 +777,10 @@ static int ext2_open_file(void *context, const char *path, uint32_t flags,
         struct ext2_filesystem *fs = context;
         const uint32_t valid_flags = VFS_OPEN_READ | VFS_OPEN_WRITE |
                                      VFS_OPEN_CREATE | VFS_OPEN_TRUNCATE |
-                                     VFS_OPEN_DIRECTORY;
+                                     VFS_OPEN_DIRECTORY | VFS_OPEN_APPEND;
         if ((flags & ~valid_flags) != 0U ||
             (flags & (VFS_OPEN_READ | VFS_OPEN_WRITE)) == 0U ||
-            ((flags & VFS_OPEN_TRUNCATE) != 0U &&
+            ((flags & (VFS_OPEN_TRUNCATE | VFS_OPEN_APPEND)) != 0U &&
              (flags & VFS_OPEN_WRITE) == 0U)) {
                 return -VFS_ERROR_INVALID;
         }

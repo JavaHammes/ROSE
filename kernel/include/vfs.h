@@ -22,6 +22,7 @@ enum vfs_open_flags {
         VFS_OPEN_CREATE = (1U << 2),
         VFS_OPEN_TRUNCATE = (1U << 3),
         VFS_OPEN_DIRECTORY = (1U << 4),
+        VFS_OPEN_APPEND = (1U << 5),
 };
 
 /* Values intentionally match the stable user ABI errno numbers. */

@@ -97,8 +97,9 @@ scheduling, and automated emulator tests.
   `SIGTTIN`.
 - Interactive `/bin/sh` process with console line editing, quoted and escaped
   argument parsing, mutable environment variables, `PATH` lookup, working
-  directory built-ins, `<` and truncating `>` redirection, foreground and `&`
-  background pipelines of up to six commands, and `jobs`/`fg` job management.
+  directory built-ins, `<`, truncating `>`, and appending `>>` redirection,
+  foreground and `&` background pipelines of up to six commands, and
+  `jobs`/`fg` job management.
   Practical `/bin` utilities include `ls`, `cat`, `echo`, `pwd`, `env`,
   `mkdir`, and `rm`. Command syntax and dispatch do not run in supervisor mode.
 - Sixteen-slot round-robin process scheduler with timer preemption, guarded user
@@ -180,6 +181,7 @@ Useful commands are:
 | `cat [FILE...]` | Copy files, or standard input, to standard output. |
 | `mkdir DIR...` / `rm PATH...` | Create or remove filesystem entries. |
 | `echo hello > /tmp/message` | Create or truncate a file using redirection. |
+| `echo again >> /tmp/message` | Append to a file using redirection. |
 | `cat < /tmp/message` | Feed a file to a command as standard input. |
 | `echo hello \| cat \| cat` | Run a multi-stage foreground pipeline. |
 | `hello` | Resolve `/bin/hello` through `PATH` and run it. |
@@ -298,8 +300,8 @@ another. `make disassemble` writes an annotated disassembly to
 ## Deliberate limitations
 
 ROSE currently targets one hart and one QEMU `virt` platform. The shell has no
-append redirection, descriptor number syntax, expansion, `bg` command, session
-management, or scripting language. The ext2 implementation is synchronous,
+descriptor number syntax, expansion, `bg` command, session management, or
+scripting language. The ext2 implementation is synchronous,
 write-through, limited to one block group and direct plus singly indirect block
 addressing (268 KiB files), and does not yet provide journaling or crash
 recovery. The VirtIO queue is polled synchronously; it is not yet connected to
