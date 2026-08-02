@@ -3,13 +3,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "rose/font.h"
 #include "rose/gui.h"
 #include "rose/syscall.h"
 #include "user_abi.h"
 
 enum {
-        FONT_WIDTH = 5,
-        FONT_HEIGHT = 7,
+        FONT_WIDTH = ROSE_FONT_WIDTH,
+        FONT_HEIGHT = ROSE_FONT_HEIGHT,
         WINDOW_LIMIT = 12,
         CAPACITY_STRESS_CYCLES = 3,
         PANEL_HEIGHT = 54,
@@ -19,6 +20,11 @@ enum {
         WINDOW_SHADOW_Y = 11,
         POINTER_SIZE = 22,
         KEY_ESCAPE = 1,
+        KEY_T = 20,
+        KEY_LEFT_CONTROL = 29,
+        KEY_LEFT_ALT = 56,
+        KEY_RIGHT_CONTROL = 97,
+        KEY_RIGHT_ALT = 100,
 };
 
 #define COLOR_PANEL UINT32_C(0x0010192a)
@@ -34,39 +40,6 @@ enum {
 #define COLOR_SHADOW UINT32_C(0x00101828)
 #define COLOR_WHITE UINT32_C(0x00ffffff)
 
-static const uint8_t font[59][FONT_WIDTH] = {
-    {0x00, 0x00, 0x00, 0x00, 0x00}, {0x00, 0x00, 0x5f, 0x00, 0x00},
-    {0x00, 0x07, 0x00, 0x07, 0x00}, {0x14, 0x7f, 0x14, 0x7f, 0x14},
-    {0x24, 0x2a, 0x7f, 0x2a, 0x12}, {0x23, 0x13, 0x08, 0x64, 0x62},
-    {0x36, 0x49, 0x55, 0x22, 0x50}, {0x00, 0x05, 0x03, 0x00, 0x00},
-    {0x00, 0x1c, 0x22, 0x41, 0x00}, {0x00, 0x41, 0x22, 0x1c, 0x00},
-    {0x14, 0x08, 0x3e, 0x08, 0x14}, {0x08, 0x08, 0x3e, 0x08, 0x08},
-    {0x00, 0x50, 0x30, 0x00, 0x00}, {0x08, 0x08, 0x08, 0x08, 0x08},
-    {0x00, 0x60, 0x60, 0x00, 0x00}, {0x20, 0x10, 0x08, 0x04, 0x02},
-    {0x3e, 0x51, 0x49, 0x45, 0x3e}, {0x00, 0x42, 0x7f, 0x40, 0x00},
-    {0x42, 0x61, 0x51, 0x49, 0x46}, {0x21, 0x41, 0x45, 0x4b, 0x31},
-    {0x18, 0x14, 0x12, 0x7f, 0x10}, {0x27, 0x45, 0x45, 0x45, 0x39},
-    {0x3c, 0x4a, 0x49, 0x49, 0x30}, {0x01, 0x71, 0x09, 0x05, 0x03},
-    {0x36, 0x49, 0x49, 0x49, 0x36}, {0x06, 0x49, 0x49, 0x29, 0x1e},
-    {0x00, 0x36, 0x36, 0x00, 0x00}, {0x00, 0x56, 0x36, 0x00, 0x00},
-    {0x08, 0x14, 0x22, 0x41, 0x00}, {0x14, 0x14, 0x14, 0x14, 0x14},
-    {0x00, 0x41, 0x22, 0x14, 0x08}, {0x02, 0x01, 0x51, 0x09, 0x06},
-    {0x32, 0x49, 0x79, 0x41, 0x3e}, {0x7e, 0x11, 0x11, 0x11, 0x7e},
-    {0x7f, 0x49, 0x49, 0x49, 0x36}, {0x3e, 0x41, 0x41, 0x41, 0x22},
-    {0x7f, 0x41, 0x41, 0x22, 0x1c}, {0x7f, 0x49, 0x49, 0x49, 0x41},
-    {0x7f, 0x09, 0x09, 0x09, 0x01}, {0x3e, 0x41, 0x49, 0x49, 0x7a},
-    {0x7f, 0x08, 0x08, 0x08, 0x7f}, {0x00, 0x41, 0x7f, 0x41, 0x00},
-    {0x20, 0x40, 0x41, 0x3f, 0x01}, {0x7f, 0x08, 0x14, 0x22, 0x41},
-    {0x7f, 0x40, 0x40, 0x40, 0x40}, {0x7f, 0x02, 0x0c, 0x02, 0x7f},
-    {0x7f, 0x04, 0x08, 0x10, 0x7f}, {0x3e, 0x41, 0x41, 0x41, 0x3e},
-    {0x7f, 0x09, 0x09, 0x09, 0x06}, {0x3e, 0x41, 0x51, 0x21, 0x5e},
-    {0x7f, 0x09, 0x19, 0x29, 0x46}, {0x46, 0x49, 0x49, 0x49, 0x31},
-    {0x01, 0x01, 0x7f, 0x01, 0x01}, {0x3f, 0x40, 0x40, 0x40, 0x3f},
-    {0x1f, 0x20, 0x40, 0x20, 0x1f}, {0x3f, 0x40, 0x38, 0x40, 0x3f},
-    {0x63, 0x14, 0x08, 0x14, 0x63}, {0x07, 0x08, 0x70, 0x08, 0x07},
-    {0x61, 0x51, 0x49, 0x45, 0x43},
-};
-
 struct rectangle {
         int32_t x;
         int32_t y;
@@ -81,6 +54,8 @@ struct desktop_window {
         int32_t y;
         uint32_t width;
         uint32_t height;
+        uint32_t capacity_width;
+        uint32_t capacity_height;
         long pid;
         struct user_shared_memory_info mapping;
         struct rose_gui_surface *surface;
@@ -98,6 +73,9 @@ struct desktop {
         int32_t pointer_y;
         uint32_t pointer_buttons;
         bool dragging;
+        bool resizing;
+        bool control;
+        bool alt;
         int32_t drag_offset_x;
         int32_t drag_offset_y;
         struct rectangle dirty;
@@ -233,10 +211,8 @@ static void draw_text(struct desktop *desktop, int32_t x, int32_t y,
                       const char *text, uint32_t color, uint32_t scale) {
         while (*text != '\0') {
                 char character = *text++;
-                if (character >= 'a' && character <= 'z')
-                        character = (char)(character - 'a' + 'A');
-                if (character < ' ' || character > 'Z') character = '?';
-                const uint8_t *glyph = font[(uint8_t)character - ' '];
+                const uint8_t *glyph = rose_font_glyph(character);
+                if (glyph == NULL) return;
                 for (int32_t glyph_x = 0; glyph_x < FONT_WIDTH; glyph_x++) {
                         for (int32_t glyph_y = 0; glyph_y < FONT_HEIGHT;
                              glyph_y++) {
@@ -270,8 +246,8 @@ static void draw_background(struct desktop *desktop) {
         fill_rectangle(desktop, 23, 19, 16, 16, COLOR_GREEN);
         draw_text(desktop, 58, 17, "ROSE", COLOR_WHITE, 2U);
         draw_text(desktop, 142, 21, "MULTI-PROCESS DESKTOP", COLOR_MUTED, 1U);
-        draw_text(desktop, (int32_t)desktop->graphics.width - 156, 21,
-                  "ESC TO EXIT", COLOR_MUTED, 1U);
+        draw_text(desktop, (int32_t)desktop->graphics.width - 282, 21,
+                  "CTRL+ALT+T NEW TERMINAL", COLOR_MUTED, 1U);
 }
 
 static void draw_window(struct desktop *desktop,
@@ -316,10 +292,20 @@ static void draw_window(struct desktop *desktop,
                 for (int32_t x = left; x < right; x++) {
                         size_t source_y = (size_t)(y - content_y);
                         size_t source_x = (size_t)(x - content_x);
+                        size_t source_stride =
+                            window->surface->stride / sizeof(uint32_t);
                         put_pixel(desktop, x, y,
-                                  window->pixels[source_y * window->width +
+                                  window->pixels[source_y * source_stride +
                                                  source_x]);
                 }
+        }
+        if (strings_equal(window->program, "/bin/gui-terminal")) {
+                fill_rectangle(desktop, content_x + (int32_t)window->width - 10,
+                               content_y + (int32_t)window->height,
+                               12, WINDOW_BORDER, COLOR_ACCENT);
+                fill_rectangle(desktop, content_x + (int32_t)window->width,
+                               content_y + (int32_t)window->height - 10,
+                               WINDOW_BORDER, 12, COLOR_ACCENT);
         }
 }
 
@@ -380,6 +366,8 @@ static bool create_window(struct desktop *desktop, const char *title,
         window->y = y;
         window->width = width;
         window->height = height;
+        window->capacity_width = width;
+        window->capacity_height = height;
         window->surface = (struct rose_gui_surface *)window->mapping.address;
         window->pixels = (uint32_t *)(window->mapping.address +
                                       ROSE_GUI_SURFACE_PIXEL_OFFSET);
@@ -495,7 +483,18 @@ static void process_pointer(struct desktop *desktop,
                         }
                         focus_window(desktop, index);
                         window = &desktop->windows[desktop->window_count - 1U];
-                        if (event->y < window->y + WINDOW_TITLE_HEIGHT) {
+                        bool resize_handle =
+                            strings_equal(window->program,
+                                          "/bin/gui-terminal") &&
+                            event->x >= window->x + WINDOW_BORDER +
+                                            (int32_t)window->width - 14 &&
+                            event->y >= window->y + WINDOW_TITLE_HEIGHT +
+                                            (int32_t)window->height - 14;
+                        if (resize_handle) {
+                                desktop->resizing = true;
+                                desktop->dragging = false;
+                        } else if (event->y <
+                                   window->y + WINDOW_TITLE_HEIGHT) {
                                 if (event->x >= window->x + 7 &&
                                     event->x < window->x + 27) {
                                         window->surface->close_requested = 1U;
@@ -510,6 +509,38 @@ static void process_pointer(struct desktop *desktop,
                                 }
                         }
                         break;
+                }
+        }
+
+        if (desktop->resizing && desktop->window_count != 0U) {
+                struct desktop_window *window =
+                    &desktop->windows[desktop->window_count - 1U];
+                uint32_t width = event->x <= window->x + WINDOW_BORDER
+                                     ? 1U
+                                     : (uint32_t)(event->x - window->x -
+                                                  WINDOW_BORDER + 1);
+                uint32_t height =
+                    event->y <= window->y + WINDOW_TITLE_HEIGHT
+                        ? 1U
+                        : (uint32_t)(event->y - window->y -
+                                     WINDOW_TITLE_HEIGHT + 1);
+                if (width < 180U) width = 180U;
+                if (height < 100U) height = 100U;
+                if (width > window->capacity_width)
+                        width = window->capacity_width;
+                if (height > window->capacity_height)
+                        height = window->capacity_height;
+                if (width != window->width || height != window->height) {
+                        dirty_add(desktop, window_damage_rectangle(window));
+                        window->width = width;
+                        window->height = height;
+                        window->surface->width = width;
+                        window->surface->height = height;
+                        __sync_synchronize();
+                        window->surface->resize_sequence++;
+                        (void)rose_event_notify(
+                            &window->surface->resize_sequence);
+                        dirty_add(desktop, window_damage_rectangle(window));
                 }
         }
 
@@ -531,10 +562,14 @@ static void process_pointer(struct desktop *desktop,
                 if (window->y > max_y) window->y = max_y;
                 dirty_add(desktop, window_damage_rectangle(window));
         }
-        if (!is_pressed) desktop->dragging = false;
+        if (!is_pressed) {
+                desktop->dragging = false;
+                desktop->resizing = false;
+        }
         desktop->pointer_buttons = event->buttons;
 
-        if (!desktop->dragging && desktop->window_count != 0U) {
+        if (!desktop->dragging && !desktop->resizing &&
+            desktop->window_count != 0U) {
                 struct desktop_window *focused =
                     &desktop->windows[desktop->window_count - 1U];
                 struct rectangle content = {
@@ -596,6 +631,7 @@ static void remove_window(struct desktop *desktop, size_t index) {
         }
         desktop->window_count--;
         desktop->dragging = false;
+        desktop->resizing = false;
         if (desktop->window_count != 0U) {
                 desktop->windows[desktop->window_count - 1U].surface->focused =
                     1U;
@@ -784,11 +820,27 @@ static bool run_capacity_stress(struct desktop *desktop) {
         return true;
 }
 
+static bool launch_terminal(struct desktop *desktop) {
+        int32_t x = 28 + (int32_t)desktop->window_count * 34;
+        int32_t y = 74 + (int32_t)desktop->window_count * 22;
+        int32_t max_x = (int32_t)desktop->graphics.width - 574 - 10;
+        int32_t max_y = (int32_t)desktop->graphics.height - 390 -
+                        WINDOW_TITLE_HEIGHT - WINDOW_BORDER - 10;
+        if (x > max_x) x = max_x;
+        if (y > max_y) y = max_y;
+        return create_window(desktop, "TERMINAL", "/bin/gui-terminal", x, y,
+                             570, 390);
+}
+
 int rose_desktop_main(int argc, char **argv) {
         static struct desktop desktop;
         zero_bytes(&desktop, sizeof(desktop));
         desktop.pointer_x = 512;
         desktop.pointer_y = 384;
+        if (!rose_font_load()) {
+                print("desktop: font resource unavailable\n");
+                return 1;
+        }
         if (rose_graphics_map(&desktop.graphics) != 0 ||
             desktop.graphics.pixel_format != USER_GRAPHICS_PIXEL_XRGB8888 ||
             desktop.graphics.width < 800U || desktop.graphics.height < 600U) {
@@ -836,9 +888,25 @@ int rose_desktop_main(int argc, char **argv) {
                 long result;
                 while ((result = rose_input_read(&event)) > 0) {
                         if (event.type == USER_INPUT_EVENT_KEY) {
-                                if (event.value != 0 &&
-                                    event.code == KEY_ESCAPE) {
+                                bool pressed = event.value != 0U;
+                                if (event.code == KEY_LEFT_CONTROL ||
+                                    event.code == KEY_RIGHT_CONTROL) {
+                                        desktop.control = pressed;
+                                }
+                                if (event.code == KEY_LEFT_ALT ||
+                                    event.code == KEY_RIGHT_ALT) {
+                                        desktop.alt = pressed;
+                                }
+                                if (event.value == 1U && desktop.control &&
+                                    desktop.alt && event.code == KEY_ESCAPE) {
                                         desktop.exiting = true;
+                                } else if (event.value == 1U &&
+                                           desktop.control && desktop.alt &&
+                                           event.code == KEY_T) {
+                                        if (!launch_terminal(&desktop)) {
+                                                print("desktop: unable to open "
+                                                      "terminal\n");
+                                        }
                                 } else if (desktop.window_count != 0U) {
                                         send_event(
                                             &desktop.windows

@@ -5,15 +5,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "rose/font.h"
 #include "user_abi.h"
 
 enum {
         ROSE_GUI_SURFACE_MAGIC = 0x52475549U,
-        ROSE_GUI_SURFACE_VERSION = 1,
+        ROSE_GUI_SURFACE_VERSION = 2,
         ROSE_GUI_SURFACE_PIXEL_OFFSET = 4096,
         ROSE_GUI_EVENT_CAPACITY = 32,
-        ROSE_GUI_FONT_WIDTH = 5,
-        ROSE_GUI_FONT_HEIGHT = 7,
+        ROSE_GUI_FONT_WIDTH = ROSE_FONT_WIDTH,
+        ROSE_GUI_FONT_HEIGHT = ROSE_FONT_HEIGHT,
 };
 
 struct rose_gui_surface {
@@ -32,6 +33,7 @@ struct rose_gui_surface {
         volatile int32_t damage_y;
         volatile int32_t damage_width;
         volatile int32_t damage_height;
+        volatile uint32_t resize_sequence;
         volatile uint32_t input_read;
         volatile uint32_t input_write;
         struct user_input_event input_events[ROSE_GUI_EVENT_CAPACITY];
@@ -51,6 +53,7 @@ struct rose_gui_context {
 };
 
 bool rose_gui_connect(const char *identifier, struct rose_gui_context *context);
+bool rose_gui_refresh_size(struct rose_gui_context *context);
 void rose_gui_disconnect(struct rose_gui_context *context);
 void rose_gui_fill(struct rose_gui_context *context, int32_t x, int32_t y,
                    int32_t width, int32_t height, uint32_t color);

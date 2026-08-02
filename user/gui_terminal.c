@@ -4,127 +4,160 @@
 
 #include "rose/gui.h"
 #include "rose/syscall.h"
+#include "rose/terminal.h"
 #include "user_abi.h"
 
 enum {
-        TERMINAL_COLUMNS = 92,
-        TERMINAL_ROWS = 40,
-        TERMINAL_LEFT = 12,
-        TERMINAL_TOP = 22,
-        TERMINAL_LINE_HEIGHT = 9,
+        TERMINAL_CELL_WIDTH = ROSE_GUI_FONT_WIDTH + 1,
+        TERMINAL_CELL_HEIGHT = ROSE_GUI_FONT_HEIGHT + 2,
+        KEY_HOME = 102,
+        KEY_UP = 103,
+        KEY_PAGE_UP = 104,
+        KEY_LEFT = 105,
+        KEY_RIGHT = 106,
+        KEY_END = 107,
+        KEY_DOWN = 108,
+        KEY_PAGE_DOWN = 109,
+        KEY_INSERT = 110,
+        KEY_DELETE = 111,
 };
 
-#define TERMINAL_BACKGROUND UINT32_C(0x00101624)
-#define TERMINAL_FOREGROUND UINT32_C(0x00d9e7f2)
-#define TERMINAL_ACCENT UINT32_C(0x004de2b4)
-#define TERMINAL_MUTED UINT32_C(0x005f7189)
-
-struct terminal_state {
-        char cells[TERMINAL_ROWS][TERMINAL_COLUMNS];
-        size_t row;
-        size_t column;
-        bool escape;
+/* ANSI's logical palette is mapped onto legible colors for the ROSE theme. */
+static const uint32_t terminal_palette[16] = {
+    UINT32_C(0x00101624), UINT32_C(0x00aa3333),
+    UINT32_C(0x0033aa66), UINT32_C(0x00aa8833),
+    UINT32_C(0x004d72cc), UINT32_C(0x00aa55aa),
+    UINT32_C(0x0033aaaa), UINT32_C(0x00d9e7f2),
+    UINT32_C(0x005f7189), UINT32_C(0x00ff6666),
+    UINT32_C(0x0066dd88), UINT32_C(0x00ffcc66),
+    UINT32_C(0x007b9cff), UINT32_C(0x00ee77dd),
+    UINT32_C(0x0066dddd), UINT32_C(0x00ffffff),
 };
 
-/* The terminal grid deliberately lives in BSS: userspace stacks are one page
- * and should remain available for syscall and rendering call frames. */
-static struct terminal_state terminal;
+#define TERMINAL_CURSOR_ACTIVE UINT32_C(0x004de2b4)
+#define TERMINAL_CURSOR_INACTIVE UINT32_C(0x005f7189)
 
-static void terminal_clear_row(struct terminal_state *terminal, size_t row) {
-        for (size_t column = 0U; column < TERMINAL_COLUMNS; column++) {
-                terminal->cells[row][column] = ' ';
-        }
+/* Screen and scrollback storage live in BSS, leaving the small userspace stack
+ * available for syscall and renderer frames. Each terminal process owns one
+ * independent emulator instance. */
+static struct rose_terminal terminal;
+static bool terminal_output_carriage_return;
+
+static size_t terminal_columns_for_width(uint32_t width) {
+        size_t columns = width / TERMINAL_CELL_WIDTH;
+        if (columns == 0U) columns = 1U;
+        if (columns > ROSE_TERMINAL_MAX_COLUMNS)
+                columns = ROSE_TERMINAL_MAX_COLUMNS;
+        return columns;
 }
 
-static void terminal_initialize(struct terminal_state *terminal) {
-        terminal->row = 0U;
-        terminal->column = 0U;
-        terminal->escape = false;
-        for (size_t row = 0U; row < TERMINAL_ROWS; row++) {
-                terminal_clear_row(terminal, row);
-        }
+static size_t terminal_rows_for_height(uint32_t height) {
+        size_t rows = height / TERMINAL_CELL_HEIGHT;
+        if (rows == 0U) rows = 1U;
+        if (rows > ROSE_TERMINAL_MAX_ROWS) rows = ROSE_TERMINAL_MAX_ROWS;
+        return rows;
 }
 
-static void terminal_newline(struct terminal_state *terminal) {
-        terminal->column = 0U;
-        if (terminal->row + 1U < TERMINAL_ROWS) {
-                terminal->row++;
+static void render_glyph(struct rose_gui_context *gui, size_t row,
+                         size_t column,
+                         const struct rose_terminal_cell *cell,
+                         bool cursor, bool focused) {
+        uint8_t foreground = cell->foreground & 15U;
+        uint8_t background = cell->background & 15U;
+        if ((cell->attributes & ROSE_TERMINAL_ATTRIBUTE_BOLD) != 0U &&
+            foreground < 8U) {
+                foreground += 8U;
+        }
+        if ((cell->attributes & ROSE_TERMINAL_ATTRIBUTE_INVERSE) != 0U) {
+                uint8_t swap = foreground;
+                foreground = background;
+                background = swap;
+        }
+
+        int32_t x = (int32_t)(column * TERMINAL_CELL_WIDTH);
+        int32_t y = (int32_t)(row * TERMINAL_CELL_HEIGHT);
+        uint32_t foreground_color = terminal_palette[foreground];
+        uint32_t background_color = terminal_palette[background];
+        char text[2] = {(char)cell->character, '\0'};
+
+        if (cursor && focused) {
+                rose_gui_fill(gui, x, y, TERMINAL_CELL_WIDTH,
+                              TERMINAL_CELL_HEIGHT, TERMINAL_CURSOR_ACTIVE);
+                rose_gui_text(gui, x, y + 1, text, background_color, 1U);
                 return;
         }
-        for (size_t row = 1U; row < TERMINAL_ROWS; row++) {
-                for (size_t column = 0U; column < TERMINAL_COLUMNS; column++) {
-                        terminal->cells[row - 1U][column] =
-                            terminal->cells[row][column];
-                }
-        }
-        terminal_clear_row(terminal, TERMINAL_ROWS - 1U);
-}
 
-static void terminal_put(struct terminal_state *terminal, char character) {
-        if (terminal->escape) {
-                if ((character >= 'A' && character <= 'Z') ||
-                    (character >= 'a' && character <= 'z')) {
-                        terminal->escape = false;
-                }
-                return;
-        }
-        if (character == 27) {
-                terminal->escape = true;
-        } else if (character == '\r') {
-                terminal->column = 0U;
-        } else if (character == '\n') {
-                terminal_newline(terminal);
-        } else if (character == '\b' || character == 127) {
-                if (terminal->column != 0U) {
-                        terminal->column--;
-                        terminal->cells[terminal->row][terminal->column] = ' ';
-                }
-        } else if (character == '\t') {
-                size_t next = (terminal->column + 8U) & ~7U;
-                while (terminal->column < next &&
-                       terminal->column < TERMINAL_COLUMNS) {
-                        terminal->cells[terminal->row][terminal->column++] =
-                            ' ';
-                }
-        } else if (character >= ' ') {
-                if (terminal->column == TERMINAL_COLUMNS) {
-                        terminal_newline(terminal);
-                }
-                terminal->cells[terminal->row][terminal->column++] = character;
+        rose_gui_fill(gui, x, y, TERMINAL_CELL_WIDTH, TERMINAL_CELL_HEIGHT,
+                      background_color);
+        rose_gui_text(gui, x, y + 1, text, foreground_color, 1U);
+        if (cursor) {
+                rose_gui_fill(gui, x, y, TERMINAL_CELL_WIDTH, 1,
+                              TERMINAL_CURSOR_INACTIVE);
+                rose_gui_fill(gui, x, y + TERMINAL_CELL_HEIGHT - 1,
+                              TERMINAL_CELL_WIDTH, 1,
+                              TERMINAL_CURSOR_INACTIVE);
+                rose_gui_fill(gui, x, y, 1, TERMINAL_CELL_HEIGHT,
+                              TERMINAL_CURSOR_INACTIVE);
+                rose_gui_fill(gui, x + TERMINAL_CELL_WIDTH - 1, y, 1,
+                              TERMINAL_CELL_HEIGHT,
+                              TERMINAL_CURSOR_INACTIVE);
         }
 }
 
 static void terminal_render(struct rose_gui_context *gui,
-                            const struct terminal_state *terminal) {
-        rose_gui_fill(gui, 0, 0, (int32_t)gui->width, (int32_t)gui->height,
-                      TERMINAL_BACKGROUND);
-        rose_gui_fill(gui, 0, 0, (int32_t)gui->width, 4, TERMINAL_ACCENT);
-        rose_gui_text(gui, 12, 9, "ROSE SHELL  /  PTY", TERMINAL_MUTED, 1U);
-        char line[TERMINAL_COLUMNS + 1U];
-        for (size_t row = 0U; row < TERMINAL_ROWS; row++) {
-                size_t last = TERMINAL_COLUMNS;
-                while (last != 0U && terminal->cells[row][last - 1U] == ' ') {
-                        last--;
+                            struct rose_terminal *state, bool focused) {
+        size_t cursor_row = 0U;
+        size_t cursor_column = 0U;
+        bool cursor = rose_terminal_visible_cursor(
+            state, &cursor_row, &cursor_column);
+
+        for (size_t row = 0U; row < rose_terminal_rows(state); row++) {
+                size_t left;
+                size_t right;
+                if (!rose_terminal_take_dirty(state, row, &left, &right))
+                        continue;
+                for (size_t column = left; column < right; column++) {
+                        const struct rose_terminal_cell *cell =
+                            rose_terminal_visible_cell(state, row, column);
+                        render_glyph(gui, row, column, cell,
+                                     cursor && row == cursor_row &&
+                                         column == cursor_column,
+                                     focused);
                 }
-                for (size_t column = 0U; column < last; column++) {
-                        line[column] = terminal->cells[row][column];
+                rose_gui_present(gui,
+                                 (int32_t)(left * TERMINAL_CELL_WIDTH),
+                                 (int32_t)(row * TERMINAL_CELL_HEIGHT),
+                                 (int32_t)((right - left) *
+                                           TERMINAL_CELL_WIDTH),
+                                 TERMINAL_CELL_HEIGHT);
+        }
+}
+
+/* ROSE's compact terminal ABI does not yet expose POSIX OPOST/ONLCR. Programs
+ * nevertheless write conventional newline-only text, so perform that output
+ * postprocessing at the PTY frontend boundary instead of weakening VT line-
+ * feed semantics inside the emulator. */
+static void terminal_feed_output(struct rose_terminal *state,
+                                 const char *bytes, size_t count) {
+        for (size_t index = 0U; index < count; index++) {
+                if (bytes[index] == '\n' &&
+                    !terminal_output_carriage_return) {
+                        rose_terminal_feed(state, "\r", 1U);
                 }
-                line[last] = '\0';
-                rose_gui_text(gui, TERMINAL_LEFT,
-                              TERMINAL_TOP +
-                                  (int32_t)row * TERMINAL_LINE_HEIGHT,
-                              line, TERMINAL_FOREGROUND, 1U);
+                rose_terminal_feed(state, &bytes[index], 1U);
+                terminal_output_carriage_return = bytes[index] == '\r';
         }
-        if (gui->surface->focused != 0U) {
-                int32_t cursor_x =
-                    TERMINAL_LEFT + (int32_t)terminal->column * 6;
-                int32_t cursor_y =
-                    TERMINAL_TOP + (int32_t)terminal->row * TERMINAL_LINE_HEIGHT;
-                rose_gui_fill(gui, cursor_x, cursor_y + 7, 5, 2,
-                              TERMINAL_ACCENT);
-        }
-        rose_gui_present(gui, 0, 0, (int32_t)gui->width,
-                         (int32_t)gui->height);
+}
+
+static bool terminal_set_window_size(int descriptor,
+                                     const struct rose_gui_context *gui) {
+        struct user_terminal_window_size window_size = {
+            .rows = (uint16_t)rose_terminal_rows(&terminal),
+            .columns = (uint16_t)rose_terminal_columns(&terminal),
+            .pixel_width = (uint16_t)gui->width,
+            .pixel_height = (uint16_t)gui->height,
+        };
+        return rose_tcsetwinsize(descriptor, &window_size) == 0;
 }
 
 static _Noreturn void terminal_child(int master, int slave) {
@@ -139,50 +172,124 @@ static _Noreturn void terminal_child(int master, int slave) {
                 (void)rose_close(slave);
         }
         char *arguments[] = {"/bin/sh", NULL};
-        char *environment[] = {"HOME=/", "PATH=/bin:/sbin",
-                               "TERM=rose-gui", NULL};
+        char *environment[] = {"HOME=/", "PATH=/bin:/sbin", "TERM=xterm",
+                               NULL};
         (void)rose_execve("/bin/sh", arguments, environment);
         rose_exit(127U);
 }
 
+static size_t sequence_length(const char *sequence) {
+        size_t length = 0U;
+        while (sequence[length] != '\0') length++;
+        return length;
+}
+
+static void set_wait_item(struct user_wait_item *item, uint32_t type,
+                          uint32_t events, int64_t identifier,
+                          uint64_t value) {
+        item->type = type;
+        item->events = events;
+        item->identifier = identifier;
+        item->value = value;
+        item->returned_events = 0U;
+        item->reserved = 0U;
+}
+
+static const char *navigation_sequence(uint16_t code, bool application) {
+        switch (code) {
+        case KEY_HOME: return application ? "\033OH" : "\033[H";
+        case KEY_UP: return application ? "\033OA" : "\033[A";
+        case KEY_LEFT: return application ? "\033OD" : "\033[D";
+        case KEY_RIGHT: return application ? "\033OC" : "\033[C";
+        case KEY_END: return application ? "\033OF" : "\033[F";
+        case KEY_DOWN: return application ? "\033OB" : "\033[B";
+        case KEY_INSERT: return "\033[2~";
+        case KEY_DELETE: return "\033[3~";
+        default: return NULL;
+        }
+}
+
+static void handle_key(struct rose_gui_context *gui, int master,
+                       const struct user_input_event *event) {
+        char character = rose_gui_key_character(gui, event);
+        if (event->value == 0U) return;
+
+        if (event->code == KEY_PAGE_UP || event->code == KEY_PAGE_DOWN) {
+                rose_terminal_scroll_page(&terminal,
+                                          event->code == KEY_PAGE_UP);
+                return;
+        }
+        if (character != 0) {
+                rose_terminal_jump_to_latest(&terminal);
+                (void)rose_write(master, &character, 1U);
+                return;
+        }
+        const char *sequence = navigation_sequence(
+            event->code, rose_terminal_application_cursor(&terminal));
+        if (sequence != NULL) {
+                rose_terminal_jump_to_latest(&terminal);
+                (void)rose_write(master, sequence, sequence_length(sequence));
+        }
+}
+
 int rose_gui_terminal_main(int argc, char **argv) {
         struct rose_gui_context gui;
-        if (argc != 2 || !rose_gui_connect(argv[1], &gui)) {
-                return 1;
+        if (argc != 2 || !rose_gui_connect(argv[1], &gui)) return 1;
+
+        rose_terminal_initialize(&terminal,
+                                 terminal_columns_for_width(gui.width),
+                                 terminal_rows_for_height(gui.height));
+        size_t scrollback_size = sizeof(struct rose_terminal_line) *
+                                 ROSE_TERMINAL_SCROLLBACK_LINES;
+        long scrollback_address = rose_mmap(
+            scrollback_size,
+            USER_MEMORY_PROTECTION_READ | USER_MEMORY_PROTECTION_WRITE);
+        if (scrollback_address < 0) {
+                rose_gui_disconnect(&gui);
+                return 2;
         }
+        rose_terminal_set_scrollback(
+            &terminal, (struct rose_terminal_line *)(uintptr_t)scrollback_address,
+            ROSE_TERMINAL_SCROLLBACK_LINES);
+        rose_gui_fill(&gui, 0, 0, (int32_t)gui.width, (int32_t)gui.height,
+                      terminal_palette[0]);
+        rose_gui_present(&gui, 0, 0, (int32_t)gui.width,
+                         (int32_t)gui.height);
+
         int terminals[2];
         if (rose_openpty(terminals) != 0) {
+                (void)rose_munmap((uintptr_t)scrollback_address,
+                                  scrollback_size);
                 rose_gui_disconnect(&gui);
                 return 2;
         }
         struct user_terminal_attributes attributes;
-        struct user_terminal_window_size window_size = {
-            .rows = TERMINAL_ROWS,
-            .columns = TERMINAL_COLUMNS,
-            .pixel_width = (uint16_t)gui.width,
-            .pixel_height = (uint16_t)gui.height,
-        };
         if (rose_tcgetattr(terminals[1], &attributes) != 0) {
                 (void)rose_close(terminals[0]);
                 (void)rose_close(terminals[1]);
+                (void)rose_munmap((uintptr_t)scrollback_address,
+                                  scrollback_size);
                 rose_gui_disconnect(&gui);
                 return 2;
         }
         attributes.flags = USER_TERMINAL_SIGNALS;
         if (rose_tcsetattr(terminals[1], &attributes) != 0 ||
-            rose_tcsetwinsize(terminals[0], &window_size) != 0) {
+            !terminal_set_window_size(terminals[0], &gui)) {
                 (void)rose_close(terminals[0]);
                 (void)rose_close(terminals[1]);
+                (void)rose_munmap((uintptr_t)scrollback_address,
+                                  scrollback_size);
                 rose_gui_disconnect(&gui);
                 return 2;
         }
+
         long shell_pid = rose_fork();
-        if (shell_pid == 0) {
-                terminal_child(terminals[0], terminals[1]);
-        }
+        if (shell_pid == 0) terminal_child(terminals[0], terminals[1]);
         if (shell_pid < 0) {
                 (void)rose_close(terminals[0]);
                 (void)rose_close(terminals[1]);
+                (void)rose_munmap((uintptr_t)scrollback_address,
+                                  scrollback_size);
                 rose_gui_disconnect(&gui);
                 return 3;
         }
@@ -191,81 +298,84 @@ int rose_gui_terminal_main(int argc, char **argv) {
             terminals[0], USER_DESCRIPTOR_NONBLOCK |
                               USER_DESCRIPTOR_CLOSE_ON_EXEC);
 
-        terminal_initialize(&terminal);
-        const char banner[] = "ROSE GRAPHICAL TERMINAL\n";
-        for (size_t index = 0U; index < sizeof(banner) - 1U; index++) {
-                terminal_put(&terminal, banner[index]);
-        }
-        terminal_render(&gui, &terminal);
+        static const char banner[] = "ROSE GRAPHICAL TERMINAL\r\n";
+        terminal_feed_output(&terminal, banner, sizeof(banner) - 1U);
+        bool focused = gui.surface->focused != 0U;
+        uint32_t resize_sequence = gui.surface->resize_sequence;
+        terminal_render(&gui, &terminal, focused);
 
         while (gui.surface->close_requested == 0U) {
-                bool changed = false;
-                char output[256];
-                long count = rose_read(terminals[0], output, sizeof(output));
-                if (count > 0) {
-                        for (long index = 0; index < count; index++) {
-                                terminal_put(&terminal, output[index]);
-                        }
-                        changed = true;
+                if (resize_sequence != gui.surface->resize_sequence) {
+                        resize_sequence = gui.surface->resize_sequence;
+                        if (!rose_gui_refresh_size(&gui)) break;
+                        rose_terminal_resize(
+                            &terminal, terminal_columns_for_width(gui.width),
+                            terminal_rows_for_height(gui.height));
+                        if (!terminal_set_window_size(terminals[0], &gui))
+                                break;
                 }
+
+                bool now_focused = gui.surface->focused != 0U;
+                if (now_focused != focused) {
+                        rose_terminal_mark_cursor_dirty(&terminal);
+                        focused = now_focused;
+                }
+
+                char output[512];
+                long count;
+                do {
+                        count = rose_read(terminals[0], output, sizeof(output));
+                        if (count > 0) {
+                                terminal_feed_output(&terminal, output,
+                                                     (size_t)count);
+                        }
+                } while (count > 0);
 
                 struct user_input_event event;
                 while (rose_gui_poll_event(&gui, &event)) {
-                        if (event.type != USER_INPUT_EVENT_KEY) {
-                                continue;
-                        }
-                        char character = rose_gui_key_character(&gui, &event);
-                        if (character != 0) {
-                                (void)rose_write(terminals[0], &character, 1U);
-                        } else if (event.value != 0 && event.code >= 103U &&
-                                   event.code <= 108U) {
-                                const char *sequence = NULL;
-                                if (event.code == 103U) sequence = "\033[A";
-                                if (event.code == 108U) sequence = "\033[B";
-                                if (event.code == 106U) sequence = "\033[C";
-                                if (event.code == 105U) sequence = "\033[D";
-                                if (sequence != NULL) {
-                                        (void)rose_write(terminals[0], sequence,
-                                                         3U);
-                                }
-                        }
+                        if (event.type == USER_INPUT_EVENT_KEY)
+                                handle_key(&gui, terminals[0], &event);
                 }
-                if (changed) {
-                        terminal_render(&gui, &terminal);
-                }
+                terminal_render(&gui, &terminal, focused);
+
                 int status;
                 long waited = rose_waitpid(shell_pid, &status,
                                             USER_WAIT_NO_HANG);
-                if (waited == shell_pid) {
-                        break;
-                }
-                struct user_wait_item waits[4] = {
-                    {.type = USER_WAIT_OBJECT_DESCRIPTOR,
-                     .events = USER_WAIT_EVENT_READABLE,
-                     .identifier = terminals[0]},
-                    {.type = USER_WAIT_OBJECT_CHILD,
-                     .events = USER_WAIT_EVENT_CHILD_EXITED,
-                     .identifier = shell_pid},
-                    {.type = USER_WAIT_OBJECT_SHARED_WORD,
-                     .events = USER_WAIT_EVENT_CHANGED,
-                     .identifier =
-                         (int64_t)(uintptr_t)&gui.surface->input_write,
-                     .value = gui.surface->input_write},
-                    {.type = USER_WAIT_OBJECT_SHARED_WORD,
-                     .events = USER_WAIT_EVENT_CHANGED,
-                     .identifier =
-                         (int64_t)(uintptr_t)&gui.surface->close_requested,
-                     .value = gui.surface->close_requested},
-                };
-                if (rose_wait_events(waits, 4U, -1) < 0) {
-                        break;
-                }
+                if (waited == shell_pid) break;
+
+                struct user_wait_item waits[6];
+                set_wait_item(&waits[0], USER_WAIT_OBJECT_DESCRIPTOR,
+                              USER_WAIT_EVENT_READABLE, terminals[0], 0U);
+                set_wait_item(&waits[1], USER_WAIT_OBJECT_CHILD,
+                              USER_WAIT_EVENT_CHILD_EXITED, shell_pid, 0U);
+                set_wait_item(
+                    &waits[2], USER_WAIT_OBJECT_SHARED_WORD,
+                    USER_WAIT_EVENT_CHANGED,
+                    (int64_t)(uintptr_t)&gui.surface->input_write,
+                    gui.surface->input_write);
+                set_wait_item(
+                    &waits[3], USER_WAIT_OBJECT_SHARED_WORD,
+                    USER_WAIT_EVENT_CHANGED,
+                    (int64_t)(uintptr_t)&gui.surface->close_requested,
+                    gui.surface->close_requested);
+                set_wait_item(
+                    &waits[4], USER_WAIT_OBJECT_SHARED_WORD,
+                    USER_WAIT_EVENT_CHANGED,
+                    (int64_t)(uintptr_t)&gui.surface->focused,
+                    gui.surface->focused);
+                set_wait_item(
+                    &waits[5], USER_WAIT_OBJECT_SHARED_WORD,
+                    USER_WAIT_EVENT_CHANGED,
+                    (int64_t)(uintptr_t)&gui.surface->resize_sequence,
+                    resize_sequence);
+                if (rose_wait_events(waits, 6U, -1) < 0) break;
         }
 
         (void)rose_kill(shell_pid, USER_SIGNAL_TERMINATE);
         int status;
         (void)rose_waitpid(shell_pid, &status, 0U);
         (void)rose_close(terminals[0]);
+        (void)rose_munmap((uintptr_t)scrollback_address, scrollback_size);
         rose_gui_disconnect(&gui);
         return 0;
 }

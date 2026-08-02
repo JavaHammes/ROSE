@@ -63,6 +63,15 @@ class QemuSession:
         self.process.stdin.flush()
         return self.read_until(b"rose> ", timeout)
 
+    def edited_command(self, input_bytes: bytes, timeout: float = 10.0) -> str:
+        """Submit raw line-editor input, including navigation sequences."""
+        assert self.process.stdin is not None
+        self.process.stdin.write(input_bytes)
+        self.process.stdin.flush()
+        # Cursor movement redraws the current prompt. Wait for a prompt at the
+        # start of a new line so an intermediate redraw cannot finish the test.
+        return self.read_until(b"\nrose> ", timeout)
+
     def command_with_input(
         self, text: str, wait_marker: bytes, input_bytes: bytes, timeout: float = 10.0
     ) -> str:
@@ -87,7 +96,9 @@ class QemuSession:
         self.process.stdin.write(b"\x01c")
         self.process.stdin.flush()
         output = self.read_until(b"(qemu) ", 5.0)
-        self.process.stdin.write(b"sendkey esc\n")
+        # Escape belongs to the focused terminal. The desktop-wide chord is
+        # deliberately harder to trigger from a character-mode application.
+        self.process.stdin.write(b"sendkey ctrl-alt-esc\n")
         self.process.stdin.flush()
         output += self.read_until(b"rose> ", 5.0)
         self.process.stdin.write(b"\x01c")
@@ -235,6 +246,17 @@ def run_smoke_test(
             session.command("echo 'hello world' \"from sh\" escaped\\ value"),
             "hello world from sh escaped value",
         )
+        require(
+            session.edited_command(
+                b"echo hllo" + b"\x1b[D" * 4 + b"\x1b[C" + b"e\n"
+            ),
+            "\nhello\n",
+        )
+        require(
+            session.edited_command(b"BADecho home\x1b[H" + b"\x1b[3~" * 3 + b"\n"),
+            "\nhome\n",
+        )
+        require(session.edited_command(b"\x1b[A\n"), "\nhome\n")
         require(session.command("pwd"), "\n/\n")
         session.command("cd /etc")
         require(session.command("pwd"), "\n/etc\n")

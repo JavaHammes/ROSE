@@ -2,45 +2,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "rose/font.h"
 #include "rose/gui.h"
 #include "rose/syscall.h"
 
 _Static_assert(sizeof(struct rose_gui_surface) <=
                    ROSE_GUI_SURFACE_PIXEL_OFFSET,
                "GUI control page exceeds its reserved page");
-
-static const uint8_t font[59][ROSE_GUI_FONT_WIDTH] = {
-    {0x00, 0x00, 0x00, 0x00, 0x00}, {0x00, 0x00, 0x5f, 0x00, 0x00},
-    {0x00, 0x07, 0x00, 0x07, 0x00},
-    {0x14, 0x7f, 0x14, 0x7f, 0x14}, {0x24, 0x2a, 0x7f, 0x2a, 0x12},
-    {0x23, 0x13, 0x08, 0x64, 0x62}, {0x36, 0x49, 0x55, 0x22, 0x50},
-    {0x00, 0x05, 0x03, 0x00, 0x00}, {0x00, 0x1c, 0x22, 0x41, 0x00},
-    {0x00, 0x41, 0x22, 0x1c, 0x00}, {0x14, 0x08, 0x3e, 0x08, 0x14},
-    {0x08, 0x08, 0x3e, 0x08, 0x08}, {0x00, 0x50, 0x30, 0x00, 0x00},
-    {0x08, 0x08, 0x08, 0x08, 0x08}, {0x00, 0x60, 0x60, 0x00, 0x00},
-    {0x20, 0x10, 0x08, 0x04, 0x02}, {0x3e, 0x51, 0x49, 0x45, 0x3e},
-    {0x00, 0x42, 0x7f, 0x40, 0x00}, {0x42, 0x61, 0x51, 0x49, 0x46},
-    {0x21, 0x41, 0x45, 0x4b, 0x31}, {0x18, 0x14, 0x12, 0x7f, 0x10},
-    {0x27, 0x45, 0x45, 0x45, 0x39}, {0x3c, 0x4a, 0x49, 0x49, 0x30},
-    {0x01, 0x71, 0x09, 0x05, 0x03}, {0x36, 0x49, 0x49, 0x49, 0x36},
-    {0x06, 0x49, 0x49, 0x29, 0x1e}, {0x00, 0x36, 0x36, 0x00, 0x00},
-    {0x00, 0x56, 0x36, 0x00, 0x00}, {0x08, 0x14, 0x22, 0x41, 0x00},
-    {0x14, 0x14, 0x14, 0x14, 0x14}, {0x00, 0x41, 0x22, 0x14, 0x08},
-    {0x02, 0x01, 0x51, 0x09, 0x06}, {0x32, 0x49, 0x79, 0x41, 0x3e},
-    {0x7e, 0x11, 0x11, 0x11, 0x7e}, {0x7f, 0x49, 0x49, 0x49, 0x36},
-    {0x3e, 0x41, 0x41, 0x41, 0x22}, {0x7f, 0x41, 0x41, 0x22, 0x1c},
-    {0x7f, 0x49, 0x49, 0x49, 0x41}, {0x7f, 0x09, 0x09, 0x09, 0x01},
-    {0x3e, 0x41, 0x49, 0x49, 0x7a}, {0x7f, 0x08, 0x08, 0x08, 0x7f},
-    {0x00, 0x41, 0x7f, 0x41, 0x00}, {0x20, 0x40, 0x41, 0x3f, 0x01},
-    {0x7f, 0x08, 0x14, 0x22, 0x41}, {0x7f, 0x40, 0x40, 0x40, 0x40},
-    {0x7f, 0x02, 0x0c, 0x02, 0x7f}, {0x7f, 0x04, 0x08, 0x10, 0x7f},
-    {0x3e, 0x41, 0x41, 0x41, 0x3e}, {0x7f, 0x09, 0x09, 0x09, 0x06},
-    {0x3e, 0x41, 0x51, 0x21, 0x5e}, {0x7f, 0x09, 0x19, 0x29, 0x46},
-    {0x46, 0x49, 0x49, 0x49, 0x31}, {0x01, 0x01, 0x7f, 0x01, 0x01},
-    {0x3f, 0x40, 0x40, 0x40, 0x3f}, {0x1f, 0x20, 0x40, 0x20, 0x1f},
-    {0x3f, 0x40, 0x38, 0x40, 0x3f}, {0x63, 0x14, 0x08, 0x14, 0x63},
-    {0x07, 0x08, 0x70, 0x08, 0x07}, {0x61, 0x51, 0x49, 0x45, 0x43},
-};
 
 static void bytes_zero(void *destination, size_t size) {
         uint8_t *bytes = destination;
@@ -84,7 +52,8 @@ bool rose_gui_connect(const char *identifier_text,
         context->identifier = identifier;
         context->surface =
             (struct rose_gui_surface *)context->mapping.address;
-        if (context->surface->magic != ROSE_GUI_SURFACE_MAGIC ||
+        if (!rose_font_load() ||
+            context->surface->magic != ROSE_GUI_SURFACE_MAGIC ||
             context->surface->version != ROSE_GUI_SURFACE_VERSION ||
             context->surface->stride < context->surface->width * 4U ||
             (uint64_t)ROSE_GUI_SURFACE_PIXEL_OFFSET +
@@ -103,6 +72,23 @@ bool rose_gui_connect(const char *identifier_text,
         context->surface->client_ready = 1U;
         rose_gui_present(context, 0, 0, (int32_t)context->width,
                          (int32_t)context->height);
+        return true;
+}
+
+bool rose_gui_refresh_size(struct rose_gui_context *context) {
+        if (context == NULL || context->surface == NULL ||
+            context->surface->width == 0U ||
+            context->surface->height == 0U ||
+            context->surface->stride < context->surface->width * 4U ||
+            (uint64_t)ROSE_GUI_SURFACE_PIXEL_OFFSET +
+                    (uint64_t)context->surface->stride *
+                        context->surface->height >
+                context->mapping.size) {
+                return false;
+        }
+        context->width = context->surface->width;
+        context->height = context->surface->height;
+        context->pixel_stride = context->surface->stride / sizeof(uint32_t);
         return true;
 }
 
@@ -154,13 +140,8 @@ void rose_gui_text(struct rose_gui_context *context, int32_t x, int32_t y,
         }
         while (text != NULL && *text != '\0') {
                 char character = *text++;
-                if (character >= 'a' && character <= 'z') {
-                        character = (char)(character - 'a' + 'A');
-                }
-                if (character < ' ' || character > 'Z') {
-                        character = '?';
-                }
-                const uint8_t *glyph = font[(uint8_t)character - ' '];
+                const uint8_t *glyph = rose_font_glyph(character);
+                if (glyph == NULL) return;
                 for (int32_t glyph_x = 0; glyph_x < ROSE_GUI_FONT_WIDTH;
                      glyph_x++) {
                         for (int32_t glyph_y = 0; glyph_y < ROSE_GUI_FONT_HEIGHT;
@@ -185,6 +166,23 @@ void rose_gui_present(struct rose_gui_context *context, int32_t x, int32_t y,
             height <= 0) {
                 return;
         }
+        if (context->surface->damage_sequence !=
+            context->surface->damage_consumed) {
+                int32_t old_right = context->surface->damage_x +
+                                    context->surface->damage_width;
+                int32_t old_bottom = context->surface->damage_y +
+                                     context->surface->damage_height;
+                int32_t right = x + width;
+                int32_t bottom = y + height;
+                if (context->surface->damage_x < x)
+                        x = context->surface->damage_x;
+                if (context->surface->damage_y < y)
+                        y = context->surface->damage_y;
+                if (old_right > right) right = old_right;
+                if (old_bottom > bottom) bottom = old_bottom;
+                width = right - x;
+                height = bottom - y;
+        }
         context->surface->damage_x = x;
         context->surface->damage_y = y;
         context->surface->damage_width = width;
@@ -198,6 +196,12 @@ bool rose_gui_poll_event(struct rose_gui_context *context,
                          struct user_input_event *event) {
         if (context == NULL || context->surface == NULL || event == NULL) {
                 return false;
+        }
+        /* A modifier release may be routed to a newly focused window. Never
+         * leave an inactive client with a latched Shift or Control state. */
+        if (context->surface->focused == 0U) {
+                context->shift = false;
+                context->control = false;
         }
         uint32_t read = context->surface->input_read;
         if (read == context->surface->input_write) {
@@ -215,7 +219,7 @@ long rose_gui_wait(struct rose_gui_context *context,
         if (context == NULL || context->surface == NULL) {
                 return -USER_ERROR_INVALID_ARGUMENT;
         }
-        struct user_wait_item items[3] = {
+        struct user_wait_item items[4] = {
             {.type = USER_WAIT_OBJECT_SHARED_WORD,
              .events = USER_WAIT_EVENT_CHANGED,
              .identifier =
@@ -230,8 +234,13 @@ long rose_gui_wait(struct rose_gui_context *context,
              .events = USER_WAIT_EVENT_CHANGED,
              .identifier = (int64_t)(uintptr_t)&context->surface->focused,
              .value = context->surface->focused},
+            {.type = USER_WAIT_OBJECT_SHARED_WORD,
+             .events = USER_WAIT_EVENT_CHANGED,
+             .identifier =
+                 (int64_t)(uintptr_t)&context->surface->resize_sequence,
+             .value = context->surface->resize_sequence},
         };
-        return rose_wait_events(items, 3U, timeout_nanoseconds);
+        return rose_wait_events(items, 4U, timeout_nanoseconds);
 }
 
 char rose_gui_key_character(struct rose_gui_context *context,

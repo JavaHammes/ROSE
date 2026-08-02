@@ -12,6 +12,7 @@ OBJCOPY    := $(PREFIX)objcopy
 SIZE       := $(PREFIX)size
 CLANG_TIDY := clang-tidy
 PYTHON     ?= python3
+HOST_CC    ?= cc
 
 QEMU ?= qemu-system-riscv64
 
@@ -83,10 +84,10 @@ USER_FALLBACK_ELFS := $(foreach program,$(USER_FALLBACK_PROGRAMS),$(BUILD_DIR)/u
 USER_IMAGE_OBJECT := $(BUILD_DIR)/kernel/arch/riscv64/user_image.o
 
 USER_EXTRA_OBJECTS_sh := $(BUILD_DIR)/user/sh.o
-USER_EXTRA_OBJECTS_desktop := $(BUILD_DIR)/user/desktop.o
-USER_EXTRA_OBJECTS_gui_terminal := $(BUILD_DIR)/user/gui_terminal.o $(BUILD_DIR)/user/gui.o
-USER_EXTRA_OBJECTS_gui_files := $(BUILD_DIR)/user/gui_files.o $(BUILD_DIR)/user/gui.o
-USER_EXTRA_OBJECTS_gui_monitor := $(BUILD_DIR)/user/gui_monitor.o $(BUILD_DIR)/user/gui.o
+USER_EXTRA_OBJECTS_desktop := $(BUILD_DIR)/user/desktop.o $(BUILD_DIR)/user/font.o
+USER_EXTRA_OBJECTS_gui_terminal := $(BUILD_DIR)/user/gui_terminal.o $(BUILD_DIR)/user/terminal.o $(BUILD_DIR)/user/gui.o $(BUILD_DIR)/user/font.o
+USER_EXTRA_OBJECTS_gui_files := $(BUILD_DIR)/user/gui_files.o $(BUILD_DIR)/user/gui.o $(BUILD_DIR)/user/font.o
+USER_EXTRA_OBJECTS_gui_monitor := $(BUILD_DIR)/user/gui_monitor.o $(BUILD_DIR)/user/gui.o $(BUILD_DIR)/user/font.o
 
 # Compiler-generated dependency files keep incremental header rebuilds correct.
 DEPS := \
@@ -94,7 +95,9 @@ DEPS := \
 	$(USER_COMMON_OBJECTS:.o=.d) \
 	$(BUILD_DIR)/user/sh.d \
 	$(BUILD_DIR)/user/desktop.d \
+	$(BUILD_DIR)/user/font.d \
 	$(BUILD_DIR)/user/gui.d \
+	$(BUILD_DIR)/user/terminal.d \
 	$(BUILD_DIR)/user/gui_terminal.d \
 	$(BUILD_DIR)/user/gui_files.d \
 	$(BUILD_DIR)/user/gui_monitor.d \
@@ -184,7 +187,7 @@ QEMU_GUI_FLAGS := \
 all: $(KERNEL) $(ROOT_IMAGE)
 
 
-$(ROOT_IMAGE): tools/mkrosefs.py $(USER_LOAD_ELFS) Makefile
+$(ROOT_IMAGE): tools/mkrosefs.py assets/font5x7.hex $(USER_LOAD_ELFS) Makefile
 	@mkdir -p $(dir $@)
 	$(PYTHON) tools/mkrosefs.py $@ \
 		--file /bin/hello=$(BUILD_DIR)/user/hello/program.load.elf \
@@ -213,6 +216,7 @@ $(ROOT_IMAGE): tools/mkrosefs.py $(USER_LOAD_ELFS) Makefile
 		--file /bin/gui-terminal=$(BUILD_DIR)/user/gui_terminal/program.load.elf \
 		--file /bin/gui-files=$(BUILD_DIR)/user/gui_files/program.load.elf \
 		--file /bin/gui-monitor=$(BUILD_DIR)/user/gui_monitor/program.load.elf \
+		--file /share/font5x7.hex=assets/font5x7.hex \
 		--file /sbin/init=$(BUILD_DIR)/user/init/program.load.elf
 
 
@@ -365,8 +369,18 @@ test-graphics: $(KERNEL) $(ROOT_IMAGE)
 
 .PHONY: test-host
 test-host:
+	$(MAKE) test-terminal-model
 	$(PYTHON) -m unittest discover -s tests -t . -p 'test_*.py'
 	$(PYTHON) -m py_compile tests/qemu_smoke.py tools/mkrosefs.py
+
+
+.PHONY: test-terminal-model
+test-terminal-model:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Iuser/include \
+		user/terminal.c tests/terminal_model_test.c \
+		-o $(BUILD_DIR)/tests/terminal_model_test
+	$(BUILD_DIR)/tests/terminal_model_test
 
 
 .PHONY: check

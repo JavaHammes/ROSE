@@ -21,6 +21,7 @@ enum {
         SHELL_PATH_SIZE = 64,
         SHELL_JOB_LIMIT = 4,
         SHELL_REDIRECTION_LIMIT = 6,
+        SHELL_HISTORY_LIMIT = 16,
 };
 
 enum shell_redirection_operation {
@@ -74,6 +75,9 @@ static size_t shell_environment_count;
 static struct shell_job shell_jobs[SHELL_JOB_LIMIT];
 static uint64_t shell_process_group;
 static int shell_last_status;
+static char shell_history[SHELL_HISTORY_LIMIT][SHELL_LINE_SIZE];
+static size_t shell_history_count;
+static char shell_history_draft[SHELL_LINE_SIZE];
 
 static size_t string_length(const char *text) {
         size_t length = 0U;
@@ -274,11 +278,132 @@ static void environment_initialize(char **environment) {
         }
 }
 
-/* Read and echo one editable command line from the console. */
+static void shell_redraw_line(const char line[SHELL_LINE_SIZE], size_t length,
+                              size_t cursor) {
+        print("\r\x1b[2Krose> ");
+        for (size_t index = 0U; index < length; index++) {
+                print_character(line[index]);
+        }
+        for (size_t index = cursor; index < length; index++) {
+                print_character('\b');
+        }
+}
+
+static void shell_set_edit_line(char line[SHELL_LINE_SIZE], const char *source,
+                                size_t *length, size_t *cursor) {
+        *length = string_length(source);
+        if (*length >= SHELL_LINE_SIZE) *length = SHELL_LINE_SIZE - 1U;
+        for (size_t index = 0U; index < *length; index++) {
+                line[index] = source[index];
+        }
+        line[*length] = '\0';
+        *cursor = *length;
+}
+
+static void shell_history_add(const char line[SHELL_LINE_SIZE], size_t length) {
+        if (length == 0U) {
+                return;
+        }
+        if (shell_history_count != 0U) {
+                const char *previous =
+                    shell_history[shell_history_count - 1U];
+                bool duplicate = previous[length] == '\0';
+
+                for (size_t index = 0U; duplicate && index < length;
+                     index++) {
+                        duplicate = previous[index] == line[index];
+                }
+                if (duplicate) {
+                        return;
+                }
+        }
+        if (shell_history_count == SHELL_HISTORY_LIMIT) {
+                for (size_t index = 1U; index < SHELL_HISTORY_LIMIT; index++) {
+                        copy_string(shell_history[index - 1U],
+                                    shell_history[index]);
+                }
+                shell_history_count--;
+        }
+        for (size_t index = 0U; index < length; index++) {
+                shell_history[shell_history_count][index] = line[index];
+        }
+        shell_history[shell_history_count][length] = '\0';
+        shell_history_count++;
+}
+
+static bool shell_navigation(char final, size_t parameter,
+                             char line[SHELL_LINE_SIZE], size_t *length,
+                             size_t *cursor, size_t *history_index) {
+        if (final == 'A') {
+                if (shell_history_count == 0U || *history_index == 0U)
+                        return false;
+                if (*history_index == shell_history_count) {
+                        line[*length] = '\0';
+                        copy_string(shell_history_draft, line);
+                }
+                (*history_index)--;
+                shell_set_edit_line(line, shell_history[*history_index],
+                                    length, cursor);
+                return true;
+        }
+        if (final == 'B') {
+                if (*history_index >= shell_history_count) return false;
+                (*history_index)++;
+                shell_set_edit_line(
+                    line, *history_index == shell_history_count
+                              ? shell_history_draft
+                              : shell_history[*history_index],
+                    length, cursor);
+                return true;
+        }
+        if (final == 'C') {
+                if (*cursor == *length) return false;
+                (*cursor)++;
+                return true;
+        }
+        if (final == 'D') {
+                if (*cursor == 0U) return false;
+                (*cursor)--;
+                return true;
+        }
+        if (final == 'H' || (final == '~' &&
+                             (parameter == 1U || parameter == 7U))) {
+                if (*cursor == 0U) return false;
+                *cursor = 0U;
+                return true;
+        }
+        if (final == 'F' || (final == '~' &&
+                             (parameter == 4U || parameter == 8U))) {
+                if (*cursor == *length) return false;
+                *cursor = *length;
+                return true;
+        }
+        if (final == '~' && parameter == 3U) {
+                if (*cursor == *length) return false;
+                for (size_t index = *cursor; index < *length; index++) {
+                        line[index] = line[index + 1U];
+                }
+                (*length)--;
+                return true;
+        }
+        return false;
+}
+
+/* Read and echo one editable command line from the console. Both the serial
+ * keyboard and graphical frontend deliver conventional CSI/SS3 navigation
+ * sequences, so consume them here instead of inserting their printable tail. */
 static bool shell_read_line(char line[SHELL_LINE_SIZE]) {
         size_t length = 0U;
+        size_t cursor = 0U;
+        size_t history_index = shell_history_count;
+        enum { SHELL_INPUT_NORMAL, SHELL_INPUT_ESCAPE, SHELL_INPUT_CSI,
+               SHELL_INPUT_SS3 } input_state = SHELL_INPUT_NORMAL;
+        size_t escape_parameter = 0U;
+        bool escape_parameter_complete = false;
 
         print("rose> ");
+        line[0] = '\0';
+        shell_history_draft[0] = '\0';
 
         while (true) {
                 char character;
@@ -286,9 +411,58 @@ static bool shell_read_line(char line[SHELL_LINE_SIZE]) {
                         return false;
                 }
 
+                if (input_state == SHELL_INPUT_ESCAPE) {
+                        if (character == '[') {
+                                input_state = SHELL_INPUT_CSI;
+                                escape_parameter = 0U;
+                                escape_parameter_complete = false;
+                                continue;
+                        }
+                        if (character == 'O') {
+                                input_state = SHELL_INPUT_SS3;
+                                continue;
+                        }
+                        input_state = SHELL_INPUT_NORMAL;
+                } else if (input_state == SHELL_INPUT_CSI) {
+                        if (character >= '0' && character <= '9') {
+                                if (!escape_parameter_complete &&
+                                    escape_parameter < 100U) {
+                                        escape_parameter =
+                                            escape_parameter * 10U +
+                                            (size_t)(character - '0');
+                                }
+                                continue;
+                        }
+                        if (character == ';') {
+                                escape_parameter_complete = true;
+                                continue;
+                        }
+                        bool changed = shell_navigation(
+                            character, escape_parameter, line, &length,
+                            &cursor, &history_index);
+                        input_state = SHELL_INPUT_NORMAL;
+                        if (changed)
+                                shell_redraw_line(line, length, cursor);
+                        continue;
+                } else if (input_state == SHELL_INPUT_SS3) {
+                        bool changed = shell_navigation(
+                            character, 0U, line, &length, &cursor,
+                            &history_index);
+                        input_state = SHELL_INPUT_NORMAL;
+                        if (changed)
+                                shell_redraw_line(line, length, cursor);
+                        continue;
+                }
+
+                if (character == '\x1b') {
+                        input_state = SHELL_INPUT_ESCAPE;
+                        continue;
+                }
+
                 if (character == '\r' || character == '\n') {
                         line[length] = '\0';
                         print("\n");
+                        shell_history_add(line, length);
                         return true;
                 }
                 if (character == '\x04') {
@@ -301,9 +475,14 @@ static bool shell_read_line(char line[SHELL_LINE_SIZE]) {
                         return true;
                 }
                 if (character == '\b' || character == '\x7f') {
-                        if (length != 0U) {
+                        if (cursor != 0U) {
+                                for (size_t index = cursor - 1U;
+                                     index < length; index++) {
+                                        line[index] = line[index + 1U];
+                                }
                                 length--;
-                                print("\b \b");
+                                cursor--;
+                                shell_redraw_line(line, length, cursor);
                         }
                         continue;
                 }
@@ -312,8 +491,17 @@ static bool shell_read_line(char line[SHELL_LINE_SIZE]) {
                         continue;
                 }
 
-                line[length++] = character;
-                print_character(character);
+                for (size_t index = length; index > cursor; index--) {
+                        line[index] = line[index - 1U];
+                }
+                line[cursor++] = character;
+                length++;
+                line[length] = '\0';
+                if (cursor == length) {
+                        print_character(character);
+                } else {
+                        shell_redraw_line(line, length, cursor);
+                }
         }
 }
 

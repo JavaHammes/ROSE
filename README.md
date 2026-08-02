@@ -39,6 +39,13 @@ scheduling, and automated emulator tests.
   close, or PTY state changes, and the monitor updates from monotonic
   deadlines. Screen/input ownership and shared mappings are reclaimed
   automatically on exit, fault, or `execve`, restoring the graphical console.
+  The terminal uses an attributed VT screen rather than a painted transcript:
+  bounded escape parsing covers cursor addressing, erase operations, saved
+  cursors, scroll regions, alternate screens, and 16-color SGR. Its grid and
+  PTY geometry follow the window size, changed cell spans are damaged
+  incrementally, and a 1,024-line ring supports Page Up/Page Down review while
+  live output continues. The compositor and clients load one complete
+  printable-ASCII bitmap font resource from `/share`.
 - Generic sector-device interface, modern VirtIO-MMIO block driver, and a
   sixteen-entry write-through cache for 1 KiB filesystem blocks.
 - Writable ext2 root filesystem containing `/sbin/init`, `/bin/sh`, programs,
@@ -182,7 +189,10 @@ The shell is visible in both the QEMU window and the serial terminal. Run
 `desktop` to enter the userspace desktop. Its Terminal runs the same shell over
 a pseudo-terminal, Files browses directories, and System Monitor reads live
 kernel counters. Click a window to focus it, drag its title bar, use the red
-control to close it, and press Escape to return to the serial shell.
+control to close it, or drag the Terminal's accented lower-right corner to
+resize it. Page Up/Page Down browse terminal history; typing jumps back to live
+output. Ctrl+Alt+T launches another independent terminal, and Ctrl+Alt+Escape
+returns to the serial shell.
 
 After `/sbin/init` launches `/bin/sh` and waits for it, the shell starts at
 `rose>`.
