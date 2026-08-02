@@ -73,6 +73,7 @@ static char *shell_environment[SHELL_ENVIRONMENT_LIMIT + 1U];
 static size_t shell_environment_count;
 static struct shell_job shell_jobs[SHELL_JOB_LIMIT];
 static uint64_t shell_process_group;
+static int shell_last_status;
 
 static size_t string_length(const char *text) {
         size_t length = 0U;
@@ -149,16 +150,25 @@ static bool environment_entry_has_name(const char *entry, const char *name) {
         return *name == '\0' && *entry == '=';
 }
 
-static const char *environment_value(const char *name) {
+static const char *environment_value_length(const char *name, size_t length) {
         for (size_t index = 0U; index < shell_environment_count; index++) {
                 const char *entry = shell_environment[index];
+                size_t character = 0U;
 
-                if (environment_entry_has_name(entry, name)) {
-                        return &entry[string_length(name) + 1U];
+                while (character < length &&
+                       entry[character] == name[character]) {
+                        character++;
+                }
+                if (character == length && entry[character] == '=') {
+                        return &entry[character + 1U];
                 }
         }
 
         return NULL;
+}
+
+static const char *environment_value(const char *name) {
+        return environment_value_length(name, string_length(name));
 }
 
 static bool environment_set(const char *name, const char *value) {
@@ -323,8 +333,115 @@ shell_command_redirects_descriptor(const struct shell_command *command,
         return false;
 }
 
+static bool shell_parameter_name_start(char character) {
+        return (character >= 'A' && character <= 'Z') ||
+               (character >= 'a' && character <= 'z') || character == '_';
+}
+
+static bool shell_parameter_name_character(char character) {
+        return shell_parameter_name_start(character) ||
+               (character >= '0' && character <= '9');
+}
+
+static bool shell_append_character(char **destination, char *storage_end,
+                                   char character) {
+        if (*destination == storage_end) {
+                return false;
+        }
+        *(*destination)++ = character;
+        return true;
+}
+
+static bool shell_append_text(char **destination, char *storage_end,
+                              const char *text) {
+        while (*text != '\0') {
+                if (!shell_append_character(destination, storage_end,
+                                            *text++)) {
+                        return false;
+                }
+        }
+        return true;
+}
+
+static bool shell_append_unsigned(char **destination, char *storage_end,
+                                  uint64_t value) {
+        static const char digits[] = "0123456789";
+        char reversed[20];
+        size_t length = 0U;
+
+        do {
+                reversed[length++] = digits[value % 10U];
+                value /= 10U;
+        } while (value != 0U);
+
+        while (length != 0U) {
+                if (!shell_append_character(destination, storage_end,
+                                            reversed[--length])) {
+                        return false;
+                }
+        }
+        return true;
+}
+
+/* Expand one parameter beginning at *source and leave source at the first
+ * unconsumed character. Expansion is deliberately substitution-only: the
+ * compact shell does not perform field splitting or pathname expansion. */
+static bool shell_expand_parameter(const char **source, char **destination,
+                                   char *storage_end) {
+        const char *cursor = *source + 1;
+
+        if (*cursor == '?') {
+                cursor++;
+                *source = cursor;
+                return shell_append_unsigned(destination, storage_end,
+                                             (uint64_t)shell_last_status);
+        }
+        if (*cursor == '$') {
+                long process_identifier = rose_getpid();
+                if (process_identifier <= 0) {
+                        return false;
+                }
+                cursor++;
+                *source = cursor;
+                return shell_append_unsigned(destination, storage_end,
+                                             (uint64_t)process_identifier);
+        }
+
+        const char *name = cursor;
+        size_t name_length = 0U;
+        if (*cursor == '{') {
+                cursor++;
+                name = cursor;
+                if (!shell_parameter_name_start(*cursor)) {
+                        return false;
+                }
+                while (shell_parameter_name_character(*cursor)) {
+                        cursor++;
+                }
+                name_length = (size_t)(cursor - name);
+                if (*cursor != '}') {
+                        return false;
+                }
+                cursor++;
+        } else if (shell_parameter_name_start(*cursor)) {
+                while (shell_parameter_name_character(*cursor)) {
+                        cursor++;
+                }
+                name_length = (size_t)(cursor - name);
+        } else {
+                *source = cursor;
+                return shell_append_character(destination, storage_end, '$');
+        }
+
+        const char *value = environment_value_length(name, name_length);
+        *source = cursor;
+        return value == NULL ||
+               shell_append_text(destination, storage_end, value);
+}
+
 /* Tokenize words while quotes and escapes are still visible, then build a
- * bounded pipeline description. Operators are special only outside quotes. */
+ * bounded pipeline description. Operators are special only outside quotes;
+ * parameter expansion is disabled by single quotes and backslash escaping. */
 static bool shell_parse_pipeline(const char *line,
                                  struct shell_pipeline *pipeline) {
         for (size_t index = 0U; index < SHELL_PIPELINE_LIMIT; index++) {
@@ -499,6 +616,16 @@ static bool shell_parse_pipeline(const char *line,
                                         quote = '\0';
                                         continue;
                                 }
+                        }
+                        if (character == '$' && quote != '\'') {
+                                const char *parameter = source - 1;
+                                if (!shell_expand_parameter(&parameter,
+                                                            &destination,
+                                                            storage_end)) {
+                                        return false;
+                                }
+                                source = parameter;
+                                continue;
                         }
                         if (destination == storage_end) {
                                 return false;
@@ -830,6 +957,7 @@ static void shell_help(void) {
         print("Commands: ls cat echo pwd env mkdir rm\n");
         print("Syntax: command [ARG...] [< FILE] [> FILE|>> FILE] [2> FILE] "
               "[2>&1] [| command...] [&]\n");
+        print("Expansion: $NAME ${NAME} $? $$ (except in single quotes)\n");
 }
 
 static void shell_list_jobs(void) {
@@ -874,17 +1002,17 @@ static size_t shell_parse_job_identifier(const char *text) {
         return *text == '\0' ? value : 0U;
 }
 
-static void shell_foreground_job(int count, char **arguments) {
+static int shell_foreground_job(int count, char **arguments) {
         if (count != 2) {
                 print_error("Usage: fg JOB\n");
-                return;
+                return 1;
         }
 
         size_t identifier = shell_parse_job_identifier(arguments[1]);
         if (identifier == 0U || identifier > SHELL_JOB_LIMIT ||
             !shell_jobs[identifier - 1U].used) {
                 print_error("fg: no such job\n");
-                return;
+                return 1;
         }
 
         struct shell_job *job = &shell_jobs[identifier - 1U];
@@ -892,12 +1020,16 @@ static void shell_foreground_job(int count, char **arguments) {
         if (shell_job_is_complete(job)) {
                 shell_print_job(identifier, "Done", job->process_group);
                 job->used = false;
-                return;
+                int status = job->statuses[job->child_count - 1U];
+                return USER_WAIT_STATUS_EXITED(status)
+                           ? (int)USER_WAIT_STATUS_EXIT_CODE(status)
+                           : 128 + (int)USER_WAIT_STATUS_TERMINATION_SIGNAL(
+                                       status);
         }
         if (rose_tcsetpgrp(USER_STDIN_FILENO, (int64_t)job->process_group) <
             0) {
                 print_error("fg: unable to foreground job\n");
-                return;
+                return 1;
         }
 
         for (size_t index = 0U; index < job->child_count; index++) {
@@ -908,16 +1040,23 @@ static void shell_foreground_job(int count, char **arguments) {
         if (rose_kill(-(int64_t)job->process_group, USER_SIGNAL_CONTINUE) < 0) {
                 shell_restore_foreground();
                 print_error("fg: unable to continue job\n");
-                return;
+                return 1;
         }
 
         shell_job_wait(job);
         shell_restore_foreground();
         if (shell_job_is_complete(job)) {
                 job->used = false;
+                int status = job->statuses[job->child_count - 1U];
+                return USER_WAIT_STATUS_EXITED(status)
+                           ? (int)USER_WAIT_STATUS_EXIT_CODE(status)
+                           : 128 + (int)USER_WAIT_STATUS_TERMINATION_SIGNAL(
+                                       status);
         } else if (shell_job_is_stopped(job)) {
                 shell_print_job(identifier, "Stopped", job->process_group);
+                return 128 + USER_SIGNAL_TERMINAL_STOP;
         }
+        return 1;
 }
 
 static bool shell_is_builtin(const char *name) {
@@ -929,18 +1068,18 @@ static bool shell_is_builtin(const char *name) {
                strings_equal(name, "fg") || strings_equal(name, "run");
 }
 
-static bool shell_execute_builtin(int count, char **arguments,
-                                  bool *keep_running) {
+static int shell_execute_builtin(int count, char **arguments,
+                                 bool *keep_running) {
         *keep_running = true;
 
         if (strings_equal(arguments[0], "exit")) {
                 print("Shutting down...\n");
                 *keep_running = false;
-                return true;
+                return 0;
         }
         if (strings_equal(arguments[0], "help")) {
                 shell_help();
-                return true;
+                return 0;
         }
         if (strings_equal(arguments[0], "echo")) {
                 for (int index = 1; index < count; index++) {
@@ -950,38 +1089,42 @@ static bool shell_execute_builtin(int count, char **arguments,
                         }
                 }
                 print("\n");
-                return true;
+                return 0;
         }
         if (strings_equal(arguments[0], "clear")) {
                 print("\x1b[2J\x1b[H");
-                return true;
+                return 0;
         }
         if (strings_equal(arguments[0], "pwd")) {
                 char directory[SHELL_PATH_SIZE];
                 if (rose_getcwd(directory, sizeof(directory)) < 0) {
                         print_error(
                             "pwd: unable to read the working directory\n");
+                        return 1;
                 } else {
                         print(directory);
                         print("\n");
                 }
-                return true;
+                return 0;
         }
         if (strings_equal(arguments[0], "cd")) {
                 const char *directory =
                     count == 1 ? environment_value("HOME") : arguments[1];
                 if (count > 2 || directory == NULL) {
                         print_error("Usage: cd [DIR]\n");
+                        return 1;
                 } else if (rose_chdir(directory) < 0) {
                         print_error("cd: unable to change directory: ");
                         print_error(directory);
                         print_error("\n");
+                        return 1;
                 }
-                return true;
+                return 0;
         }
         if (strings_equal(arguments[0], "env")) {
                 if (count != 1) {
                         print_error("Usage: env\n");
+                        return 1;
                 } else {
                         for (size_t index = 0U; index < shell_environment_count;
                              index++) {
@@ -989,34 +1132,36 @@ static bool shell_execute_builtin(int count, char **arguments,
                                 print("\n");
                         }
                 }
-                return true;
+                return 0;
         }
         if (strings_equal(arguments[0], "setenv")) {
                 if (count != 3 ||
                     !environment_set(arguments[1], arguments[2])) {
                         print_error("Usage: setenv NAME VALUE\n");
+                        return 1;
                 }
-                return true;
+                return 0;
         }
         if (strings_equal(arguments[0], "unsetenv")) {
                 if (count != 2 || !environment_name_is_valid(arguments[1])) {
                         print_error("Usage: unsetenv NAME\n");
+                        return 1;
                 } else {
                         environment_unset(arguments[1]);
                 }
-                return true;
+                return 0;
         }
         if (strings_equal(arguments[0], "jobs")) {
                 if (count != 1) {
                         print_error("Usage: jobs\n");
+                        return 1;
                 } else {
                         shell_list_jobs();
                 }
-                return true;
+                return 0;
         }
         if (strings_equal(arguments[0], "fg")) {
-                shell_foreground_job(count, arguments);
-                return true;
+                return shell_foreground_job(count, arguments);
         }
 
         /* Keep the former terminal's run command as a compatibility alias,
@@ -1024,15 +1169,13 @@ static bool shell_execute_builtin(int count, char **arguments,
         if (strings_equal(arguments[0], "run")) {
                 char *default_arguments[] = {"/bin/hello", NULL};
                 if (count == 1) {
-                        (void)run_foreground(default_arguments, true);
+                        return run_foreground(default_arguments, true);
                 } else {
-                        (void)run_foreground(&arguments[1], true);
+                        return run_foreground(&arguments[1], true);
                 }
-                return true;
         }
 
-        (void)run_foreground(arguments, false);
-        return false;
+        return run_foreground(arguments, false);
 }
 
 static bool
@@ -1312,12 +1455,14 @@ static bool shell_execute(struct shell_pipeline *pipeline) {
                 if (pipeline->background) {
                         print_error(
                             "sh: built-ins cannot run in the background\n");
+                        shell_last_status = 1;
                         return true;
                 }
                 struct shell_saved_descriptors saved;
                 if (!shell_save_standard_descriptors(&saved)) {
                         print_error(
                             "sh: unable to save standard descriptors\n");
+                        shell_last_status = 1;
                         return true;
                 }
 
@@ -1325,11 +1470,14 @@ static bool shell_execute(struct shell_pipeline *pipeline) {
                 if (!shell_apply_redirections(command)) {
                         (void)shell_restore_standard_descriptors(&saved);
                         print_error("sh: unable to redirect command\n");
+                        shell_last_status = 1;
                 } else {
-                        (void)shell_execute_builtin(command->argument_count,
-                                                    command->arguments,
-                                                    &keep_running);
-                        (void)shell_restore_standard_descriptors(&saved);
+                        shell_last_status = shell_execute_builtin(
+                            command->argument_count, command->arguments,
+                            &keep_running);
+                        if (!shell_restore_standard_descriptors(&saved)) {
+                                shell_last_status = 1;
+                        }
                 }
                 shell_release_standard_descriptors(&saved);
                 return keep_running;
@@ -1347,12 +1495,13 @@ static bool shell_execute(struct shell_pipeline *pipeline) {
                                  item, USER_STDOUT_FILENO))) {
                                 print_error("sh: redirection conflicts with "
                                             "pipeline\n");
+                                shell_last_status = 1;
                                 return true;
                         }
                 }
         }
 
-        (void)shell_run_pipeline(pipeline);
+        shell_last_status = shell_run_pipeline(pipeline);
         return true;
 }
 
@@ -1406,6 +1555,7 @@ static void shell_terminate_jobs(void) {
 int rose_shell_main(char **environment) { // NOLINT(misc-use-internal-linkage)
         environment_initialize(environment);
         shell_initialize_job_control();
+        shell_last_status = 0;
         print("ROSE userspace shell\n");
 
         while (true) {
@@ -1420,6 +1570,7 @@ int rose_shell_main(char **environment) { // NOLINT(misc-use-internal-linkage)
 
                 if (!shell_parse_pipeline(line, &pipeline)) {
                         print_error("sh: invalid or too long command line\n");
+                        shell_last_status = 2;
                         continue;
                 }
                 if (!shell_execute(&pipeline)) {

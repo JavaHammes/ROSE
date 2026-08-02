@@ -240,6 +240,7 @@ def run_smoke_test(
             "Built-ins:",
             "Commands: ls cat echo pwd env mkdir rm",
             "Syntax: command",
+            "Expansion: $NAME ${NAME} $? $$",
         )
 
         require(
@@ -290,11 +291,21 @@ def run_smoke_test(
             session.command("missing"),
             "sh: command not found: missing",
         )
+        require(session.command("echo status=$?"), "\nstatus=127\n")
+        shell_pid = session.command("echo shell-pid=$$")
+        pid_lines = [
+            line for line in shell_pid.splitlines() if line.startswith("shell-pid=")
+        ]
+        if len(pid_lines) != 1 or not pid_lines[0][len("shell-pid=") :].isdigit():
+            raise AssertionError(f"invalid shell PID expansion:\n{shell_pid}")
 
         motd = "Welcome to ROSE. This message was read from writable ext2."
         require(session.command("cat /etc/motd"), motd)
 
         require(session.command("mkdir /tmp"), "rose> ")
+        session.command("setenv ROSE_OUTPUT /tmp/expanded-output")
+        session.command('echo expanded-redirection > "$ROSE_OUTPUT"')
+        require(session.command("cat /tmp/expanded-output"), "expanded-redirection")
         session.command("echo redirection works > /tmp/message")
         session.command("echo append works >> /tmp/message")
         session.command("echo numbered output 1> /tmp/numbered-output")
@@ -348,7 +359,9 @@ def run_smoke_test(
         session.command("rm /tmp/pipeline-error")
         session.command("rm /tmp/two-stage")
         session.command("rm /tmp/three-stage")
+        session.command("rm /tmp/expanded-output")
         session.command("rm /tmp")
+        session.command("unsetenv ROSE_OUTPUT")
 
         require(
             session.command("fs-test"),
@@ -356,6 +369,14 @@ def run_smoke_test(
         )
 
         session.command("setenv ROSE_TEST passed")
+        require(
+            session.command("echo before-${ROSE_TEST}-after"),
+            "\nbefore-passed-after\n",
+        )
+        require(
+            session.command("echo '$ROSE_TEST' \\$ROSE_TEST \"$ROSE_TEST\""),
+            "\n$ROSE_TEST $ROSE_TEST passed\n",
+        )
         require(
             session.command("args-env alpha beta"),
             "Program arguments and environment passed",

@@ -96,7 +96,8 @@ scheduling, and automated emulator tests.
   to the foreground process group; background console reads stop with
   `SIGTTIN`.
 - Interactive `/bin/sh` process with console line editing, quoted and escaped
-  argument parsing, mutable environment variables, `PATH` lookup, working
+  argument parsing, mutable environment variables, quote-aware `$NAME`,
+  `${NAME}`, `$?`, and `$$` parameter expansion, `PATH` lookup, working
   directory built-ins, and ordered standard-descriptor redirection with `<`,
   truncating `>`, appending `>>`, `2>`, `2>>`, and descriptor duplication such
   as `2>&1`. Foreground and `&` background pipelines support up to six commands,
@@ -202,6 +203,7 @@ Useful commands are:
 | `env` | Show environment variables inherited by new programs. |
 | `setenv NAME VALUE` | Set an inherited environment variable. |
 | `unsetenv NAME` | Remove an inherited environment variable. |
+| `echo "$HOME ($$): $?"` | Expand environment, shell PID, and prior status parameters. |
 | `run [PATH [ARG...]]` | Compatibility alias; defaults to `/bin/hello`. |
 | `exit` | Shut QEMU down through SBI SRST. |
 
@@ -254,6 +256,7 @@ and executes host-side tests for changes in `tests/` or `tools/`.
 The smoke tests cover disk-root boot through `/sbin/init` into `/bin/sh`,
 userspace line parsing and built-ins, `PATH` execution, VirtIO-backed ext2
 mutation, directory utilities, input/output redirection, multi-stage pipelines,
+quote-aware environment, status, PID, and redirection-path expansion,
 user/kernel isolation, syscall validation, working-directory resolution,
 shared descriptor offsets across aliases and processes, ordered standard-stream
 redirection and duplication, close-on-exec and nonblocking inheritance,
@@ -315,7 +318,8 @@ another. `make disassemble` writes an annotated disassembly to
 
 ROSE currently targets one hart and one QEMU `virt` platform. Shell redirection
 is limited to the three standard descriptors and has no descriptor-close
-syntax; the shell also has no expansion, `bg` command, session management, or
+syntax; parameter expansion does not yet perform field splitting, pathname or
+command expansion, and the shell has no `bg` command, session management, or
 scripting language. The ext2 implementation is synchronous,
 write-through, limited to one block group and direct plus singly indirect block
 addressing (268 KiB files), and does not yet provide journaling or crash
