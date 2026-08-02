@@ -157,6 +157,11 @@ make -j4
 make run
 ```
 
+Interactive boots use `kernel/build/run-root.ext2`, so filesystem changes
+persist between `run`, `run-gui`, and `debug` sessions. The deterministic
+`kernel/build/root.ext2` image remains pristine for tests and for recreating the
+runtime disk; `make clean` resets both.
+
 For the graphical machine, launch QEMU with the GPU, keyboard, and tablet:
 
 ```sh
@@ -270,6 +275,11 @@ The host-side image tests additionally validate filesystem metadata, output
 determinism, atomic replacement, guest path constraints, and malformed tree
 rejection. Invalid image-builder mappings are reported as concise usage errors
 instead of Python tracebacks.
+
+Each emulator test runs against its own disposable copy of the deterministic
+ext2 image. Guest filesystem mutations and interrupted tests therefore cannot
+contaminate the canonical build artifact, the persistent interactive disk, or
+later test runs.
 
 For source-level debugging, use `make debug` in one terminal and `make gdb` in
 another. `make disassemble` writes an annotated disassembly to

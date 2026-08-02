@@ -21,6 +21,7 @@ override BUILD_DIR := kernel/build
 KERNEL    := $(BUILD_DIR)/kernel.elf
 MAP       := $(BUILD_DIR)/kernel.map
 ROOT_IMAGE := $(BUILD_DIR)/root.ext2
+RUN_ROOT_IMAGE := $(BUILD_DIR)/run-root.ext2
 
 LINKER_SCRIPT := kernel/linker/linker.ld
 USER_LINKER_SCRIPT := user/linker.ld
@@ -159,7 +160,7 @@ QEMU_FLAGS := \
 	-nographic \
 	-bios default \
 	-kernel $(KERNEL) \
-	-drive file=$(ROOT_IMAGE),format=raw,if=none,id=rose-root \
+	-drive file=$(RUN_ROOT_IMAGE),format=raw,if=none,id=rose-root \
 	-device virtio-blk-device,drive=rose-root \
 	-global virtio-mmio.force-legacy=false
 
@@ -169,7 +170,7 @@ QEMU_GUI_FLAGS := \
 	-m 128M \
 	-bios default \
 	-kernel $(KERNEL) \
-	-drive file=$(ROOT_IMAGE),format=raw,if=none,id=rose-root \
+	-drive file=$(RUN_ROOT_IMAGE),format=raw,if=none,id=rose-root \
 	-device virtio-blk-device,drive=rose-root \
 	-device virtio-gpu-device \
 	-device virtio-keyboard-device \
@@ -213,6 +214,12 @@ $(ROOT_IMAGE): tools/mkrosefs.py $(USER_LOAD_ELFS) Makefile
 		--file /bin/gui-files=$(BUILD_DIR)/user/gui_files/program.load.elf \
 		--file /bin/gui-monitor=$(BUILD_DIR)/user/gui_monitor/program.load.elf \
 		--file /sbin/init=$(BUILD_DIR)/user/init/program.load.elf
+
+
+# Interactive boots persist their filesystem changes without modifying the
+# deterministic image consumed by tests and fresh runtime-disk creation.
+$(RUN_ROOT_IMAGE): $(ROOT_IMAGE)
+	cp $< $@
 
 
 $(KERNEL): $(OBJECTS) $(LINKER_SCRIPT) Makefile
@@ -284,17 +291,17 @@ $(BUILD_DIR)/%.o: %.S Makefile
 
 
 .PHONY: run
-run: $(KERNEL) $(ROOT_IMAGE)
+run: $(KERNEL) $(RUN_ROOT_IMAGE)
 	$(QEMU) $(QEMU_FLAGS)
 
 
 .PHONY: run-gui
-run-gui: $(KERNEL) $(ROOT_IMAGE)
+run-gui: $(KERNEL) $(RUN_ROOT_IMAGE)
 	$(QEMU) $(QEMU_GUI_FLAGS)
 
 
 .PHONY: debug
-debug: $(KERNEL) $(ROOT_IMAGE)
+debug: $(KERNEL) $(RUN_ROOT_IMAGE)
 	$(QEMU) $(QEMU_FLAGS) -S -gdb tcp::1234
 
 

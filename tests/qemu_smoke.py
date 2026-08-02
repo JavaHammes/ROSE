@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import os
 import select
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Union
+from typing import Iterator, Union
 
 
 class QemuSession:
@@ -143,18 +146,23 @@ def ext2_free_counts(path: Path) -> tuple[int, int]:
     return struct.unpack("<II", counts)
 
 
-def main() -> int:
-    # Environment overrides mirror Makefile variables and keep the test usable
-    # with differently named cross-toolchains or QEMU installations.
-    repository = Path(__file__).resolve().parents[1]
-    qemu = os.environ.get("QEMU", "qemu-system-riscv64")
-    kernel = Path(os.environ.get("KERNEL", repository / "kernel/build/kernel.elf"))
-    root_image = Path(
-        os.environ.get("ROOT_IMAGE", repository / "kernel/build/root.ext2")
-    )
-    memory = os.environ.get("QEMU_MEMORY", "128M")
-    graphics = os.environ.get("QEMU_GRAPHICS") == "1"
-    graphics_only = os.environ.get("QEMU_GRAPHICS_ONLY") == "1"
+@contextmanager
+def temporary_root_image(source: Path) -> Iterator[Path]:
+    """Give one QEMU run a disposable copy of the writable root image."""
+    with tempfile.TemporaryDirectory(prefix="rose-qemu-") as directory:
+        working_copy = Path(directory) / "root.ext2"
+        shutil.copyfile(source, working_copy)
+        yield working_copy
+
+
+def run_smoke_test(
+    qemu: str,
+    kernel: Path,
+    root_image: Path,
+    memory: str,
+    graphics: bool,
+    graphics_only: bool,
+) -> int:
     initial_free_counts = ext2_free_counts(root_image)
     base_command = [
         qemu,
@@ -466,9 +474,28 @@ def main() -> int:
     return 0
 
 
+def main() -> int:
+    # Environment overrides mirror Makefile variables and keep the test usable
+    # with differently named cross-toolchains or QEMU installations.
+    repository = Path(__file__).resolve().parents[1]
+    qemu = os.environ.get("QEMU", "qemu-system-riscv64")
+    kernel = Path(os.environ.get("KERNEL", repository / "kernel/build/kernel.elf"))
+    source_root_image = Path(
+        os.environ.get("ROOT_IMAGE", repository / "kernel/build/root.ext2")
+    )
+    memory = os.environ.get("QEMU_MEMORY", "128M")
+    graphics = os.environ.get("QEMU_GRAPHICS") == "1"
+    graphics_only = os.environ.get("QEMU_GRAPHICS_ONLY") == "1"
+
+    with temporary_root_image(source_root_image) as root_image:
+        return run_smoke_test(
+            qemu, kernel, root_image, memory, graphics, graphics_only
+        )
+
+
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (AssertionError, RuntimeError) as error:
+    except (AssertionError, OSError, RuntimeError) as error:
         print(error, file=sys.stderr)
         raise SystemExit(1)
