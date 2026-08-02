@@ -274,6 +274,7 @@ def run_smoke_test(
             session.command("syscall-test"),
             "Working directory passed",
             "Descriptor duplication passed",
+            "Time and event waiting passed",
             "Descriptor inheritance passed",
             "Fork semantics passed",
             "Copy-on-write passed",
@@ -476,6 +477,7 @@ def run_smoke_test(
         )
         require(
             fallback.command("syscall-test"),
+            "Time and event waiting passed",
             "Descriptor inheritance passed",
             "Fork semantics passed",
             "Copy-on-write passed",

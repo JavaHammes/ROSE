@@ -432,6 +432,65 @@ static int run_multi_demo(const char *message) {
         return 0;
 }
 
+static int run_time_wait_test(const void *kernel_address) {
+        const uint64_t millisecond = UINT64_C(1000000);
+        uint64_t before = rose_monotonic_time();
+        if (rose_sleep(2U * millisecond) != 0) {
+                return 122;
+        }
+        uint64_t after = rose_monotonic_time();
+        if (after < before + millisecond) {
+                return 123;
+        }
+
+        before = after;
+        if (rose_poll(NULL, 0U, 2) != 0) {
+                return 124;
+        }
+        after = rose_monotonic_time();
+        if (after < before + millisecond ||
+            rose_poll((struct user_poll_descriptor *)kernel_address, 1U, 0) !=
+                -USER_ERROR_BAD_ADDRESS) {
+                return 125;
+        }
+        struct user_poll_descriptor console = {
+            .descriptor = USER_STDOUT_FILENO,
+            .events = USER_POLL_WRITABLE,
+        };
+        if (rose_poll(&console, 1U, 1000) != 1 ||
+            console.returned_events != USER_POLL_WRITABLE) {
+                return 133;
+        }
+
+        volatile uint32_t sequence = 0U;
+        struct user_wait_item changed = {
+            .type = USER_WAIT_OBJECT_SHARED_WORD,
+            .events = USER_WAIT_EVENT_CHANGED,
+            .identifier = (int64_t)(uintptr_t)&sequence,
+            .value = 0U,
+        };
+        if (rose_wait_events(&changed, 1U, 0) != 0 ||
+            rose_event_notify(NULL) != -USER_ERROR_BAD_ADDRESS) {
+                return 126;
+        }
+        sequence = 1U;
+        if (rose_event_notify(&sequence) != 0 ||
+            rose_wait_events(&changed, 1U, 0) != 1 ||
+            changed.returned_events != USER_WAIT_EVENT_CHANGED ||
+            changed.value != 1U ||
+            rose_wait_events((struct user_wait_item *)kernel_address, 1U, 0) !=
+                -USER_ERROR_BAD_ADDRESS) {
+                return 127;
+        }
+
+        before = rose_monotonic_time();
+        if (rose_wait_events(NULL, 0U, 2 * (int64_t)millisecond) != 0) {
+                return 128;
+        }
+        after = rose_monotonic_time();
+        return after >= before + millisecond ? 0 : 129;
+}
+
 static int run_syscall_test(void) {
         /* Kernel text is mapped supervisor-only in this address space. Passing
          * it to write must return EFAULT without dereferencing it in S-mode. */
@@ -546,6 +605,12 @@ static int run_syscall_test(void) {
             -USER_ERROR_NOT_IMPLEMENTED) {
                 return 5;
         }
+
+        int time_wait_result = run_time_wait_test(kernel_address);
+        if (time_wait_result != 0) {
+                return time_wait_result;
+        }
+        print("Time and event waiting passed\n");
 
         /* brk(0) exposes the page-aligned end of the loaded ELF. Growing by a
          * non-page multiple verifies both full and partial heap pages. */
@@ -965,14 +1030,28 @@ static int run_syscall_test(void) {
 
         int terminals[2];
         char terminal_byte = 0;
+        struct user_poll_descriptor terminal_poll;
         if (rose_openpty((int *)kernel_address) != -USER_ERROR_BAD_ADDRESS ||
             rose_openpty(terminals) != 0 || terminals[0] != 3 ||
             terminals[1] != 4 ||
             rose_set_descriptor_flags(terminals[0], USER_DESCRIPTOR_NONBLOCK) !=
-                0 ||
+                0) {
+                return 80;
+        }
+        terminal_poll = (struct user_poll_descriptor){
+            .descriptor = terminals[0],
+            .events = USER_POLL_READABLE | USER_POLL_WRITABLE};
+        if (rose_poll(&terminal_poll, 1U, 0) != 1 ||
+            terminal_poll.returned_events != USER_POLL_WRITABLE ||
             rose_read(terminals[0], &terminal_byte, 1U) !=
                 -USER_ERROR_TRY_AGAIN ||
-            rose_write(terminals[0], "m", 1U) != 1 ||
+            rose_write(terminals[0], "m", 1U) != 1) {
+                return 80;
+        }
+        terminal_poll = (struct user_poll_descriptor){
+            .descriptor = terminals[1], .events = USER_POLL_READABLE};
+        if (rose_poll(&terminal_poll, 1U, 0) != 1 ||
+            terminal_poll.returned_events != USER_POLL_READABLE ||
             rose_read(terminals[1], &terminal_byte, 1U) != 1 ||
             terminal_byte != 'm' || rose_write(terminals[1], "s", 1U) != 1 ||
             rose_read(terminals[0], &terminal_byte, 1U) != 1 ||
@@ -1529,12 +1608,39 @@ static int run_pipe_test(void) {
                 return 42;
         }
 
+        struct user_poll_descriptor readiness[2] = {
+            {.descriptor = descriptors[0], .events = USER_POLL_READABLE},
+            {.descriptor = descriptors[1], .events = USER_POLL_WRITABLE},
+        };
+        if (rose_poll(readiness, 2U, 0) != 1 ||
+            readiness[0].returned_events != 0U ||
+            readiness[1].returned_events != USER_POLL_WRITABLE) {
+                return 130;
+        }
+
         char *arguments[] = {"/bin/pipe-writer", NULL};
         char *environment[] = {NULL};
         long child = rose_spawn("/bin/pipe-writer", arguments, environment);
 
         if (child <= 0 || rose_close(descriptors[1]) != 0) {
                 return 43;
+        }
+
+
+        readiness[0] = (struct user_poll_descriptor){
+            .descriptor = descriptors[0], .events = USER_POLL_READABLE};
+        if (rose_poll(readiness, 1U, 1000) != 1 ||
+            (readiness[0].returned_events & USER_POLL_READABLE) == 0U) {
+                return 131;
+        }
+        struct user_wait_item pipe_wait = {
+            .type = USER_WAIT_OBJECT_DESCRIPTOR,
+            .events = USER_WAIT_EVENT_READABLE,
+            .identifier = descriptors[0],
+        };
+        if (rose_wait_events(&pipe_wait, 1U, 0) != 1 ||
+            (pipe_wait.returned_events & USER_WAIT_EVENT_READABLE) == 0U) {
+                return 132;
         }
 
         char streaming_buffer[257];
@@ -1568,7 +1674,14 @@ static int run_pipe_test(void) {
         }
 
         int wait_status = -1;
-        if (rose_waitpid(child, &wait_status, 0U) != child ||
+        struct user_wait_item child_wait = {
+            .type = USER_WAIT_OBJECT_CHILD,
+            .events = USER_WAIT_EVENT_CHILD_EXITED,
+            .identifier = child,
+        };
+        if (rose_wait_events(&child_wait, 1U, INT64_C(1000000000)) != 1 ||
+            child_wait.returned_events != USER_WAIT_EVENT_CHILD_EXITED ||
+            rose_waitpid(child, &wait_status, 0U) != child ||
             !USER_WAIT_STATUS_EXITED(wait_status) ||
             USER_WAIT_STATUS_EXIT_CODE(wait_status) != 0U) {
                 return 47;

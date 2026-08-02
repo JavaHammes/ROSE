@@ -46,6 +46,11 @@
 #define USER_SYSCALL_MMAP 40
 #define USER_SYSCALL_MUNMAP 41
 #define USER_SYSCALL_MPROTECT 42
+#define USER_SYSCALL_MONOTONIC_TIME 43
+#define USER_SYSCALL_SLEEP 44
+#define USER_SYSCALL_POLL 45
+#define USER_SYSCALL_WAIT_EVENTS 46
+#define USER_SYSCALL_EVENT_NOTIFY 47
 
 #else
 
@@ -93,6 +98,11 @@ enum user_syscall_number {
         USER_SYSCALL_MMAP = 40,
         USER_SYSCALL_MUNMAP = 41,
         USER_SYSCALL_MPROTECT = 42,
+        USER_SYSCALL_MONOTONIC_TIME = 43,
+        USER_SYSCALL_SLEEP = 44,
+        USER_SYSCALL_POLL = 45,
+        USER_SYSCALL_WAIT_EVENTS = 46,
+        USER_SYSCALL_EVENT_NOTIFY = 47,
 };
 
 /* Stable negative error values returned in a0 by failed system calls. */
@@ -136,6 +146,53 @@ enum user_open_flags {
 enum user_descriptor_flags {
         USER_DESCRIPTOR_CLOSE_ON_EXEC = (1U << 0),
         USER_DESCRIPTOR_NONBLOCK = (1U << 1),
+};
+
+/* Descriptor readiness flags used by poll and descriptor wait items. Error,
+ * hangup, and invalid-descriptor state is reported even when not requested. */
+enum user_poll_event {
+        USER_POLL_READABLE = (1U << 0),
+        USER_POLL_WRITABLE = (1U << 1),
+        USER_POLL_ERROR = (1U << 2),
+        USER_POLL_HANGUP = (1U << 3),
+        USER_POLL_INVALID = (1U << 4),
+};
+
+struct user_poll_descriptor {
+        int32_t descriptor;
+        uint32_t events;
+        uint32_t returned_events;
+};
+
+/* A wait set can combine kernel descriptors with the graphics input queue,
+ * child transitions, and userspace shared-memory sequence words. The timeout
+ * is relative nanoseconds; a negative timeout means no deadline. */
+enum user_wait_object_type {
+        USER_WAIT_OBJECT_DESCRIPTOR = 1,
+        USER_WAIT_OBJECT_INPUT = 2,
+        USER_WAIT_OBJECT_CHILD = 3,
+        USER_WAIT_OBJECT_SHARED_WORD = 4,
+};
+
+enum user_wait_event {
+        USER_WAIT_EVENT_READABLE = USER_POLL_READABLE,
+        USER_WAIT_EVENT_WRITABLE = USER_POLL_WRITABLE,
+        USER_WAIT_EVENT_ERROR = USER_POLL_ERROR,
+        USER_WAIT_EVENT_HANGUP = USER_POLL_HANGUP,
+        USER_WAIT_EVENT_INVALID = USER_POLL_INVALID,
+        USER_WAIT_EVENT_CHILD_EXITED = (1U << 5),
+        USER_WAIT_EVENT_CHILD_STOPPED = (1U << 6),
+        USER_WAIT_EVENT_CHILD_CONTINUED = (1U << 7),
+        USER_WAIT_EVENT_CHANGED = (1U << 8),
+};
+
+struct user_wait_item {
+        uint32_t type;
+        uint32_t events;
+        int64_t identifier;
+        uint64_t value;
+        uint32_t returned_events;
+        uint32_t reserved;
 };
 
 enum user_seek_whence {

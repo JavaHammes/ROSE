@@ -28,15 +28,17 @@ scheduling, and automated emulator tests.
   flushes. A graphical console mirrors `/dev/console` output while UART remains
   available for diagnostics and headless automation.
 - A userspace graphics ABI maps the framebuffer into one owning process and
-  exposes validated dirty-rectangle flushes and nonblocking input events.
+  exposes validated dirty-rectangle flushes and waitable input events.
   `/bin/desktop` is a multi-process window server with overlapping surfaces,
   focus and z-order, title-bar dragging, close controls, input routing, and
   damage-tracked composition. Page-backed shared-memory objects carry client
   pixels and event rings. Separate graphical terminal, Files, and live system
   monitor processes render through a compact client UI library and expose
-  copy-on-write activity alongside scheduler and memory counters. Screen/input
-  ownership and shared mappings are reclaimed automatically on exit, fault,
-  or `execve`, restoring the graphical console.
+  copy-on-write activity alongside scheduler and memory counters. Shared-word
+  notifications let compositor and clients sleep until input, damage, focus,
+  close, or PTY state changes, and the monitor updates from monotonic
+  deadlines. Screen/input ownership and shared mappings are reclaimed
+  automatically on exit, fault, or `execve`, restoring the graphical console.
 - Generic sector-device interface, modern VirtIO-MMIO block driver, and a
   sixteen-entry write-through cache for 1 KiB filesystem blocks.
 - Writable ext2 root filesystem containing `/sbin/init`, `/bin/sh`, programs,
@@ -62,7 +64,8 @@ scheduling, and automated emulator tests.
   `getcwd`, `pipe`, descriptor flags, `fork`, `spawn`, `execve`, `getpid`,
   `waitpid`, `sigaction`, `kill`, process-group and console foreground-group
   control, shared memory, pseudo-terminals, system telemetry, `brk`, `mmap`,
-  `mprotect`, `munmap`, `exit`, and `yield`
+  `mprotect`, `munmap`, monotonic time, sleep, descriptor `poll`, mixed event
+  waits, shared-event notification, `exit`, and `yield`
   system calls. Relative paths resolve from a canonical per-process working
   directory. `brk` provides a private, zero-filled, growable userspace heap
   between the ELF image and stack guard; shrinking or process teardown returns
@@ -85,7 +88,9 @@ scheduling, and automated emulator tests.
   carries both untouched reservations and resident pages forward while applying
   copy-on-write to writable pages.
   UART reads and writes block on scheduler wait channels and resume from device
-  interrupts without polling in syscall traps.
+  interrupts without polling in syscall traps. A single wait set can combine
+  console, pipe, or PTY readiness with graphics input, child transitions,
+  shared-memory sequence words, and a relative timeout.
 - Process-directed signals with default termination, ignore, and caught
   dispositions. Caught handlers return through a runtime trampoline and a
   kernel-held register frame, preventing `sigreturn` from forging privileged
@@ -107,9 +112,9 @@ scheduling, and automated emulator tests.
 - Sixteen-slot round-robin process scheduler with timer preemption, guarded user
   stacks, per-process kernel trap stacks, process creation, termination,
   parent/child ownership, orphan adoption by PID 0, waiting, reaping, typed
-  block/wake channels, and an interruptible idle path with an atomic
-  interrupt-masked readiness check. On a disk-root boot, `/sbin/init` remains
-  PID 1 while its `/bin/sh` child is running.
+  block/wake channels, per-process monotonic deadlines, and an interruptible
+  idle path with an atomic interrupt-masked readiness check. On a disk-root
+  boot, `/sbin/init` remains PID 1 while its `/bin/sh` child is running.
 - Interrupt-driven UART input, PLIC external interrupts, SBI timers, panic
   diagnostics, and clean shutdown after the userspace shell exits.
 - Automated QEMU tests at two RAM sizes, including leak detection.
@@ -266,9 +271,11 @@ shrinkage, lazy anonymous mappings, partial protection and unmapping, mapping
 protection and reclamation, copy-on-write `fork` address-space isolation and
 concurrent process-capacity stress, caught/ignored/default signal delivery,
 signal wakeup of blocked processes, fork inheritance and exec reset of
-dispositions, blocking UART and pipe I/O, process-group signal delivery, stop/continue wait
-events, Ctrl-C and Ctrl-Z foreground handling, background commands, `jobs`/`fg`,
-child creation and waiting, memory reclamation, fallback-ramfs shell boot,
+dispositions, monotonic sleeps and timeout waits, descriptor and mixed-event
+readiness, blocking UART and pipe I/O, process-group signal delivery,
+stop/continue wait events, Ctrl-C and Ctrl-Z foreground handling, background
+commands, `jobs`/`fg`, child creation and waiting, memory reclamation,
+fallback-ramfs shell boot,
 graphical transport discovery, userspace framebuffer mapping and flushing,
 automatic graphical console restoration, and clean shutdown. The graphical
 smoke test boots and closes the full three-client desktop; the terminal path

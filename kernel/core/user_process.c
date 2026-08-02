@@ -48,6 +48,7 @@ enum {
         SHARED_MEMORY_PROCESS_LIMIT = 4,
         SHARED_MEMORY_PAGE_LIMIT = 256,
         PROCESS_ANONYMOUS_MAPPING_LIMIT = 16,
+        USER_WAIT_ITEM_LIMIT = PROCESS_LIMIT + 4,
 };
 
 enum descriptor_access {
@@ -64,6 +65,13 @@ enum process_state {
         PROCESS_BLOCKED,
         PROCESS_STOPPED,
         PROCESS_EXITED,
+};
+
+enum process_pending_wait {
+        PROCESS_WAIT_NONE,
+        PROCESS_WAIT_SLEEP,
+        PROCESS_WAIT_POLL,
+        PROCESS_WAIT_EVENTS,
 };
 
 _Static_assert((uint32_t)USER_OPEN_READ == (uint32_t)VFS_OPEN_READ &&
@@ -201,6 +209,11 @@ struct process {
         /* Blocking syscall continuation state. A process never returns to
          * U-mode while either pending flag is true. */
         enum scheduler_wait_channel wait_channel;
+        bool scheduler_deadline_active;
+        uint64_t scheduler_deadline;
+        enum process_pending_wait pending_wait;
+        bool pending_wait_has_deadline;
+        uint64_t pending_wait_deadline;
         bool pending_write;
         size_t write_descriptor;
         size_t write_result_length;
@@ -1652,6 +1665,7 @@ static void process_queue_signal(struct process *target, uint32_t signal) {
             (target->state == PROCESS_STOPPED && signal == USER_SIGNAL_KILL)) {
                 target->state = PROCESS_READY;
                 target->wait_channel = SCHEDULER_WAIT_NONE;
+                target->scheduler_deadline_active = false;
         }
 }
 
@@ -3667,6 +3681,367 @@ static uint64_t syscall_system_info(uintptr_t user_information) {
         return 0U;
 }
 
+static uint64_t saturating_add(uint64_t left, uint64_t right) {
+        return left > UINT64_MAX - right ? UINT64_MAX : left + right;
+}
+
+static uint64_t milliseconds_to_nanoseconds(int64_t milliseconds) {
+        const uint64_t nanoseconds_per_millisecond = UINT64_C(1000000);
+        if (milliseconds <= 0) {
+                return 0U;
+        }
+        if ((uint64_t)milliseconds >
+            UINT64_MAX / nanoseconds_per_millisecond) {
+                return UINT64_MAX;
+        }
+        return (uint64_t)milliseconds * nanoseconds_per_millisecond;
+}
+
+static void process_wait_begin(enum process_pending_wait wait,
+                               bool has_deadline,
+                               uint64_t duration_nanoseconds) {
+        if (active_process->pending_wait == PROCESS_WAIT_NONE) {
+                active_process->pending_wait = wait;
+                active_process->pending_wait_has_deadline = has_deadline;
+                active_process->pending_wait_deadline =
+                    has_deadline
+                        ? saturating_add(timer_monotonic_nanoseconds(),
+                                         duration_nanoseconds)
+                        : 0U;
+                return;
+        }
+        if (active_process->pending_wait != wait) {
+                panic("Mismatched blocking wait continuation");
+        }
+}
+
+static bool process_wait_deadline_reached(void) {
+        return active_process->pending_wait_has_deadline &&
+               timer_monotonic_nanoseconds() >=
+                   active_process->pending_wait_deadline;
+}
+
+static void process_wait_complete(void) {
+        active_process->pending_wait = PROCESS_WAIT_NONE;
+        active_process->pending_wait_has_deadline = false;
+        active_process->pending_wait_deadline = 0U;
+}
+
+static void process_wait_block(struct trap_frame *frame,
+                               enum scheduler_wait_channel channel) {
+        if (active_process->pending_wait_has_deadline) {
+                scheduler_block_current_until(
+                    frame, channel, active_process->pending_wait_deadline);
+        } else {
+                scheduler_block_current(frame, channel);
+        }
+}
+
+static uint32_t descriptor_ready_events(int32_t descriptor,
+                                        uint32_t requested) {
+        if (descriptor < 0) {
+                return 0U;
+        }
+        if ((uint32_t)descriptor >= PROCESS_DESCRIPTOR_LIMIT) {
+                return USER_POLL_INVALID;
+        }
+
+        const struct process_open_file *open_file =
+            active_process->descriptors[(size_t)descriptor].open_file;
+        if (open_file == NULL) {
+                return USER_POLL_INVALID;
+        }
+
+        uint32_t returned = 0U;
+        if (open_file->read_pipe != NULL) {
+                const struct process_pipe *pipe = open_file->read_pipe;
+                if ((requested & USER_POLL_READABLE) != 0U &&
+                    (pipe->count != 0U || pipe->writers == 0U)) {
+                        returned |= USER_POLL_READABLE;
+                }
+                if (pipe->writers == 0U) {
+                        returned |= USER_POLL_HANGUP;
+                }
+        }
+        if (open_file->write_pipe != NULL) {
+                const struct process_pipe *pipe = open_file->write_pipe;
+                if (pipe->readers == 0U) {
+                        returned |= USER_POLL_ERROR | USER_POLL_HANGUP;
+                } else if ((requested & USER_POLL_WRITABLE) != 0U &&
+                           pipe->count < PIPE_BUFFER_SIZE) {
+                        returned |= USER_POLL_WRITABLE;
+                }
+        }
+        if (open_file->read_pipe != NULL || open_file->write_pipe != NULL) {
+                return returned;
+        }
+
+        if (open_file->file.type == VFS_NODE_CHARACTER_DEVICE) {
+                if ((requested & USER_POLL_READABLE) != 0U &&
+                    (open_file->access & DESCRIPTOR_READ) != 0U &&
+                    uart_read_ready()) {
+                        returned |= USER_POLL_READABLE;
+                }
+                if ((requested & USER_POLL_WRITABLE) != 0U &&
+                    (open_file->access & DESCRIPTOR_WRITE) != 0U &&
+                    (uart_write_owner == NULL ||
+                     uart_write_owner == active_process) &&
+                    uart_write_ready()) {
+                        returned |= USER_POLL_WRITABLE;
+                }
+                return returned;
+        }
+
+        if ((requested & USER_POLL_READABLE) != 0U &&
+            (open_file->access & DESCRIPTOR_READ) != 0U) {
+                returned |= USER_POLL_READABLE;
+        }
+        if ((requested & USER_POLL_WRITABLE) != 0U &&
+            (open_file->access & DESCRIPTOR_WRITE) != 0U) {
+                returned |= USER_POLL_WRITABLE;
+        }
+        return returned;
+}
+
+static uint64_t poll_validate(uintptr_t user_descriptors, size_t count) {
+        if (count > PROCESS_DESCRIPTOR_LIMIT) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+        if (count != 0U &&
+            !user_range_is_valid(user_descriptors,
+                                 count * sizeof(struct user_poll_descriptor),
+                                 VM_PAGE_READ | VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        return 0U;
+}
+
+static size_t poll_scan(uintptr_t user_descriptors, size_t count) {
+        size_t ready = 0U;
+        for (size_t index = 0U; index < count; index++) {
+                uintptr_t address =
+                    user_descriptors +
+                    index * sizeof(struct user_poll_descriptor);
+                struct user_poll_descriptor descriptor;
+                user_copy_from((uint8_t *)&descriptor, address,
+                               sizeof(descriptor));
+                descriptor.returned_events = descriptor_ready_events(
+                    descriptor.descriptor, descriptor.events);
+                if (descriptor.returned_events != 0U) {
+                        ready++;
+                }
+                user_copy_to(address, (const uint8_t *)&descriptor,
+                             sizeof(descriptor));
+        }
+        return ready;
+}
+
+static void syscall_sleep(struct trap_frame *frame,
+                          uint64_t duration_nanoseconds) {
+        process_wait_begin(PROCESS_WAIT_SLEEP, true, duration_nanoseconds);
+        if (process_wait_deadline_reached()) {
+                process_wait_complete();
+                frame->a0 = 0U;
+                frame->sepc += 4U;
+                return;
+        }
+        process_wait_block(frame, SCHEDULER_WAIT_TIMER);
+}
+
+static void syscall_poll(struct trap_frame *frame,
+                         uintptr_t user_descriptors, size_t count,
+                         int64_t timeout_milliseconds) {
+        uint64_t validation = poll_validate(user_descriptors, count);
+        if (validation != 0U) {
+                process_wait_complete();
+                frame->a0 = validation;
+                frame->sepc += 4U;
+                return;
+        }
+
+        bool has_deadline = timeout_milliseconds >= 0;
+        process_wait_begin(PROCESS_WAIT_POLL, has_deadline,
+                           milliseconds_to_nanoseconds(timeout_milliseconds));
+        size_t ready = poll_scan(user_descriptors, count);
+        if (ready != 0U || process_wait_deadline_reached()) {
+                process_wait_complete();
+                frame->a0 = ready;
+                frame->sepc += 4U;
+                return;
+        }
+        process_wait_block(frame, SCHEDULER_WAIT_EVENT);
+}
+
+static uint64_t child_ready_events(int64_t requested_pid, uint32_t requested,
+                                   bool *found_child) {
+        uint32_t returned = 0U;
+        *found_child = false;
+        for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
+                const struct process *child = &process_table[index];
+                if (!process_is_waitable_child(child, requested_pid)) {
+                        continue;
+                }
+                *found_child = true;
+                if (child->state == PROCESS_EXITED &&
+                    (requested & USER_WAIT_EVENT_CHILD_EXITED) != 0U) {
+                        returned |= USER_WAIT_EVENT_CHILD_EXITED;
+                }
+                if (child->stop_event &&
+                    (requested & USER_WAIT_EVENT_CHILD_STOPPED) != 0U) {
+                        returned |= USER_WAIT_EVENT_CHILD_STOPPED;
+                }
+                if (child->continued_event &&
+                    (requested & USER_WAIT_EVENT_CHILD_CONTINUED) != 0U) {
+                        returned |= USER_WAIT_EVENT_CHILD_CONTINUED;
+                }
+        }
+        return returned;
+}
+
+static uint64_t wait_item_scan(struct user_wait_item *item) {
+        item->returned_events = 0U;
+        if (item->reserved != 0U) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+
+        switch (item->type) {
+        case USER_WAIT_OBJECT_DESCRIPTOR:
+                if ((item->events & ~(uint32_t)(USER_WAIT_EVENT_READABLE |
+                                                USER_WAIT_EVENT_WRITABLE)) !=
+                        0U ||
+                    item->identifier < INT32_MIN ||
+                    item->identifier > INT32_MAX) {
+                        return (uint64_t)-(
+                            int64_t)USER_ERROR_INVALID_ARGUMENT;
+                }
+                item->returned_events = descriptor_ready_events(
+                    (int32_t)item->identifier, item->events);
+                return 0U;
+
+        case USER_WAIT_OBJECT_INPUT:
+                if (item->identifier != 0 || item->value != 0U ||
+                    item->events != USER_WAIT_EVENT_READABLE) {
+                        return (uint64_t)-(
+                            int64_t)USER_ERROR_INVALID_ARGUMENT;
+                }
+                if (graphics_owner_pid != active_process->pid) {
+                        return (uint64_t)-(int64_t)USER_ERROR_PERMISSION;
+                }
+                if (input_event_available()) {
+                        item->returned_events = USER_WAIT_EVENT_READABLE;
+                }
+                return 0U;
+
+        case USER_WAIT_OBJECT_CHILD: {
+                const uint32_t child_events =
+                    USER_WAIT_EVENT_CHILD_EXITED |
+                    USER_WAIT_EVENT_CHILD_STOPPED |
+                    USER_WAIT_EVENT_CHILD_CONTINUED;
+                if ((item->events & ~child_events) != 0U ||
+                    item->events == 0U || item->value != 0U ||
+                    item->identifier == INT64_MIN) {
+                        return (uint64_t)-(
+                            int64_t)USER_ERROR_INVALID_ARGUMENT;
+                }
+                bool found_child;
+                item->returned_events = (uint32_t)child_ready_events(
+                    item->identifier, item->events, &found_child);
+                return found_child
+                           ? 0U
+                           : (uint64_t)-(int64_t)USER_ERROR_NO_CHILD;
+        }
+
+        case USER_WAIT_OBJECT_SHARED_WORD: {
+                if (item->events != USER_WAIT_EVENT_CHANGED) {
+                        return (uint64_t)-(
+                            int64_t)USER_ERROR_INVALID_ARGUMENT;
+                }
+                if (item->identifier <= 0 ||
+                    !user_range_is_valid((uintptr_t)item->identifier,
+                                         sizeof(uint32_t), VM_PAGE_READ)) {
+                        return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+                }
+                uint32_t current;
+                user_copy_from((uint8_t *)&current,
+                               (uintptr_t)item->identifier, sizeof(current));
+                if (current != (uint32_t)item->value) {
+                        item->returned_events = USER_WAIT_EVENT_CHANGED;
+                        item->value = current;
+                }
+                return 0U;
+        }
+
+        default:
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+}
+
+static uint64_t wait_events_validate(uintptr_t user_items, size_t count) {
+        if (count > USER_WAIT_ITEM_LIMIT) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+        if (count != 0U &&
+            !user_range_is_valid(user_items,
+                                 count * sizeof(struct user_wait_item),
+                                 VM_PAGE_READ | VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        return 0U;
+}
+
+static uint64_t wait_events_scan(uintptr_t user_items, size_t count,
+                                 size_t *ready) {
+        *ready = 0U;
+        for (size_t index = 0U; index < count; index++) {
+                uintptr_t address =
+                    user_items + index * sizeof(struct user_wait_item);
+                struct user_wait_item item;
+                user_copy_from((uint8_t *)&item, address, sizeof(item));
+                uint64_t result = wait_item_scan(&item);
+                if (result != 0U) {
+                        return result;
+                }
+                if (item.returned_events != 0U) {
+                        (*ready)++;
+                }
+                user_copy_to(address, (const uint8_t *)&item, sizeof(item));
+        }
+        return 0U;
+}
+
+static void syscall_wait_events(struct trap_frame *frame,
+                                uintptr_t user_items, size_t count,
+                                int64_t timeout_nanoseconds) {
+        uint64_t validation = wait_events_validate(user_items, count);
+        if (validation != 0U) {
+                process_wait_complete();
+                frame->a0 = validation;
+                frame->sepc += 4U;
+                return;
+        }
+
+        bool has_deadline = timeout_nanoseconds >= 0;
+        process_wait_begin(PROCESS_WAIT_EVENTS, has_deadline,
+                           has_deadline ? (uint64_t)timeout_nanoseconds : 0U);
+        size_t ready;
+        uint64_t result = wait_events_scan(user_items, count, &ready);
+        if (result != 0U || ready != 0U || process_wait_deadline_reached()) {
+                process_wait_complete();
+                frame->a0 = result != 0U ? result : ready;
+                frame->sepc += 4U;
+                return;
+        }
+        process_wait_block(frame, SCHEDULER_WAIT_EVENT);
+}
+
+static uint64_t syscall_event_notify(uintptr_t user_word) {
+        if (!user_range_is_valid(user_word, sizeof(uint32_t), VM_PAGE_READ)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        (void)scheduler_wake_all(SCHEDULER_WAIT_EVENT);
+        return 0U;
+}
+
 /* Select the first READY slot after the current process, wrapping once. */
 static struct process *scheduler_find_next_ready(void) {
         size_t start_index = 0U;
@@ -3705,8 +4080,9 @@ static void scheduler_return_to_kernel(struct trap_frame *frame) {
         frame->sstatus |= SSTATUS_SPP;
 }
 
-void scheduler_block_current(struct trap_frame *frame,
-                             enum scheduler_wait_channel channel) {
+static void scheduler_block_current_internal(
+    struct trap_frame *frame, enum scheduler_wait_channel channel,
+    bool deadline_active, uint64_t deadline_nanoseconds) {
         if (frame == NULL) {
                 panic("Scheduler block requires a trap frame");
         }
@@ -3721,6 +4097,8 @@ void scheduler_block_current(struct trap_frame *frame,
         trap_frame_copy(&previous->context, frame);
         previous->state = PROCESS_BLOCKED;
         previous->wait_channel = channel;
+        previous->scheduler_deadline_active = deadline_active;
+        previous->scheduler_deadline = deadline_nanoseconds;
         scheduler_blocks++;
 
         struct process *next = scheduler_find_next_ready();
@@ -3734,6 +4112,24 @@ void scheduler_block_current(struct trap_frame *frame,
         scheduler_return_to_kernel(frame);
 }
 
+void scheduler_block_current(struct trap_frame *frame,
+                             enum scheduler_wait_channel channel) {
+        scheduler_block_current_internal(frame, channel, false, 0U);
+}
+
+void scheduler_block_current_until(struct trap_frame *frame,
+                                   enum scheduler_wait_channel channel,
+                                   uint64_t deadline_nanoseconds) {
+        scheduler_block_current_internal(frame, channel, true,
+                                         deadline_nanoseconds);
+}
+
+static void scheduler_make_ready(struct process *process) {
+        process->state = PROCESS_READY;
+        process->wait_channel = SCHEDULER_WAIT_NONE;
+        process->scheduler_deadline_active = false;
+}
+
 size_t scheduler_wake_all(enum scheduler_wait_channel channel) {
         if (channel == SCHEDULER_WAIT_NONE) {
                 return 0U;
@@ -3745,9 +4141,10 @@ size_t scheduler_wake_all(enum scheduler_wait_channel channel) {
                 struct process *process = &process_table[index];
 
                 if (process->state == PROCESS_BLOCKED &&
-                    process->wait_channel == channel) {
-                        process->state = PROCESS_READY;
-                        process->wait_channel = SCHEDULER_WAIT_NONE;
+                    (process->wait_channel == channel ||
+                     (channel != SCHEDULER_WAIT_EVENT &&
+                      process->wait_channel == SCHEDULER_WAIT_EVENT))) {
+                        scheduler_make_ready(process);
                         woken++;
                 }
         }
@@ -3760,18 +4157,48 @@ bool scheduler_wake_one(enum scheduler_wait_channel channel) {
                 return false;
         }
 
+        bool woken = false;
         for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
                 struct process *process = &process_table[index];
 
                 if (process->state == PROCESS_BLOCKED &&
                     process->wait_channel == channel) {
-                        process->state = PROCESS_READY;
-                        process->wait_channel = SCHEDULER_WAIT_NONE;
-                        return true;
+                        scheduler_make_ready(process);
+                        woken = true;
+                        break;
                 }
         }
 
-        return false;
+        /* A readiness wait may be interested in the same transition as a
+         * traditional blocking read. It is safe to wake all wait sets: each
+         * one rescans its objects atomically before sleeping again. */
+        if (channel != SCHEDULER_WAIT_EVENT) {
+                for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
+                        struct process *process = &process_table[index];
+                        if (process->state == PROCESS_BLOCKED &&
+                            process->wait_channel == SCHEDULER_WAIT_EVENT) {
+                                scheduler_make_ready(process);
+                                woken = true;
+                        }
+                }
+        }
+
+        return woken;
+}
+
+size_t scheduler_wake_expired(uint64_t now_nanoseconds) {
+        size_t woken = 0U;
+
+        for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
+                struct process *process = &process_table[index];
+                if (process->state == PROCESS_BLOCKED &&
+                    process->scheduler_deadline_active &&
+                    now_nanoseconds >= process->scheduler_deadline) {
+                        scheduler_make_ready(process);
+                        woken++;
+                }
+        }
+        return woken;
 }
 
 /* Advance one resumable write. While it is blocked, sepc continues to point at
@@ -3990,6 +4417,8 @@ static void user_process_finish(struct trap_frame *frame, uint64_t status) {
         }
         active_process->pending_write = false;
         active_process->pending_read = false;
+        active_process->pending_wait = PROCESS_WAIT_NONE;
+        active_process->pending_wait_has_deadline = false;
         active_process->state = PROCESS_EXITED;
         active_process->exit_status = status;
         process_orphan_children(active_process->pid);
@@ -4024,6 +4453,7 @@ static void process_stop_current(struct trap_frame *frame, uint32_t signal) {
         trap_frame_copy(&stopped->context, frame);
         stopped->state = PROCESS_STOPPED;
         stopped->wait_channel = SCHEDULER_WAIT_NONE;
+        stopped->scheduler_deadline_active = false;
         stopped->stop_signal = signal;
         stopped->stop_event = true;
         stopped->continued_event = false;
@@ -4344,6 +4774,12 @@ void user_process_handle_syscall(struct trap_frame *frame) {
         /* A blocked syscall resumes at its original ECALL. Deliver the signal
          * which woke it before its continuation can put it back to sleep. */
         if (process_has_deliverable_signal(active_process)) {
+                if (active_process->pending_wait != PROCESS_WAIT_NONE) {
+                        process_wait_complete();
+                        frame->a0 =
+                            (uint64_t)-(int64_t)USER_ERROR_INTERRUPTED;
+                        frame->sepc += 4U;
+                }
                 return;
         }
 
@@ -4599,6 +5035,31 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 frame->a0 =
                     syscall_mprotect((uintptr_t)frame->a0, (size_t)frame->a1,
                                      (uint32_t)frame->a2);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_MONOTONIC_TIME:
+                frame->a0 = timer_monotonic_nanoseconds();
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_SLEEP:
+                syscall_sleep(frame, frame->a0);
+                return;
+
+        case USER_SYSCALL_POLL:
+                syscall_poll(frame, (uintptr_t)frame->a0,
+                             (size_t)frame->a1, (int64_t)frame->a2);
+                return;
+
+        case USER_SYSCALL_WAIT_EVENTS:
+                syscall_wait_events(frame, (uintptr_t)frame->a0,
+                                    (size_t)frame->a1,
+                                    (int64_t)frame->a2);
+                return;
+
+        case USER_SYSCALL_EVENT_NOTIFY:
+                frame->a0 = syscall_event_notify((uintptr_t)frame->a0);
                 frame->sepc += 4U;
                 return;
 

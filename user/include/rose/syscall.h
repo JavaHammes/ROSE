@@ -24,6 +24,17 @@ long rose_dup2(int old_descriptor, int new_descriptor);
 long rose_pipe(int descriptors[2]);
 long rose_set_descriptor_flags(int descriptor, uint32_t flags);
 
+/* Monotonic time and interruptible event-driven waiting. Poll timeouts are
+ * milliseconds; wait-set and sleep durations are nanoseconds. A negative poll
+ * or wait-set timeout blocks indefinitely. */
+uint64_t rose_monotonic_time(void);
+long rose_sleep(uint64_t duration_nanoseconds);
+long rose_poll(struct user_poll_descriptor *descriptors, size_t count,
+               int64_t timeout_milliseconds);
+long rose_wait_events(struct user_wait_item *items, size_t count,
+                      int64_t timeout_nanoseconds);
+long rose_event_notify(const volatile uint32_t *word);
+
 /* Replace the calling process image. Success does not return. */
 long rose_execve(const char *path, char *const arguments[],
                  char *const environment[]);

@@ -18,6 +18,25 @@ uint64_t read_time(void) {
         return value;
 }
 
+/* The DTB supplies a 32-bit timebase frequency, so the remainder product fits
+ * in 64 bits. The counter is monotonic and independent of wall time. */
+uint64_t timer_monotonic_nanoseconds(void) {
+        const uint64_t nanoseconds_per_second = UINT64_C(1000000000);
+        uint64_t frequency = platform_timebase_frequency();
+        uint64_t ticks = read_time();
+
+        if (frequency == 0U) {
+                return 0U;
+        }
+        uint64_t seconds = ticks / frequency;
+        uint64_t remainder = ticks % frequency;
+        if (seconds > UINT64_MAX / nanoseconds_per_second) {
+                return UINT64_MAX;
+        }
+        return seconds * nanoseconds_per_second +
+               (remainder * nanoseconds_per_second) / frequency;
+}
+
 /*
  * Program the next timer interrupt.
  * After one interrupt occurs we must set another deadline if we want

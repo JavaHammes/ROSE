@@ -2,6 +2,7 @@
 
 #include "panic.h"
 #include "plic.h"
+#include "scheduler.h"
 #include "timer.h"
 #include "trap.h"
 #include "uart.h"
@@ -75,6 +76,8 @@ static void handle_interrupt(struct trap_frame *frame, uint64_t code) {
         switch (code) {
         case SCAUSE_SUPERVISOR_TIMER:
                 timer_schedule_next();
+                (void)scheduler_wake_expired(
+                    timer_monotonic_nanoseconds());
                 user_process_handle_timer(frame);
                 return;
 

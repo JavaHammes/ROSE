@@ -61,16 +61,15 @@ static void monitor_render(struct rose_gui_context *gui,
 int rose_gui_monitor_main(int argc, char **argv) {
         struct rose_gui_context gui;
         if (argc != 2 || !rose_gui_connect(argv[1], &gui)) return 1;
-        uint32_t delay = 0U;
         while (gui.surface->close_requested == 0U) {
-                if (delay == 0U) {
-                        struct user_system_info information;
-                        if (rose_system_info(&information) == 0) {
-                                monitor_render(&gui, &information);
-                        }
+                struct user_system_info information;
+                if (rose_system_info(&information) == 0) {
+                        monitor_render(&gui, &information);
                 }
-                delay = (delay + 1U) % 32U;
-                rose_yield();
+                if (rose_gui_wait(&gui, INT64_C(500000000)) < 0) {
+                        rose_gui_disconnect(&gui);
+                        return 2;
+                }
         }
         rose_gui_disconnect(&gui);
         return 0;

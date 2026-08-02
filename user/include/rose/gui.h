@@ -60,6 +60,8 @@ void rose_gui_present(struct rose_gui_context *context, int32_t x, int32_t y,
                       int32_t width, int32_t height);
 bool rose_gui_poll_event(struct rose_gui_context *context,
                          struct user_input_event *event);
+long rose_gui_wait(struct rose_gui_context *context,
+                   int64_t timeout_nanoseconds);
 char rose_gui_key_character(struct rose_gui_context *context,
                             const struct user_input_event *event);
 void rose_gui_unsigned(char *buffer, size_t size, uint64_t value);

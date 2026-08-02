@@ -112,6 +112,7 @@ void rose_gui_disconnect(struct rose_gui_context *context) {
         }
         context->surface->client_closed = 1U;
         __sync_synchronize();
+        (void)rose_event_notify(&context->surface->client_closed);
         (void)rose_shared_memory_unmap(context->identifier);
         bytes_zero(context, sizeof(*context));
 }
@@ -190,6 +191,7 @@ void rose_gui_present(struct rose_gui_context *context, int32_t x, int32_t y,
         context->surface->damage_height = height;
         __sync_synchronize();
         context->surface->damage_sequence++;
+        (void)rose_event_notify(&context->surface->damage_sequence);
 }
 
 bool rose_gui_poll_event(struct rose_gui_context *context,
@@ -206,6 +208,30 @@ bool rose_gui_poll_event(struct rose_gui_context *context,
         context->surface->input_read =
             (read + 1U) % ROSE_GUI_EVENT_CAPACITY;
         return true;
+}
+
+long rose_gui_wait(struct rose_gui_context *context,
+                   int64_t timeout_nanoseconds) {
+        if (context == NULL || context->surface == NULL) {
+                return -USER_ERROR_INVALID_ARGUMENT;
+        }
+        struct user_wait_item items[3] = {
+            {.type = USER_WAIT_OBJECT_SHARED_WORD,
+             .events = USER_WAIT_EVENT_CHANGED,
+             .identifier =
+                 (int64_t)(uintptr_t)&context->surface->input_write,
+             .value = context->surface->input_write},
+            {.type = USER_WAIT_OBJECT_SHARED_WORD,
+             .events = USER_WAIT_EVENT_CHANGED,
+             .identifier =
+                 (int64_t)(uintptr_t)&context->surface->close_requested,
+             .value = context->surface->close_requested},
+            {.type = USER_WAIT_OBJECT_SHARED_WORD,
+             .events = USER_WAIT_EVENT_CHANGED,
+             .identifier = (int64_t)(uintptr_t)&context->surface->focused,
+             .value = context->surface->focused},
+        };
+        return rose_wait_events(items, 3U, timeout_nanoseconds);
 }
 
 char rose_gui_key_character(struct rose_gui_context *context,

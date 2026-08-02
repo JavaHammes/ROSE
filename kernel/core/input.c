@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "input.h"
+#include "scheduler.h"
 
 enum { INPUT_EVENT_QUEUE_SIZE = 128 };
 
@@ -26,7 +27,10 @@ void input_event_push(const struct user_input_event *event) {
         }
         events[write_index] = *event;
         write_index = next;
+        (void)scheduler_wake_all(SCHEDULER_WAIT_EVENT);
 }
+
+bool input_event_available(void) { return read_index != write_index; }
 
 bool input_event_pop(struct user_input_event *event) {
         if (event == NULL || read_index == write_index) {

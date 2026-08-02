@@ -197,6 +197,15 @@ bool uart_getc(char *character) {
         return true;
 }
 
+bool uart_read_ready(void) {
+        return uart_rx_read_index != uart_rx_write_index;
+}
+
+bool uart_write_ready(void) {
+        return !uart_tx_in_flight &&
+               (UART_REGISTERS[UART_LSR] & UART_LSR_THRE) != 0U;
+}
+
 /*
  * Transmit one character through the UART. (Polling)
  *

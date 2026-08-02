@@ -424,6 +424,56 @@ rose_munmap:
     ret
 .size rose_munmap, . - rose_munmap
 
+.section .text.rose_monotonic_time,"ax",@progbits
+.align 2
+.globl rose_monotonic_time
+.type rose_monotonic_time, @function
+rose_monotonic_time:
+    li a7, USER_SYSCALL_MONOTONIC_TIME
+    ecall
+    ret
+.size rose_monotonic_time, . - rose_monotonic_time
+
+.section .text.rose_sleep,"ax",@progbits
+.align 2
+.globl rose_sleep
+.type rose_sleep, @function
+rose_sleep:
+    li a7, USER_SYSCALL_SLEEP
+    ecall
+    ret
+.size rose_sleep, . - rose_sleep
+
+.section .text.rose_poll,"ax",@progbits
+.align 2
+.globl rose_poll
+.type rose_poll, @function
+rose_poll:
+    li a7, USER_SYSCALL_POLL
+    ecall
+    ret
+.size rose_poll, . - rose_poll
+
+.section .text.rose_wait_events,"ax",@progbits
+.align 2
+.globl rose_wait_events
+.type rose_wait_events, @function
+rose_wait_events:
+    li a7, USER_SYSCALL_WAIT_EVENTS
+    ecall
+    ret
+.size rose_wait_events, . - rose_wait_events
+
+.section .text.rose_event_notify,"ax",@progbits
+.align 2
+.globl rose_event_notify
+.type rose_event_notify, @function
+rose_event_notify:
+    li a7, USER_SYSCALL_EVENT_NOTIFY
+    ecall
+    ret
+.size rose_event_notify, . - rose_event_notify
+
 .section .text.rose_exit,"ax",@progbits
 .align 2
 .globl rose_exit

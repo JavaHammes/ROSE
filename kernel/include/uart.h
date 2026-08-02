@@ -14,6 +14,8 @@ void uart_put_uint64(uint64_t value);
 bool uart_tx_submit(char character);
 
 bool uart_getc(char *character);
+bool uart_read_ready(void);
+bool uart_write_ready(void);
 /* Feed a byte from any console input device into the shared terminal stream. */
 void uart_receive_character(char character);
 

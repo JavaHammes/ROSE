@@ -215,7 +215,27 @@ int rose_gui_terminal_main(int argc, char **argv) {
                 if (waited == shell_pid) {
                         break;
                 }
-                rose_yield();
+                struct user_wait_item waits[4] = {
+                    {.type = USER_WAIT_OBJECT_DESCRIPTOR,
+                     .events = USER_WAIT_EVENT_READABLE,
+                     .identifier = terminals[0]},
+                    {.type = USER_WAIT_OBJECT_CHILD,
+                     .events = USER_WAIT_EVENT_CHILD_EXITED,
+                     .identifier = shell_pid},
+                    {.type = USER_WAIT_OBJECT_SHARED_WORD,
+                     .events = USER_WAIT_EVENT_CHANGED,
+                     .identifier =
+                         (int64_t)(uintptr_t)&gui.surface->input_write,
+                     .value = gui.surface->input_write},
+                    {.type = USER_WAIT_OBJECT_SHARED_WORD,
+                     .events = USER_WAIT_EVENT_CHANGED,
+                     .identifier =
+                         (int64_t)(uintptr_t)&gui.surface->close_requested,
+                     .value = gui.surface->close_requested},
+                };
+                if (rose_wait_events(waits, 4U, -1) < 0) {
+                        break;
+                }
         }
 
         (void)rose_kill(shell_pid, USER_SIGNAL_TERMINATE);

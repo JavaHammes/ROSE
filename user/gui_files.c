@@ -130,7 +130,10 @@ int rose_gui_files_main(int argc, char **argv) {
                         }
                         pressed = now;
                 }
-                rose_yield();
+                if (rose_gui_wait(&gui, -1) < 0) {
+                        rose_gui_disconnect(&gui);
+                        return 2;
+                }
         }
         rose_gui_disconnect(&gui);
         return 0;

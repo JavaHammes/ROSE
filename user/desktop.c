@@ -416,6 +416,8 @@ static void focus_window(struct desktop *desktop, size_t index) {
         if (index >= desktop->window_count) return;
         for (size_t item = 0U; item < desktop->window_count; item++) {
                 desktop->windows[item].surface->focused = 0U;
+                (void)rose_event_notify(
+                    &desktop->windows[item].surface->focused);
         }
         if (index + 1U != desktop->window_count) {
                 struct desktop_window selected = desktop->windows[index];
@@ -433,6 +435,8 @@ static void focus_window(struct desktop *desktop, size_t index) {
                                    });
         }
         desktop->windows[desktop->window_count - 1U].surface->focused = 1U;
+        (void)rose_event_notify(
+            &desktop->windows[desktop->window_count - 1U].surface->focused);
         dirty_add(
             desktop,
             window_damage_rectangle(
@@ -460,6 +464,7 @@ static void send_event(struct desktop_window *window,
         window->surface->input_events[write] = event;
         __sync_synchronize();
         window->surface->input_write = next;
+        (void)rose_event_notify(&window->surface->input_write);
 }
 
 static void process_pointer(struct desktop *desktop,
@@ -493,6 +498,8 @@ static void process_pointer(struct desktop *desktop,
                                 if (event->x >= window->x + 7 &&
                                     event->x < window->x + 27) {
                                         window->surface->close_requested = 1U;
+                                        (void)rose_event_notify(
+                                            &window->surface->close_requested);
                                 } else {
                                         desktop->dragging = true;
                                         desktop->drag_offset_x =
@@ -591,6 +598,9 @@ static void remove_window(struct desktop *desktop, size_t index) {
         if (desktop->window_count != 0U) {
                 desktop->windows[desktop->window_count - 1U].surface->focused =
                     1U;
+                (void)rose_event_notify(
+                    &desktop->windows[desktop->window_count - 1U]
+                         .surface->focused);
         }
         dirty_add(desktop, old);
 }
@@ -612,11 +622,21 @@ static void reap_windows(struct desktop *desktop) {
 static void close_windows(struct desktop *desktop) {
         for (size_t index = 0U; index < desktop->window_count; index++) {
                 desktop->windows[index].surface->close_requested = 1U;
+                (void)rose_event_notify(
+                    &desktop->windows[index].surface->close_requested);
         }
-        for (size_t turns = 0U; desktop->window_count != 0U && turns < 4096U;
+        for (size_t turns = 0U; desktop->window_count != 0U && turns < 100U;
              turns++) {
                 reap_windows(desktop);
-                rose_yield();
+                if (desktop->window_count != 0U) {
+                        struct user_wait_item child = {
+                            .type = USER_WAIT_OBJECT_CHILD,
+                            .events = USER_WAIT_EVENT_CHILD_EXITED,
+                            .identifier = -1,
+                        };
+                        (void)rose_wait_events(&child, 1U,
+                                               INT64_C(10000000));
+                }
         }
         while (desktop->window_count != 0U) {
                 (void)rose_kill(desktop->windows[0].pid,
@@ -625,6 +645,34 @@ static void close_windows(struct desktop *desktop) {
                 (void)rose_waitpid(desktop->windows[0].pid, &status, 0U);
                 remove_window(desktop, 0U);
         }
+}
+
+static long desktop_wait_for_activity(struct desktop *desktop) {
+        struct user_wait_item items[WINDOW_LIMIT + 2U];
+        size_t count = 0U;
+
+        items[count++] = (struct user_wait_item){
+            .type = USER_WAIT_OBJECT_INPUT,
+            .events = USER_WAIT_EVENT_READABLE,
+        };
+        if (desktop->window_count != 0U) {
+                items[count++] = (struct user_wait_item){
+                    .type = USER_WAIT_OBJECT_CHILD,
+                    .events = USER_WAIT_EVENT_CHILD_EXITED,
+                    .identifier = -1,
+                };
+        }
+        for (size_t index = 0U; index < desktop->window_count; index++) {
+                struct desktop_window *window = &desktop->windows[index];
+                items[count++] = (struct user_wait_item){
+                    .type = USER_WAIT_OBJECT_SHARED_WORD,
+                    .events = USER_WAIT_EVENT_CHANGED,
+                    .identifier = (int64_t)(uintptr_t)&window->surface
+                                      ->damage_sequence,
+                    .value = window->last_damage_sequence,
+                };
+        }
+        return rose_wait_events(items, count, -1);
 }
 
 int rose_desktop_main(int argc, char **argv) {
@@ -691,7 +739,11 @@ int rose_desktop_main(int argc, char **argv) {
                         close_windows(&desktop);
                         return 5;
                 }
-                rose_yield();
+                if (!desktop.exiting && desktop_wait_for_activity(&desktop) <
+                                            0) {
+                        close_windows(&desktop);
+                        return 6;
+                }
         }
         close_windows(&desktop);
         return 0;
