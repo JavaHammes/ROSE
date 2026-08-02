@@ -128,6 +128,9 @@ static void terminal_render(struct rose_gui_context *gui,
 }
 
 static _Noreturn void terminal_child(int master, int slave) {
+        if (rose_setsid() < 0 || rose_tcsetctty(slave) < 0) {
+                rose_exit(126U);
+        }
         (void)rose_dup2(slave, USER_STDIN_FILENO);
         (void)rose_dup2(slave, USER_STDOUT_FILENO);
         (void)rose_dup2(slave, USER_STDERR_FILENO);
@@ -149,6 +152,27 @@ int rose_gui_terminal_main(int argc, char **argv) {
         }
         int terminals[2];
         if (rose_openpty(terminals) != 0) {
+                rose_gui_disconnect(&gui);
+                return 2;
+        }
+        struct user_terminal_attributes attributes;
+        struct user_terminal_window_size window_size = {
+            .rows = TERMINAL_ROWS,
+            .columns = TERMINAL_COLUMNS,
+            .pixel_width = (uint16_t)gui.width,
+            .pixel_height = (uint16_t)gui.height,
+        };
+        if (rose_tcgetattr(terminals[1], &attributes) != 0) {
+                (void)rose_close(terminals[0]);
+                (void)rose_close(terminals[1]);
+                rose_gui_disconnect(&gui);
+                return 2;
+        }
+        attributes.flags = USER_TERMINAL_SIGNALS;
+        if (rose_tcsetattr(terminals[1], &attributes) != 0 ||
+            rose_tcsetwinsize(terminals[0], &window_size) != 0) {
+                (void)rose_close(terminals[0]);
+                (void)rose_close(terminals[1]);
                 rose_gui_disconnect(&gui);
                 return 2;
         }

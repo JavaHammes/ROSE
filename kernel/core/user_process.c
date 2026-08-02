@@ -36,18 +36,19 @@ enum {
         USER_WRITE_TRANSMIT_MAX = USER_IO_MAX * 2,
         USER_PATH_MAX = 64,
         PROCESS_EXECUTABLE_MAX = 64 * 1024,
-        PROCESS_DESCRIPTOR_LIMIT = 8,
+        PROCESS_DESCRIPTOR_LIMIT = 16,
         PROCESS_FIRST_OPEN_DESCRIPTOR = 3,
-        PROCESS_LIMIT = 16,
+        PROCESS_LIMIT = 48,
         PROCESS_OPEN_FILE_LIMIT = PROCESS_LIMIT * PROCESS_DESCRIPTOR_LIMIT,
-        PIPE_LIMIT = 8,
+        PIPE_LIMIT = 32,
         PIPE_BUFFER_SIZE = USER_IO_MAX,
+        PSEUDO_TERMINAL_LIMIT = PIPE_LIMIT / 2,
         PROCESS_ARGUMENT_LIMIT = 16,
         PROCESS_ENVIRONMENT_LIMIT = 16,
-        SHARED_MEMORY_OBJECT_LIMIT = 12,
-        SHARED_MEMORY_PROCESS_LIMIT = 4,
+        SHARED_MEMORY_OBJECT_LIMIT = 32,
+        SHARED_MEMORY_PROCESS_LIMIT = 16,
         SHARED_MEMORY_PAGE_LIMIT = 256,
-        PROCESS_ANONYMOUS_MAPPING_LIMIT = 16,
+        PROCESS_ANONYMOUS_MAPPING_LIMIT = 32,
         USER_WAIT_ITEM_LIMIT = PROCESS_LIMIT + 4,
 };
 
@@ -93,7 +94,7 @@ _Static_assert((uint32_t)USER_OPEN_READ == (uint32_t)VFS_OPEN_READ &&
  *   0x007ff000                 unmapped stack guard
  *   0x00800000                 one-page user stack
  *   0x01000000 ..              owned graphical framebuffer
- *   0x02000000 .. 0x023fffff   four shared-memory mapping slots
+ *   0x02000000 .. 0x02ffffff   sixteen shared-memory mapping slots
  *   0x04000000 .. 0x0fffffff   private anonymous mappings
  *
  * The stack pointer begins just above the mapped stack page and grows down.
@@ -124,7 +125,8 @@ struct process_open_file {
         uint64_t offset;
         struct process_pipe *read_pipe;
         struct process_pipe *write_pipe;
-        bool pseudo_terminal;
+        struct process_terminal *terminal;
+        uint8_t terminal_endpoint;
         struct vfs_file file;
 };
 
@@ -136,6 +138,30 @@ struct process_pipe {
         size_t write_offset;
         size_t count;
         uint8_t buffer[PIPE_BUFFER_SIZE];
+};
+
+enum process_terminal_endpoint {
+        PROCESS_TERMINAL_NONE,
+        PROCESS_TERMINAL_MASTER,
+        PROCESS_TERMINAL_SLAVE,
+};
+
+/* One shared line discipline belongs to both ends of a PTY. The physical
+ * console uses the same foreground/session metadata but retains its existing
+ * UART byte queue. */
+struct process_terminal {
+        bool used;
+        bool console;
+        size_t open_references;
+        struct process_pipe *input_pipe;
+        struct process_pipe *output_pipe;
+        struct user_terminal_attributes attributes;
+        struct user_terminal_window_size window_size;
+        size_t canonical_ready;
+        size_t canonical_pending;
+        bool canonical_eof;
+        uint64_t foreground_process_group;
+        uint64_t controlling_session;
 };
 
 struct process_descriptor {
@@ -175,6 +201,8 @@ struct process {
         uint64_t pid;
         uint64_t parent_pid;
         uint64_t process_group;
+        uint64_t session_id;
+        struct process_terminal *controlling_terminal;
         enum process_state state;
         struct trap_frame context;
         /* Resources below remain owned until process_release_resources. */
@@ -242,6 +270,8 @@ struct process_replacement {
 /* Fixed slots keep early process management independent of a kernel heap. */
 static struct process process_table[PROCESS_LIMIT];
 static struct process_pipe pipe_table[PIPE_LIMIT];
+static struct process_terminal pseudo_terminal_table[PSEUDO_TERMINAL_LIMIT];
+static struct process_terminal console_terminal;
 static struct process_open_file open_file_table[PROCESS_OPEN_FILE_LIMIT];
 static struct shared_memory_object
     shared_memory_objects[SHARED_MEMORY_OBJECT_LIMIT];
@@ -250,7 +280,6 @@ static struct process *uart_write_owner;
 static uint64_t next_pid = 1U;
 static uint64_t graphics_owner_pid;
 static uint32_t next_shared_memory_identifier = 1U;
-static uint64_t terminal_foreground_process_group;
 static uint64_t scheduler_preemptions;
 static uint64_t scheduler_context_switches;
 static uint64_t scheduler_blocks;
@@ -327,6 +356,56 @@ static void graphics_release_if_owned(uint64_t pid) {
         graphics_console_init();
 }
 
+static void process_terminal_set_defaults(struct process_terminal *terminal,
+                                          bool console) {
+        bytes_zero(terminal, sizeof(*terminal));
+        terminal->used = true;
+        terminal->console = console;
+        /* Preserve the serial console's established userspace line editor.
+         * PTYs start with the conventional cooked discipline. */
+        terminal->attributes.flags = console
+                                         ? USER_TERMINAL_SIGNALS
+                                         : USER_TERMINAL_CANONICAL |
+                                               USER_TERMINAL_ECHO |
+                                               USER_TERMINAL_SIGNALS;
+        terminal->attributes.interrupt_character = UINT8_C(0x03);
+        terminal->attributes.quit_character = UINT8_C(0x1c);
+        terminal->attributes.erase_character = UINT8_C(0x7f);
+        terminal->attributes.end_of_file_character = UINT8_C(0x04);
+        terminal->attributes.suspend_character = UINT8_C(0x1a);
+        terminal->window_size.rows = console ? 25U : 24U;
+        terminal->window_size.columns = 80U;
+}
+
+static struct process_terminal *process_console_terminal(void) {
+        if (!console_terminal.used) {
+                process_terminal_set_defaults(&console_terminal, true);
+        }
+        return &console_terminal;
+}
+
+static struct process_terminal *process_terminal_allocate(void) {
+        for (size_t index = 0U; index < PSEUDO_TERMINAL_LIMIT; index++) {
+                if (!pseudo_terminal_table[index].used) {
+                        process_terminal_set_defaults(
+                            &pseudo_terminal_table[index], false);
+                        return &pseudo_terminal_table[index];
+                }
+        }
+        return NULL;
+}
+
+static void process_terminal_maybe_destroy(
+    struct process_terminal *terminal) {
+        if (terminal == NULL || terminal->console || !terminal->used) {
+                return;
+        }
+        if (terminal->open_references == 0U &&
+            terminal->controlling_session == 0U) {
+                bytes_zero(terminal, sizeof(*terminal));
+        }
+}
+
 static struct process_pipe *process_pipe_allocate(void) {
         for (size_t index = 0U; index < PIPE_LIMIT; index++) {
                 if (!pipe_table[index].used) {
@@ -377,6 +456,17 @@ static void process_pipe_release(struct process_pipe *pipe, uint8_t access) {
         if (pipe->readers == 0U && pipe->writers == 0U) {
                 bytes_zero(pipe, sizeof(*pipe));
         }
+}
+
+static void process_terminal_open_release(struct process_terminal *terminal) {
+        if (terminal == NULL || terminal->console) {
+                return;
+        }
+        if (!terminal->used || terminal->open_references == 0U) {
+                panic("Invalid terminal endpoint release");
+        }
+        terminal->open_references--;
+        process_terminal_maybe_destroy(terminal);
 }
 
 /* trap_frame contains only integer-sized fields, so an explicit word copy is
@@ -442,6 +532,7 @@ static void process_descriptor_close(struct process_descriptor *descriptor) {
                         process_pipe_release(open_file->write_pipe,
                                              DESCRIPTOR_WRITE);
                 }
+                process_terminal_open_release(open_file->terminal);
                 bytes_zero(open_file, sizeof(*open_file));
         }
 }
@@ -468,6 +559,8 @@ static bool process_descriptors_initialize(struct process *process) {
                                         ? DESCRIPTOR_READ
                                         : DESCRIPTOR_WRITE;
                 open_file->file = console;
+                open_file->terminal = process_console_terminal();
+                open_file->terminal_endpoint = PROCESS_TERMINAL_SLAVE;
                 process_descriptor_install(&process->descriptors[descriptor],
                                            open_file);
         }
@@ -1071,6 +1164,13 @@ static uint64_t process_create(struct process *process, const char *path,
         process->process_group = descriptor_source == NULL
                                      ? process->pid
                                      : descriptor_source->process_group;
+        process->session_id = descriptor_source == NULL
+                                  ? process->pid
+                                  : descriptor_source->session_id;
+        process->controlling_terminal =
+            descriptor_source == NULL
+                ? process_console_terminal()
+                : descriptor_source->controlling_terminal;
         process->state = PROCESS_READY;
         /* SPIE causes sret to enable supervisor interrupts while U-mode runs.
          */
@@ -1083,14 +1183,21 @@ static uint64_t process_create(struct process *process, const char *path,
                 ? process_descriptors_initialize(process)
                 : process_descriptors_clone(process, descriptor_source);
         if (!descriptors_ready) {
-                panic("Initial process descriptors are unavailable");
+                process_release_resources(process);
+                bytes_zero(process, sizeof(*process));
+                return (uint64_t)-(
+                    int64_t)USER_ERROR_FILE_TABLE_OVERFLOW;
         }
         next_pid++;
         if (next_pid == 0U) {
                 next_pid = 1U;
         }
-        if (terminal_foreground_process_group == 0U) {
-                terminal_foreground_process_group = process->process_group;
+        if (process->controlling_terminal != NULL &&
+            process->controlling_terminal->controlling_session == 0U) {
+                process->controlling_terminal->controlling_session =
+                    process->session_id;
+                process->controlling_terminal->foreground_process_group =
+                    process->process_group;
         }
 
         process->address_space = virtual_memory_create_address_space();
@@ -1436,6 +1543,8 @@ static uint64_t syscall_fork(const struct trap_frame *frame) {
         bytes_zero(child, sizeof(*child));
         child->parent_pid = parent->pid;
         child->process_group = parent->process_group;
+        child->session_id = parent->session_id;
+        child->controlling_terminal = parent->controlling_terminal;
         child->exit_status = UINT64_MAX;
         child->heap_start = parent->heap_start;
         child->heap_break = parent->heap_start;
@@ -1617,35 +1726,25 @@ static struct process *process_find_pid(uint64_t pid) {
         return NULL;
 }
 
-static bool process_group_exists(uint64_t process_group) {
-        if (process_group == 0U) {
-                return false;
-        }
-
-        for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
-                const struct process *process = &process_table[index];
-
-                /* A zombie retains its PID and process-group identity until
-                 * waitpid reaps it; later pipeline members may still join. */
-                if (process->state != PROCESS_UNUSED &&
-                    process->process_group == process_group) {
-                        return true;
-                }
-        }
-
-        return false;
-}
-
 static bool process_signal_stops_by_default(uint32_t signal) {
         return signal == USER_SIGNAL_STOP ||
                signal == USER_SIGNAL_TERMINAL_STOP ||
                signal == USER_SIGNAL_BACKGROUND_READ;
 }
 
+static bool process_signal_ignored_by_default(uint32_t signal) {
+        return signal == USER_SIGNAL_WINDOW_CHANGED;
+}
+
 /* Queueing SIGCONT changes scheduler state immediately; its disposition is
  * still delivered later. SIGKILL likewise makes a stopped process runnable so
  * the normal trusted return boundary can terminate it. */
 static void process_queue_signal(struct process *target, uint32_t signal) {
+        if (process_signal_ignored_by_default(signal) &&
+            target->signal_dispositions[signal].handler <=
+                USER_SIGNAL_IGNORE) {
+                return;
+        }
         if (signal == USER_SIGNAL_CONTINUE) {
                 target->pending_signals &=
                     ~(signal_bit(USER_SIGNAL_STOP) |
@@ -1794,78 +1893,421 @@ static uint64_t syscall_set_process_group(int64_t pid, int64_t process_group) {
             target->parent_pid != active_process->pid) {
                 return (uint64_t)-(int64_t)USER_ERROR_PERMISSION;
         }
+        if (target->session_id != active_process->session_id ||
+            target->pid == target->session_id) {
+                return (uint64_t)-(int64_t)USER_ERROR_PERMISSION;
+        }
 
         uint64_t requested_group =
             process_group == 0 ? target->pid : (uint64_t)process_group;
-        if (requested_group != target->pid &&
-            !process_group_exists(requested_group)) {
-                return (uint64_t)-(int64_t)USER_ERROR_PERMISSION;
+        if (requested_group != target->pid) {
+                bool matching_session = false;
+                for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
+                        const struct process *member = &process_table[index];
+                        if (member->state != PROCESS_UNUSED &&
+                            member->process_group == requested_group &&
+                            member->session_id == target->session_id) {
+                                matching_session = true;
+                                break;
+                        }
+                }
+                if (!matching_session) {
+                        return (uint64_t)-(int64_t)USER_ERROR_PERMISSION;
+                }
         }
 
         target->process_group = requested_group;
         return 0U;
 }
 
-static bool process_descriptor_is_console(uint64_t descriptor) {
+static struct process_terminal *process_descriptor_terminal(
+    uint64_t descriptor, uint8_t *endpoint) {
         if (descriptor >= PROCESS_DESCRIPTOR_LIMIT) {
-                return false;
+                return NULL;
         }
 
         const struct process_open_file *open_file =
             active_process->descriptors[(size_t)descriptor].open_file;
-        return open_file != NULL &&
-               (open_file->pseudo_terminal ||
-                (open_file->file.type == VFS_NODE_CHARACTER_DEVICE &&
-                 open_file->file.device == VFS_DEVICE_CONSOLE));
+        if (open_file == NULL || open_file->terminal == NULL) {
+                return NULL;
+        }
+        if (endpoint != NULL) {
+                *endpoint = open_file->terminal_endpoint;
+        }
+        return open_file->terminal;
+}
+
+static bool process_group_belongs_to_session(uint64_t process_group,
+                                             uint64_t session_id) {
+        for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
+                const struct process *process = &process_table[index];
+                if (process->state != PROCESS_UNUSED &&
+                    process->process_group == process_group &&
+                    process->session_id == session_id) {
+                        return true;
+                }
+        }
+        return false;
 }
 
 static uint64_t syscall_terminal_set_foreground_group(uint64_t descriptor,
                                                       int64_t process_group) {
-        if (!process_descriptor_is_console(descriptor)) {
+        struct process_terminal *terminal =
+            process_descriptor_terminal(descriptor, NULL);
+        if (terminal == NULL) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
         }
-        if (process_group <= 0 ||
-            !process_group_exists((uint64_t)process_group)) {
+        if (active_process->controlling_terminal != terminal ||
+            terminal->controlling_session != active_process->session_id) {
+                return (uint64_t)-(int64_t)USER_ERROR_PERMISSION;
+        }
+        if (process_group <= 0 || !process_group_belongs_to_session(
+                                      (uint64_t)process_group,
+                                      active_process->session_id)) {
                 return (uint64_t)-(int64_t)USER_ERROR_NO_PROCESS;
         }
-        terminal_foreground_process_group = (uint64_t)process_group;
+        terminal->foreground_process_group = (uint64_t)process_group;
         return 0U;
 }
 
 static uint64_t syscall_terminal_get_foreground_group(uint64_t descriptor) {
-        if (!process_descriptor_is_console(descriptor)) {
+        struct process_terminal *terminal =
+            process_descriptor_terminal(descriptor, NULL);
+        if (terminal == NULL) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
         }
 
-        return terminal_foreground_process_group;
+        return terminal->foreground_process_group;
 }
 
-bool user_process_handle_console_control(char character) {
-        uint32_t signal;
-
-        if (character == '\x03') {
-                signal = USER_SIGNAL_INTERRUPT;
-        } else if (character == '\x1a') {
-                signal = USER_SIGNAL_TERMINAL_STOP;
-        } else {
+static bool process_terminal_signal_foreground(
+    const struct process_terminal *terminal, uint32_t signal) {
+        bool matched = false;
+        if (terminal == NULL || terminal->foreground_process_group == 0U) {
                 return false;
         }
-
-        bool matched = false;
         for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
                 struct process *target = &process_table[index];
-
                 if (target->state == PROCESS_UNUSED ||
                     target->state == PROCESS_EXITED ||
                     target->process_group !=
-                        terminal_foreground_process_group) {
+                        terminal->foreground_process_group ||
+                    target->session_id != terminal->controlling_session) {
                         continue;
                 }
                 process_queue_signal(target, signal);
                 matched = true;
         }
-
         return matched;
+}
+
+static uint32_t process_terminal_control_signal(
+    const struct process_terminal *terminal, uint8_t character) {
+        if ((terminal->attributes.flags & USER_TERMINAL_SIGNALS) == 0U) {
+                return 0U;
+        }
+        if (terminal->attributes.interrupt_character != 0U &&
+            character == terminal->attributes.interrupt_character) {
+                return USER_SIGNAL_INTERRUPT;
+        }
+        if (terminal->attributes.quit_character != 0U &&
+            character == terminal->attributes.quit_character) {
+                return USER_SIGNAL_QUIT;
+        }
+        if (terminal->attributes.suspend_character != 0U &&
+            character == terminal->attributes.suspend_character) {
+                return USER_SIGNAL_TERMINAL_STOP;
+        }
+        return 0U;
+}
+
+static void process_pipe_push_byte(struct process_pipe *pipe, uint8_t byte) {
+        if (pipe == NULL || !pipe->used || pipe->count == PIPE_BUFFER_SIZE) {
+                panic("Terminal pipe overflow");
+        }
+        pipe->buffer[pipe->write_offset] = byte;
+        pipe->write_offset = (pipe->write_offset + 1U) % PIPE_BUFFER_SIZE;
+        pipe->count++;
+}
+
+static void process_pipe_discard_last(struct process_pipe *pipe) {
+        if (pipe == NULL || !pipe->used || pipe->count == 0U) {
+                panic("Terminal pipe underflow");
+        }
+        pipe->write_offset =
+            (pipe->write_offset + PIPE_BUFFER_SIZE - 1U) % PIPE_BUFFER_SIZE;
+        pipe->count--;
+}
+
+/* Process one byte written to a PTY master. False means that accepting this
+ * byte would overrun the input or echo ring and the write must wait. */
+static bool process_terminal_master_write_character(
+    struct process_terminal *terminal, uint8_t character) {
+        struct process_pipe *input = terminal->input_pipe;
+        struct process_pipe *output = terminal->output_pipe;
+        bool canonical = (terminal->attributes.flags &
+                          USER_TERMINAL_CANONICAL) != 0U;
+        bool echo = (terminal->attributes.flags & USER_TERMINAL_ECHO) != 0U;
+        uint32_t signal = process_terminal_control_signal(terminal, character);
+        bool erase = canonical && terminal->attributes.erase_character != 0U &&
+                     character == terminal->attributes.erase_character;
+        bool eof = canonical &&
+                   terminal->attributes.end_of_file_character != 0U &&
+                   character == terminal->attributes.end_of_file_character;
+        bool newline = canonical && (character == '\r' || character == '\n');
+        size_t echo_length = 0U;
+
+        if (echo && signal == 0U && !eof) {
+                echo_length = erase ? (terminal->canonical_pending != 0U ? 3U
+                                                                         : 0U)
+                                    : (newline ? 2U : 1U);
+        }
+        if (echo_length > PIPE_BUFFER_SIZE - output->count) {
+                return false;
+        }
+        if (signal == 0U && !erase && !eof &&
+            input->count == PIPE_BUFFER_SIZE) {
+                return false;
+        }
+
+        if (signal != 0U) {
+                (void)process_terminal_signal_foreground(terminal, signal);
+        } else if (erase) {
+                if (terminal->canonical_pending != 0U) {
+                        process_pipe_discard_last(input);
+                        terminal->canonical_pending--;
+                }
+        } else if (eof) {
+                if (terminal->canonical_pending != 0U) {
+                        terminal->canonical_ready +=
+                            terminal->canonical_pending;
+                        terminal->canonical_pending = 0U;
+                } else {
+                        terminal->canonical_eof = true;
+                }
+        } else {
+                uint8_t stored = newline ? (uint8_t)'\n' : character;
+                process_pipe_push_byte(input, stored);
+                if (canonical) {
+                        terminal->canonical_pending++;
+                        if (newline) {
+                                terminal->canonical_ready +=
+                                    terminal->canonical_pending;
+                                terminal->canonical_pending = 0U;
+                        }
+                }
+        }
+
+        if (echo_length == 3U) {
+                process_pipe_push_byte(output, (uint8_t)'\b');
+                process_pipe_push_byte(output, (uint8_t)' ');
+                process_pipe_push_byte(output, (uint8_t)'\b');
+        } else if (echo_length == 2U) {
+                process_pipe_push_byte(output, (uint8_t)'\r');
+                process_pipe_push_byte(output, (uint8_t)'\n');
+        } else if (echo_length == 1U) {
+                process_pipe_push_byte(output, character);
+        }
+        if (signal == 0U) {
+                (void)scheduler_wake_all(SCHEDULER_WAIT_PIPE_READ);
+        }
+        return true;
+}
+
+bool user_process_handle_console_control(char character) {
+        struct process_terminal *terminal = process_console_terminal();
+        uint32_t signal =
+            process_terminal_control_signal(terminal, (uint8_t)character);
+
+        if (signal == 0U) {
+                return false;
+        }
+        (void)process_terminal_signal_foreground(terminal, signal);
+        /* Signal-generating control bytes are consumed even when the current
+         * foreground group has already exited. */
+        return true;
+}
+
+static uint64_t syscall_terminal_get_attributes(uint64_t descriptor,
+                                                uintptr_t user_attributes) {
+        struct process_terminal *terminal =
+            process_descriptor_terminal(descriptor, NULL);
+        if (terminal == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        if (!user_range_is_valid(user_attributes,
+                                 sizeof(struct user_terminal_attributes),
+                                 VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        user_copy_to(user_attributes, (const uint8_t *)&terminal->attributes,
+                     sizeof(terminal->attributes));
+        return 0U;
+}
+
+static uint64_t syscall_terminal_set_attributes(uint64_t descriptor,
+                                                uintptr_t user_attributes) {
+        struct process_terminal *terminal =
+            process_descriptor_terminal(descriptor, NULL);
+        if (terminal == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        if (!user_range_is_valid(user_attributes,
+                                 sizeof(struct user_terminal_attributes),
+                                 VM_PAGE_READ)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        struct user_terminal_attributes attributes;
+        user_copy_from((uint8_t *)&attributes, user_attributes,
+                       sizeof(attributes));
+        if ((attributes.flags & ~(uint32_t)(USER_TERMINAL_CANONICAL |
+                                            USER_TERMINAL_ECHO |
+                                            USER_TERMINAL_SIGNALS)) != 0U) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+        for (size_t index = 0U; index < sizeof(attributes.reserved); index++) {
+                if (attributes.reserved[index] != 0U) {
+                        return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+                }
+        }
+
+        bool was_canonical = (terminal->attributes.flags &
+                              USER_TERMINAL_CANONICAL) != 0U;
+        bool canonical =
+            (attributes.flags & USER_TERMINAL_CANONICAL) != 0U;
+        terminal->attributes = attributes;
+        if (was_canonical != canonical && terminal->input_pipe != NULL) {
+                /* Never strand bytes across a mode transition. Existing input
+                 * is immediately readable; only subsequent bytes begin a new
+                 * canonical record. */
+                terminal->canonical_ready = terminal->input_pipe->count;
+                terminal->canonical_pending = 0U;
+                terminal->canonical_eof = false;
+                (void)scheduler_wake_all(SCHEDULER_WAIT_PIPE_READ);
+        }
+        return 0U;
+}
+
+static uint64_t syscall_terminal_get_window_size(uint64_t descriptor,
+                                                 uintptr_t user_window_size) {
+        struct process_terminal *terminal =
+            process_descriptor_terminal(descriptor, NULL);
+        if (terminal == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        if (!user_range_is_valid(user_window_size,
+                                 sizeof(struct user_terminal_window_size),
+                                 VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        user_copy_to(user_window_size,
+                     (const uint8_t *)&terminal->window_size,
+                     sizeof(terminal->window_size));
+        return 0U;
+}
+
+static bool process_terminal_window_sizes_equal(
+    const struct user_terminal_window_size *left,
+    const struct user_terminal_window_size *right) {
+        return left->rows == right->rows &&
+               left->columns == right->columns &&
+               left->pixel_width == right->pixel_width &&
+               left->pixel_height == right->pixel_height;
+}
+
+static uint64_t syscall_terminal_set_window_size(uint64_t descriptor,
+                                                 uintptr_t user_window_size) {
+        struct process_terminal *terminal =
+            process_descriptor_terminal(descriptor, NULL);
+        if (terminal == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        if (!user_range_is_valid(user_window_size,
+                                 sizeof(struct user_terminal_window_size),
+                                 VM_PAGE_READ)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        struct user_terminal_window_size window_size;
+        user_copy_from((uint8_t *)&window_size, user_window_size,
+                       sizeof(window_size));
+        if (window_size.rows == 0U || window_size.columns == 0U) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+        if (!process_terminal_window_sizes_equal(&terminal->window_size,
+                                                 &window_size)) {
+                terminal->window_size = window_size;
+                (void)process_terminal_signal_foreground(
+                    terminal, USER_SIGNAL_WINDOW_CHANGED);
+        }
+        return 0U;
+}
+
+static bool process_session_has_live_member(uint64_t session_id) {
+        for (size_t index = 0U; index < PROCESS_LIMIT; index++) {
+                const struct process *process = &process_table[index];
+                if (process->state != PROCESS_UNUSED &&
+                    process->state != PROCESS_EXITED &&
+                    process->session_id == session_id) {
+                        return true;
+                }
+        }
+        return false;
+}
+
+static void process_terminal_release_empty_session(
+    struct process_terminal *terminal, uint64_t session_id) {
+        if (terminal != NULL && terminal->controlling_session == session_id &&
+            !process_session_has_live_member(session_id)) {
+                terminal->controlling_session = 0U;
+                terminal->foreground_process_group = 0U;
+                process_terminal_maybe_destroy(terminal);
+        }
+}
+
+static uint64_t syscall_create_session(void) {
+        if (active_process->process_group == active_process->pid) {
+                return (uint64_t)-(int64_t)USER_ERROR_PERMISSION;
+        }
+        uint64_t old_session = active_process->session_id;
+        struct process_terminal *old_terminal =
+            active_process->controlling_terminal;
+        active_process->session_id = active_process->pid;
+        active_process->process_group = active_process->pid;
+        active_process->controlling_terminal = NULL;
+        process_terminal_release_empty_session(old_terminal, old_session);
+        return active_process->session_id;
+}
+
+static uint64_t syscall_get_session(int64_t pid) {
+        if (pid < 0) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+        struct process *target =
+            pid == 0 ? active_process : process_find_pid((uint64_t)pid);
+        return target == NULL
+                   ? (uint64_t)-(int64_t)USER_ERROR_NO_PROCESS
+                   : target->session_id;
+}
+
+static uint64_t syscall_terminal_set_controlling(uint64_t descriptor) {
+        uint8_t endpoint;
+        struct process_terminal *terminal =
+            process_descriptor_terminal(descriptor, &endpoint);
+        if (terminal == NULL || endpoint != PROCESS_TERMINAL_SLAVE) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        if (active_process->session_id != active_process->pid ||
+            active_process->controlling_terminal != NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_PERMISSION;
+        }
+        if (terminal->controlling_session != 0U &&
+            terminal->controlling_session != active_process->session_id) {
+                return (uint64_t)-(int64_t)USER_ERROR_PERMISSION;
+        }
+        terminal->controlling_session = active_process->session_id;
+        terminal->foreground_process_group = active_process->process_group;
+        active_process->controlling_terminal = terminal;
+        return 0U;
 }
 
 /* The interrupted frame never enters userspace, so sigreturn cannot forge
@@ -2558,7 +3000,8 @@ static uint64_t syscall_open(uintptr_t user_path, uint32_t flags) {
 
         struct process_open_file *open_file = process_open_file_allocate();
         if (open_file == NULL) {
-                panic("Descriptor exists without open-file capacity");
+                return (uint64_t)-(
+                    int64_t)USER_ERROR_FILE_TABLE_OVERFLOW;
         }
         open_file->access = access;
         open_file->append = (flags & VFS_OPEN_APPEND) != 0U;
@@ -2599,6 +3042,15 @@ static uint64_t syscall_read_begin(uint64_t descriptor, uintptr_t user_buffer,
                 return 0U;
         }
 
+        if (open_file->terminal != NULL &&
+            open_file->terminal_endpoint == PROCESS_TERMINAL_SLAVE &&
+            active_process->controlling_terminal == open_file->terminal &&
+            open_file->terminal->foreground_process_group != 0U &&
+            active_process->process_group !=
+                open_file->terminal->foreground_process_group) {
+                (void)syscall_kill(0, USER_SIGNAL_BACKGROUND_READ);
+        }
+
         if (open_file->read_pipe != NULL) {
                 active_process->pending_read = true;
                 active_process->read_descriptor = (size_t)descriptor;
@@ -2629,11 +3081,6 @@ static uint64_t syscall_read_begin(uint64_t descriptor, uintptr_t user_buffer,
         active_process->read_descriptor = (size_t)descriptor;
         active_process->read_buffer = user_buffer;
         active_process->read_length = length;
-        if (open_file->file.device == VFS_DEVICE_CONSOLE &&
-            active_process->process_group !=
-                terminal_foreground_process_group) {
-                (void)syscall_kill(0, USER_SIGNAL_BACKGROUND_READ);
-        }
         return 0U;
 }
 
@@ -3432,7 +3879,7 @@ static uint32_t shared_memory_allocate_identifier(void) {
                         return candidate;
                 }
         }
-        panic("Unable to allocate shared-memory identifier");
+        return 0U;
 }
 
 static size_t process_shared_memory_free_slot(void) {
@@ -3520,6 +3967,10 @@ static uint64_t syscall_shared_memory_create(size_t size,
         bytes_zero(object, sizeof(*object));
         object->used = true;
         object->identifier = shared_memory_allocate_identifier();
+        if (object->identifier == 0U) {
+                bytes_zero(object, sizeof(*object));
+                return (uint64_t)-(int64_t)USER_ERROR_NO_SPACE;
+        }
         object->size = size;
         size_t page_count = (size + PAGE_SIZE - 1U) / PAGE_SIZE;
         while (object->page_count < page_count) {
@@ -3615,6 +4066,11 @@ static uint64_t syscall_open_pseudo_terminal(uintptr_t user_descriptors) {
                 return (uint64_t)-(int64_t)USER_ERROR_FILE_TABLE_OVERFLOW;
         }
 
+        struct process_terminal *terminal = process_terminal_allocate();
+        if (terminal == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_FILE_TABLE_OVERFLOW;
+        }
+
         struct process_pipe *to_slave = process_pipe_allocate();
         struct process_pipe *to_master = process_pipe_allocate();
         if (to_slave == NULL || to_master == NULL) {
@@ -3624,8 +4080,13 @@ static uint64_t syscall_open_pseudo_terminal(uintptr_t user_descriptors) {
                 if (to_master != NULL) {
                         bytes_zero(to_master, sizeof(*to_master));
                 }
+                bytes_zero(terminal, sizeof(*terminal));
                 return (uint64_t)-(int64_t)USER_ERROR_FILE_TABLE_OVERFLOW;
         }
+
+        terminal->input_pipe = to_slave;
+        terminal->output_pipe = to_master;
+        terminal->open_references = 2U;
 
         struct process_open_file *master = process_open_file_allocate();
         struct process_open_file *slave = process_open_file_allocate();
@@ -3635,11 +4096,13 @@ static uint64_t syscall_open_pseudo_terminal(uintptr_t user_descriptors) {
         master->access = DESCRIPTOR_READ | DESCRIPTOR_WRITE;
         master->read_pipe = to_master;
         master->write_pipe = to_slave;
-        master->pseudo_terminal = true;
+        master->terminal = terminal;
+        master->terminal_endpoint = PROCESS_TERMINAL_MASTER;
         slave->access = DESCRIPTOR_READ | DESCRIPTOR_WRITE;
         slave->read_pipe = to_slave;
         slave->write_pipe = to_master;
-        slave->pseudo_terminal = true;
+        slave->terminal = terminal;
+        slave->terminal_endpoint = PROCESS_TERMINAL_SLAVE;
         process_pipe_retain(to_master, DESCRIPTOR_READ);
         process_pipe_retain(to_master, DESCRIPTOR_WRITE);
         process_pipe_retain(to_slave, DESCRIPTOR_READ);
@@ -3755,8 +4218,20 @@ static uint32_t descriptor_ready_events(int32_t descriptor,
         uint32_t returned = 0U;
         if (open_file->read_pipe != NULL) {
                 const struct process_pipe *pipe = open_file->read_pipe;
+                bool canonical_slave =
+                    open_file->terminal != NULL &&
+                    open_file->terminal_endpoint == PROCESS_TERMINAL_SLAVE &&
+                    (open_file->terminal->attributes.flags &
+                     USER_TERMINAL_CANONICAL) != 0U;
+                bool input_ready =
+                    !canonical_slave ||
+                    open_file->terminal->canonical_ready != 0U ||
+                    open_file->terminal->canonical_eof;
                 if ((requested & USER_POLL_READABLE) != 0U &&
-                    (pipe->count != 0U || pipe->writers == 0U)) {
+                    ((pipe->count != 0U && input_ready) ||
+                     pipe->writers == 0U ||
+                     (canonical_slave &&
+                      open_file->terminal->canonical_eof))) {
                         returned |= USER_POLL_READABLE;
                 }
                 if (pipe->writers == 0U) {
@@ -4227,6 +4702,38 @@ static void process_continue_write(struct trap_frame *frame) {
                         frame->sepc += 4U;
                         return;
                 }
+                if (open_file->terminal != NULL &&
+                    open_file->terminal_endpoint == PROCESS_TERMINAL_MASTER) {
+                        while (process->write_offset < process->write_length &&
+                               process_terminal_master_write_character(
+                                   open_file->terminal,
+                                   (uint8_t)process->write_buffer
+                                       [process->write_offset])) {
+                                process->write_offset++;
+                        }
+                        if (process->write_offset != process->write_length) {
+                                if (process->descriptors
+                                        [process->write_descriptor]
+                                            .nonblocking) {
+                                        size_t completed = process->write_offset;
+                                        process->pending_write = false;
+                                        frame->a0 = completed == 0U
+                                                        ? (uint64_t)-(
+                                                              int64_t)
+                                                              USER_ERROR_TRY_AGAIN
+                                                        : completed;
+                                        frame->sepc += 4U;
+                                        return;
+                                }
+                                scheduler_block_current(
+                                    frame, SCHEDULER_WAIT_PIPE_WRITE);
+                                return;
+                        }
+                        process->pending_write = false;
+                        frame->a0 = process->write_result_length;
+                        frame->sepc += 4U;
+                        return;
+                }
                 if (process->write_length > PIPE_BUFFER_SIZE - pipe->count) {
                         if (process->descriptors[process->write_descriptor]
                                 .nonblocking) {
@@ -4301,11 +4808,42 @@ static void process_continue_read(struct trap_frame *frame) {
         if (open_file == NULL) {
                 panic_trap("Pending read descriptor was closed", frame);
         }
+        if (open_file->terminal != NULL &&
+            open_file->terminal_endpoint == PROCESS_TERMINAL_SLAVE &&
+            process->controlling_terminal == open_file->terminal &&
+            open_file->terminal->foreground_process_group != 0U &&
+            process->process_group !=
+                open_file->terminal->foreground_process_group) {
+                (void)syscall_kill(0, USER_SIGNAL_BACKGROUND_READ);
+                return;
+        }
 
         if (open_file->read_pipe != NULL) {
                 struct process_pipe *pipe = open_file->read_pipe;
+                struct process_terminal *terminal = open_file->terminal;
+                bool canonical =
+                    terminal != NULL &&
+                    open_file->terminal_endpoint == PROCESS_TERMINAL_SLAVE &&
+                    (terminal->attributes.flags & USER_TERMINAL_CANONICAL) !=
+                        0U;
 
-                if (pipe->count == 0U) {
+                if (canonical && pipe->writers == 0U &&
+                    terminal->canonical_ready == 0U &&
+                    terminal->canonical_pending != 0U) {
+                        terminal->canonical_ready = terminal->canonical_pending;
+                        terminal->canonical_pending = 0U;
+                }
+                if (canonical && terminal->canonical_ready == 0U &&
+                    terminal->canonical_eof) {
+                        terminal->canonical_eof = false;
+                        process->pending_read = false;
+                        frame->a0 = 0U;
+                        frame->sepc += 4U;
+                        return;
+                }
+
+                if (pipe->count == 0U ||
+                    (canonical && terminal->canonical_ready == 0U)) {
                         if (pipe->writers == 0U) {
                                 process->pending_read = false;
                                 frame->a0 = 0U;
@@ -4331,6 +4869,19 @@ static void process_continue_read(struct trap_frame *frame) {
                 if (pipe_count > pipe->count) {
                         pipe_count = pipe->count;
                 }
+                if (canonical && pipe_count > terminal->canonical_ready) {
+                        pipe_count = terminal->canonical_ready;
+                }
+                if (canonical) {
+                        size_t scan = pipe->read_offset;
+                        for (size_t offset = 0U; offset < pipe_count; offset++) {
+                                if (pipe->buffer[scan] == (uint8_t)'\n') {
+                                        pipe_count = offset + 1U;
+                                        break;
+                                }
+                                scan = (scan + 1U) % PIPE_BUFFER_SIZE;
+                        }
+                }
                 for (size_t offset = 0U; offset < pipe_count; offset++) {
                         process->write_buffer[offset] =
                             (char)pipe->buffer[pipe->read_offset];
@@ -4338,6 +4889,9 @@ static void process_continue_read(struct trap_frame *frame) {
                             (pipe->read_offset + 1U) % PIPE_BUFFER_SIZE;
                 }
                 pipe->count -= pipe_count;
+                if (canonical) {
+                        terminal->canonical_ready -= pipe_count;
+                }
                 user_copy_to(process->read_buffer,
                              (const uint8_t *)process->write_buffer,
                              pipe_count);
@@ -4421,6 +4975,11 @@ static void user_process_finish(struct trap_frame *frame, uint64_t status) {
         active_process->pending_wait_has_deadline = false;
         active_process->state = PROCESS_EXITED;
         active_process->exit_status = status;
+        struct process_terminal *terminal =
+            active_process->controlling_terminal;
+        uint64_t session_id = active_process->session_id;
+        active_process->controlling_terminal = NULL;
+        process_terminal_release_empty_session(terminal, session_id);
         process_orphan_children(active_process->pid);
         (void)scheduler_wake_all(SCHEDULER_WAIT_CHILD);
 
@@ -4506,6 +5065,10 @@ static void process_deliver_pending_signals(struct trap_frame *frame) {
                         continue;
                 }
                 if (signal == USER_SIGNAL_CONTINUE &&
+                    disposition->handler == USER_SIGNAL_DEFAULT) {
+                        continue;
+                }
+                if (process_signal_ignored_by_default(signal) &&
                     disposition->handler == USER_SIGNAL_DEFAULT) {
                         continue;
                 }
@@ -4972,6 +5535,45 @@ void user_process_handle_syscall(struct trap_frame *frame) {
 
         case USER_SYSCALL_TERMINAL_GET_FOREGROUND_GROUP:
                 frame->a0 = syscall_terminal_get_foreground_group(frame->a0);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_TERMINAL_GET_ATTRIBUTES:
+                frame->a0 = syscall_terminal_get_attributes(
+                    frame->a0, (uintptr_t)frame->a1);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_TERMINAL_SET_ATTRIBUTES:
+                frame->a0 = syscall_terminal_set_attributes(
+                    frame->a0, (uintptr_t)frame->a1);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_TERMINAL_GET_WINDOW_SIZE:
+                frame->a0 = syscall_terminal_get_window_size(
+                    frame->a0, (uintptr_t)frame->a1);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_TERMINAL_SET_WINDOW_SIZE:
+                frame->a0 = syscall_terminal_set_window_size(
+                    frame->a0, (uintptr_t)frame->a1);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_CREATE_SESSION:
+                frame->a0 = syscall_create_session();
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_GET_SESSION:
+                frame->a0 = syscall_get_session((int64_t)frame->a0);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_TERMINAL_SET_CONTROLLING:
+                frame->a0 = syscall_terminal_set_controlling(frame->a0);
                 frame->sepc += 4U;
                 return;
 

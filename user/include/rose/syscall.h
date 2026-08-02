@@ -57,6 +57,20 @@ long rose_getpgrp(void);
 long rose_tcsetpgrp(int descriptor, int64_t process_group);
 long rose_tcgetpgrp(int descriptor);
 
+/* Terminal line discipline, PTY geometry, sessions, and controlling-terminal
+ * ownership. A freshly created session has no controlling terminal; its
+ * leader may claim one slave endpoint with rose_tcsetctty. */
+long rose_tcgetattr(int descriptor, struct user_terminal_attributes *attributes);
+long rose_tcsetattr(int descriptor,
+                    const struct user_terminal_attributes *attributes);
+long rose_tcgetwinsize(int descriptor,
+                       struct user_terminal_window_size *window_size);
+long rose_tcsetwinsize(int descriptor,
+                       const struct user_terminal_window_size *window_size);
+long rose_setsid(void);
+long rose_getsid(int64_t pid);
+long rose_tcsetctty(int descriptor);
+
 /* Query or move the process break. Address zero queries without changing it;
  * success returns the resulting break and failure returns a negative error. */
 long rose_brk(uintptr_t address);

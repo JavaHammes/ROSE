@@ -291,6 +291,76 @@ rose_tcgetpgrp:
     ret
 .size rose_tcgetpgrp, . - rose_tcgetpgrp
 
+.section .text.rose_tcgetattr,"ax",@progbits
+.align 2
+.globl rose_tcgetattr
+.type rose_tcgetattr, @function
+rose_tcgetattr:
+    li a7, USER_SYSCALL_TERMINAL_GET_ATTRIBUTES
+    ecall
+    ret
+.size rose_tcgetattr, . - rose_tcgetattr
+
+.section .text.rose_tcsetattr,"ax",@progbits
+.align 2
+.globl rose_tcsetattr
+.type rose_tcsetattr, @function
+rose_tcsetattr:
+    li a7, USER_SYSCALL_TERMINAL_SET_ATTRIBUTES
+    ecall
+    ret
+.size rose_tcsetattr, . - rose_tcsetattr
+
+.section .text.rose_tcgetwinsize,"ax",@progbits
+.align 2
+.globl rose_tcgetwinsize
+.type rose_tcgetwinsize, @function
+rose_tcgetwinsize:
+    li a7, USER_SYSCALL_TERMINAL_GET_WINDOW_SIZE
+    ecall
+    ret
+.size rose_tcgetwinsize, . - rose_tcgetwinsize
+
+.section .text.rose_tcsetwinsize,"ax",@progbits
+.align 2
+.globl rose_tcsetwinsize
+.type rose_tcsetwinsize, @function
+rose_tcsetwinsize:
+    li a7, USER_SYSCALL_TERMINAL_SET_WINDOW_SIZE
+    ecall
+    ret
+.size rose_tcsetwinsize, . - rose_tcsetwinsize
+
+.section .text.rose_setsid,"ax",@progbits
+.align 2
+.globl rose_setsid
+.type rose_setsid, @function
+rose_setsid:
+    li a7, USER_SYSCALL_CREATE_SESSION
+    ecall
+    ret
+.size rose_setsid, . - rose_setsid
+
+.section .text.rose_getsid,"ax",@progbits
+.align 2
+.globl rose_getsid
+.type rose_getsid, @function
+rose_getsid:
+    li a7, USER_SYSCALL_GET_SESSION
+    ecall
+    ret
+.size rose_getsid, . - rose_getsid
+
+.section .text.rose_tcsetctty,"ax",@progbits
+.align 2
+.globl rose_tcsetctty
+.type rose_tcsetctty, @function
+rose_tcsetctty:
+    li a7, USER_SYSCALL_TERMINAL_SET_CONTROLLING
+    ecall
+    ret
+.size rose_tcsetctty, . - rose_tcsetctty
+
 .section .text.rose_signal_trampoline,"ax",@progbits
 .align 2
 .type rose_signal_trampoline, @function

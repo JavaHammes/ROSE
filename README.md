@@ -48,7 +48,7 @@ scheduling, and automated emulator tests.
   linker-embedded ramfs is retained as a boot-diagnostic fallback.
 - VFS regular files, directories, and character devices with canonical path
   lookup, create/truncate, stat, seek, directory iteration, mkdir, and unlink.
-- Eight-entry per-process descriptor tables backed by a bounded global
+- Sixteen-entry per-process descriptor tables backed by a bounded global
   open-file table, with standard input, output, and error attached to
   `/dev/console`; aliases inherited by `dup`, `fork`, and `spawn` share their
   file offset and remain usable until the final alias is closed. Anonymous
@@ -58,12 +58,15 @@ scheduling, and automated emulator tests.
   and nonblocking flags keep shell-private pipe ends and saved descriptors out
   of child images. Bidirectional pseudo-terminal pairs connect the graphical
   terminal to the existing shell without moving command parsing into the
-  window server.
+  window server. Each PTY has canonical/raw, echo, and signal-processing
+  attributes plus shared row/column and pixel dimensions; size changes notify
+  its foreground process group with `SIGWINCH`.
 - U-mode C runtime with descriptor I/O, `open`, `close`, `stat`, `fstat`,
   `lseek`, `dup`, `dup2`, directory iteration, `mkdir`, `unlink`, `chdir`,
   `getcwd`, `pipe`, descriptor flags, `fork`, `spawn`, `execve`, `getpid`,
-  `waitpid`, `sigaction`, `kill`, process-group and console foreground-group
-  control, shared memory, pseudo-terminals, system telemetry, `brk`, `mmap`,
+  `waitpid`, `sigaction`, `kill`, process groups, sessions, controlling-terminal
+  and foreground-group control, terminal attributes and window sizing, shared
+  memory, pseudo-terminals, system telemetry, `brk`, `mmap`,
   `mprotect`, `munmap`, monotonic time, sleep, descriptor `poll`, mixed event
   waits, shared-event notification, `exit`, and `yield`
   system calls. Relative paths resolve from a canonical per-process working
@@ -97,9 +100,10 @@ scheduling, and automated emulator tests.
   state. `SIGKILL` and `SIGSTOP` remain uncatchable, delivery wakes blocked
   targets, process-group delivery supports terminal jobs, and stop/continue
   transitions are retained for `waitpid`. Dispositions are inherited by
-  `fork`, and caught handlers reset on `execve`. The UART maps Ctrl-C and Ctrl-Z
-  to the foreground process group; background console reads stop with
-  `SIGTTIN`.
+  `fork`, and caught handlers reset on `execve`. Configurable terminal control
+  characters generate signals for the terminal's foreground process group;
+  background controlling-terminal reads stop with `SIGTTIN`. Separate PTY
+  sessions keep nested shells and graphical terminals independent.
 - Interactive `/bin/sh` process with console line editing, quoted and escaped
   argument parsing, mutable environment variables, quote-aware `$NAME`,
   `${NAME}`, `$?`, and `$$` parameter expansion, `PATH` lookup, working
@@ -278,8 +282,10 @@ commands, `jobs`/`fg`, child creation and waiting, memory reclamation,
 fallback-ramfs shell boot,
 graphical transport discovery, userspace framebuffer mapping and flushing,
 automatic graphical console restoration, and clean shutdown. The graphical
-smoke test boots and closes the full three-client desktop; the terminal path
-was also verified with a shell command entered through its pseudo-terminal.
+smoke test repeatedly opens and closes twelve simultaneous graphical terminals,
+checks process and physical-page reclamation after every cycle, then boots and
+closes the normal three-client desktop. The terminal path was also verified
+with a shell command entered through its pseudo-terminal.
 
 The host-side image tests additionally validate filesystem metadata, output
 determinism, atomic replacement, guest path constraints, and malformed tree
@@ -332,8 +338,8 @@ write-through, limited to one block group and direct plus singly indirect block
 addressing (268 KiB files), and does not yet provide journaling or crash
 recovery. The VirtIO queue is polled synchronously; it is not yet connected to
 a scheduler completion channel. Signals do not yet have masks, alternate
-stacks, sessions, or realtime queues. Anonymous mappings use a fixed
-sixteen-entry VMA table and do not yet support file backing, shared mappings,
+stacks, or realtime queues. Anonymous mappings use a fixed
+thirty-two-entry VMA table and do not yet support file backing, shared mappings,
 or fixed addresses. There are no general-purpose kernel threads, ASIDs,
 networking, users, or permissions enforcement.
 

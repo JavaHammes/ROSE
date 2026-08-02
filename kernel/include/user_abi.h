@@ -51,6 +51,13 @@
 #define USER_SYSCALL_POLL 45
 #define USER_SYSCALL_WAIT_EVENTS 46
 #define USER_SYSCALL_EVENT_NOTIFY 47
+#define USER_SYSCALL_TERMINAL_GET_ATTRIBUTES 48
+#define USER_SYSCALL_TERMINAL_SET_ATTRIBUTES 49
+#define USER_SYSCALL_TERMINAL_GET_WINDOW_SIZE 50
+#define USER_SYSCALL_TERMINAL_SET_WINDOW_SIZE 51
+#define USER_SYSCALL_CREATE_SESSION 52
+#define USER_SYSCALL_GET_SESSION 53
+#define USER_SYSCALL_TERMINAL_SET_CONTROLLING 54
 
 #else
 
@@ -103,6 +110,13 @@ enum user_syscall_number {
         USER_SYSCALL_POLL = 45,
         USER_SYSCALL_WAIT_EVENTS = 46,
         USER_SYSCALL_EVENT_NOTIFY = 47,
+        USER_SYSCALL_TERMINAL_GET_ATTRIBUTES = 48,
+        USER_SYSCALL_TERMINAL_SET_ATTRIBUTES = 49,
+        USER_SYSCALL_TERMINAL_GET_WINDOW_SIZE = 50,
+        USER_SYSCALL_TERMINAL_SET_WINDOW_SIZE = 51,
+        USER_SYSCALL_CREATE_SESSION = 52,
+        USER_SYSCALL_GET_SESSION = 53,
+        USER_SYSCALL_TERMINAL_SET_CONTROLLING = 54,
 };
 
 /* Stable negative error values returned in a0 by failed system calls. */
@@ -232,6 +246,7 @@ enum user_wait_options {
  * so wait statuses and programs can use familiar numbers. */
 enum user_signal_number {
         USER_SIGNAL_INTERRUPT = 2,
+        USER_SIGNAL_QUIT = 3,
         USER_SIGNAL_KILL = 9,
         USER_SIGNAL_USER_1 = 10,
         USER_SIGNAL_TERMINATE = 15,
@@ -239,6 +254,7 @@ enum user_signal_number {
         USER_SIGNAL_STOP = 19,
         USER_SIGNAL_TERMINAL_STOP = 20,
         USER_SIGNAL_BACKGROUND_READ = 21,
+        USER_SIGNAL_WINDOW_CHANGED = 28,
         USER_SIGNAL_MAX = 31,
 };
 
@@ -248,6 +264,33 @@ enum user_signal_number {
 struct user_signal_action {
         uintptr_t handler;
         uint64_t flags;
+};
+
+/* A deliberately compact line-discipline ABI. Clearing CANONICAL selects raw
+ * byte delivery; the independently controlled echo and signal processing
+ * flags remain useful in either input mode. A zero control character disables
+ * that control action. */
+enum user_terminal_attribute_flag {
+        USER_TERMINAL_CANONICAL = (1U << 0),
+        USER_TERMINAL_ECHO = (1U << 1),
+        USER_TERMINAL_SIGNALS = (1U << 2),
+};
+
+struct user_terminal_attributes {
+        uint32_t flags;
+        uint8_t interrupt_character;
+        uint8_t quit_character;
+        uint8_t erase_character;
+        uint8_t end_of_file_character;
+        uint8_t suspend_character;
+        uint8_t reserved[3];
+};
+
+struct user_terminal_window_size {
+        uint16_t rows;
+        uint16_t columns;
+        uint16_t pixel_width;
+        uint16_t pixel_height;
 };
 
 enum user_file_type {

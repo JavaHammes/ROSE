@@ -59,14 +59,28 @@ static void monitor_render(struct rose_gui_context *gui,
 }
 
 int rose_gui_monitor_main(int argc, char **argv) {
+        const uint64_t update_interval = UINT64_C(500000000);
         struct rose_gui_context gui;
         if (argc != 2 || !rose_gui_connect(argv[1], &gui)) return 1;
+        uint64_t next_update = rose_monotonic_time();
         while (gui.surface->close_requested == 0U) {
-                struct user_system_info information;
-                if (rose_system_info(&information) == 0) {
-                        monitor_render(&gui, &information);
+                uint64_t now = rose_monotonic_time();
+                if (now >= next_update) {
+                        struct user_system_info information;
+                        if (rose_system_info(&information) == 0) {
+                                monitor_render(&gui, &information);
+                        }
+                        now = rose_monotonic_time();
+                        do {
+                                next_update += update_interval;
+                        } while (next_update <= now);
                 }
-                if (rose_gui_wait(&gui, INT64_C(500000000)) < 0) {
+                now = rose_monotonic_time();
+                int64_t timeout = next_update > now
+                                      ? (int64_t)(next_update - now)
+                                      : 0;
+                long result = rose_gui_wait(&gui, timeout);
+                if (result < 0 && result != -USER_ERROR_INTERRUPTED) {
                         rose_gui_disconnect(&gui);
                         return 2;
                 }

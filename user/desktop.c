@@ -10,7 +10,8 @@
 enum {
         FONT_WIDTH = 5,
         FONT_HEIGHT = 7,
-        WINDOW_LIMIT = 3,
+        WINDOW_LIMIT = 12,
+        CAPACITY_STRESS_CYCLES = 3,
         PANEL_HEIGHT = 54,
         WINDOW_BORDER = 2,
         WINDOW_TITLE_HEIGHT = 30,
@@ -625,7 +626,7 @@ static void close_windows(struct desktop *desktop) {
                 (void)rose_event_notify(
                     &desktop->windows[index].surface->close_requested);
         }
-        for (size_t turns = 0U; desktop->window_count != 0U && turns < 100U;
+        for (size_t turns = 0U; desktop->window_count != 0U && turns < 500U;
              turns++) {
                 reap_windows(desktop);
                 if (desktop->window_count != 0U) {
@@ -675,8 +676,116 @@ static long desktop_wait_for_activity(struct desktop *desktop) {
         return rose_wait_events(items, count, -1);
 }
 
+/* A terminal window owns a frontend process, a shell process, one shared
+ * surface, a PTY, and two pipes. Repeating this test exercises every capacity
+ * table used by the heaviest small graphical client and verifies that teardown
+ * returns both process slots and physical pages to the pre-test baseline. */
+static bool capacity_stress_wait_ready(struct desktop *desktop,
+                                       uint32_t expected_processes) {
+        const uint64_t wait_quantum = UINT64_C(10000000);
+        const uint64_t deadline =
+            rose_monotonic_time() + UINT64_C(10000000000);
+
+        while (true) {
+                reap_windows(desktop);
+                if (desktop->window_count != WINDOW_LIMIT) return false;
+
+                bool clients_ready = true;
+                for (size_t index = 0U; index < desktop->window_count;
+                     index++) {
+                        if (desktop->windows[index].surface->client_ready ==
+                            0U) {
+                                clients_ready = false;
+                        }
+                }
+                struct user_system_info information;
+                if (rose_system_info(&information) != 0) return false;
+                if (clients_ready &&
+                    information.process_count == expected_processes) {
+                        return true;
+                }
+
+                uint64_t now = rose_monotonic_time();
+                if (now >= deadline) return false;
+                uint64_t remaining = deadline - now;
+                int64_t timeout =
+                    (int64_t)(remaining < wait_quantum ? remaining
+                                                       : wait_quantum);
+                struct user_wait_item items[WINDOW_LIMIT + 1U];
+                size_t count = 0U;
+                items[count++] = (struct user_wait_item){
+                    .type = USER_WAIT_OBJECT_CHILD,
+                    .events = USER_WAIT_EVENT_CHILD_EXITED,
+                    .identifier = -1,
+                };
+                for (size_t index = 0U; index < desktop->window_count;
+                     index++) {
+                        struct desktop_window *window =
+                            &desktop->windows[index];
+                        if (window->surface->client_ready == 0U) {
+                                items[count++] = (struct user_wait_item){
+                                    .type = USER_WAIT_OBJECT_SHARED_WORD,
+                                    .events = USER_WAIT_EVENT_CHANGED,
+                                    .identifier =
+                                        (int64_t)(uintptr_t)&window->surface
+                                              ->client_ready,
+                                    .value = 0U,
+                                };
+                        }
+                }
+                long result = rose_wait_events(items, count, timeout);
+                if (result < 0 && result != -USER_ERROR_INTERRUPTED) {
+                        return false;
+                }
+        }
+}
+
+static bool run_capacity_stress(struct desktop *desktop) {
+        struct user_system_info baseline;
+        if (rose_system_info(&baseline) != 0) return false;
+
+        for (size_t cycle = 0U; cycle < CAPACITY_STRESS_CYCLES; cycle++) {
+                for (size_t index = 0U; index < WINDOW_LIMIT; index++) {
+                        int32_t x = 12 + (int32_t)(index % 4U) * 250;
+                        int32_t y = 62 + (int32_t)(index / 4U) * 215;
+                        if (!create_window(desktop, "TERMINAL",
+                                           "/bin/gui-terminal", x, y, 220,
+                                           150)) {
+                                print("desktop: capacity exhausted while "
+                                      "opening terminals\n");
+                                close_windows(desktop);
+                                return false;
+                        }
+                }
+                if (!capacity_stress_wait_ready(
+                        desktop,
+                        baseline.process_count + WINDOW_LIMIT * 2U)) {
+                        print("desktop: terminal startup capacity test "
+                              "timed out\n");
+                        close_windows(desktop);
+                        return false;
+                }
+                collect_damage(desktop);
+                if (!render(desktop)) {
+                        close_windows(desktop);
+                        return false;
+                }
+                close_windows(desktop);
+
+                struct user_system_info released;
+                if (rose_system_info(&released) != 0 ||
+                    released.process_count != baseline.process_count ||
+                    released.used_pages != baseline.used_pages) {
+                        print("desktop: capacity resources leaked after "
+                              "close\n");
+                        return false;
+                }
+        }
+        return true;
+}
+
 int rose_desktop_main(int argc, char **argv) {
-        struct desktop desktop;
+        static struct desktop desktop;
         zero_bytes(&desktop, sizeof(desktop));
         desktop.pointer_x = 512;
         desktop.pointer_y = 384;
@@ -695,6 +804,11 @@ int rose_desktop_main(int argc, char **argv) {
         if (argc == 2 && strings_equal(argv[1], "--test")) {
                 if (!render(&desktop)) return 2;
                 print("Graphics userspace test passed\n");
+                return 0;
+        }
+        if (argc == 2 && strings_equal(argv[1], "--stress")) {
+                if (!run_capacity_stress(&desktop)) return 7;
+                print("GUI capacity stress passed\n");
                 return 0;
         }
 

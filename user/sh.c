@@ -1507,11 +1507,13 @@ static bool shell_execute(struct shell_pipeline *pipeline) {
 
 static void shell_initialize_job_control(void) {
         long pid = rose_getpid();
-        if (pid <= 0 || rose_setpgid(0, 0) < 0) {
+        long process_group = rose_getpgrp();
+        if (pid <= 0 || process_group <= 0 ||
+            (process_group != pid && rose_setpgid(0, 0) < 0)) {
                 print_error("sh: unable to create shell process group\n");
                 return;
         }
-        long process_group = rose_getpgrp();
+        process_group = rose_getpgrp();
         if (process_group <= 0) {
                 print_error("sh: unable to read shell process group\n");
                 return;

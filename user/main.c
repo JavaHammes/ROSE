@@ -23,7 +23,9 @@ static volatile uint64_t user_counter;
 static volatile uint64_t user_signal_count;
 
 static void signal_test_handler(int signal) {
-        if (signal == USER_SIGNAL_USER_1) {
+        if (signal == USER_SIGNAL_USER_1 ||
+            signal == USER_SIGNAL_WINDOW_CHANGED ||
+            signal == USER_SIGNAL_INTERRUPT) {
                 user_signal_count++;
         }
 }
@@ -550,7 +552,7 @@ static int run_syscall_test(void) {
             rose_dup2((int)original, (int)original) != original ||
             rose_dup(99) != -USER_ERROR_BAD_FILE_DESCRIPTOR ||
             rose_dup2(99, 6) != -USER_ERROR_BAD_FILE_DESCRIPTOR ||
-            rose_dup2((int)original, 8) != -USER_ERROR_BAD_FILE_DESCRIPTOR ||
+            rose_dup2((int)original, 16) != -USER_ERROR_BAD_FILE_DESCRIPTOR ||
             rose_read((int)original, &characters[0], 1U) != 1 ||
             rose_read((int)duplicate, &characters[1], 1U) != 1 ||
             rose_read((int)replacement, &characters[2], 1U) != 1 ||
@@ -569,9 +571,10 @@ static int run_syscall_test(void) {
         print("Working directory passed\n");
         print("Descriptor duplication passed\n");
 
-        long descriptors[5];
+        enum { OPEN_DESCRIPTOR_COUNT = 13 };
+        long descriptors[OPEN_DESCRIPTOR_COUNT];
 
-        for (size_t index = 0U; index < 5U; index++) {
+        for (size_t index = 0U; index < OPEN_DESCRIPTOR_COUNT; index++) {
                 descriptors[index] = rose_open("/etc/motd", USER_OPEN_READ);
                 if (descriptors[index] != (long)(index + 3U)) {
                         return 14;
@@ -581,8 +584,15 @@ static int run_syscall_test(void) {
             -USER_ERROR_TOO_MANY_FILES) {
                 return 15;
         }
-        for (size_t index = 0U; index < 5U; index++) {
-                if (rose_close((int)descriptors[index]) != 0) {
+        if (rose_close((int)descriptors[6]) != 0 ||
+            rose_open("/etc/motd", USER_OPEN_READ) != descriptors[6] ||
+            rose_close((int)descriptors[6]) != 0) {
+                return 16;
+        }
+        descriptors[6] = -1;
+        for (size_t index = 0U; index < OPEN_DESCRIPTOR_COUNT; index++) {
+                if (descriptors[index] >= 0 &&
+                    rose_close((int)descriptors[index]) != 0) {
                         return 16;
                 }
         }
@@ -1029,13 +1039,68 @@ static int run_syscall_test(void) {
         print("Shared memory passed\n");
 
         int terminals[2];
-        char terminal_byte = 0;
+        char terminal_buffer[8] = {0};
         struct user_poll_descriptor terminal_poll;
+        struct user_terminal_attributes terminal_attributes;
+        struct user_terminal_window_size terminal_window_size;
         if (rose_openpty((int *)kernel_address) != -USER_ERROR_BAD_ADDRESS ||
             rose_openpty(terminals) != 0 || terminals[0] != 3 ||
             terminals[1] != 4 ||
             rose_set_descriptor_flags(terminals[0], USER_DESCRIPTOR_NONBLOCK) !=
-                0) {
+                0 ||
+            rose_set_descriptor_flags(terminals[1], USER_DESCRIPTOR_NONBLOCK) !=
+                0 ||
+            rose_tcgetattr(terminals[1], &terminal_attributes) != 0 ||
+            terminal_attributes.flags !=
+                (USER_TERMINAL_CANONICAL | USER_TERMINAL_ECHO |
+                 USER_TERMINAL_SIGNALS) ||
+            terminal_attributes.interrupt_character != '\x03' ||
+            terminal_attributes.erase_character != '\x7f' ||
+            terminal_attributes.end_of_file_character != '\x04' ||
+            rose_tcgetattr(terminals[0],
+                           (struct user_terminal_attributes *)kernel_address) !=
+                -USER_ERROR_BAD_ADDRESS ||
+            rose_tcgetwinsize(terminals[0], &terminal_window_size) != 0 ||
+            terminal_window_size.rows != 24U ||
+            terminal_window_size.columns != 80U) {
+                return 80;
+        }
+        terminal_window_size = (struct user_terminal_window_size){
+            .rows = 40U,
+            .columns = 100U,
+            .pixel_width = 800U,
+            .pixel_height = 600U,
+        };
+        if (rose_tcsetwinsize(terminals[0], &terminal_window_size) != 0) {
+                return 80;
+        }
+        terminal_window_size = (struct user_terminal_window_size){0};
+        if (rose_tcgetwinsize(terminals[1], &terminal_window_size) != 0 ||
+            terminal_window_size.rows != 40U ||
+            terminal_window_size.columns != 100U ||
+            terminal_window_size.pixel_width != 800U ||
+            terminal_window_size.pixel_height != 600U ||
+            rose_write(terminals[0], "ab", 2U) != 2 ||
+            rose_read(terminals[1], terminal_buffer,
+                      sizeof(terminal_buffer)) != -USER_ERROR_TRY_AGAIN ||
+            rose_read(terminals[0], terminal_buffer, 2U) != 2 ||
+            terminal_buffer[0] != 'a' || terminal_buffer[1] != 'b' ||
+            rose_write(terminals[0], "\x7f" "c\r", 3U) != 3 ||
+            rose_read(terminals[1], terminal_buffer,
+                      sizeof(terminal_buffer)) != 3 ||
+            terminal_buffer[0] != 'a' || terminal_buffer[1] != 'c' ||
+            terminal_buffer[2] != '\n' ||
+            rose_read(terminals[0], terminal_buffer, 6U) != 6 ||
+            terminal_buffer[0] != '\b' || terminal_buffer[1] != ' ' ||
+            terminal_buffer[2] != '\b' || terminal_buffer[3] != 'c' ||
+            terminal_buffer[4] != '\r' || terminal_buffer[5] != '\n') {
+                return 80;
+        }
+        terminal_attributes.flags = 0U;
+        if (rose_tcsetattr(terminals[1], &terminal_attributes) != 0 ||
+            rose_write(terminals[0], "m", 1U) != 1 ||
+            rose_read(terminals[1], terminal_buffer, 1U) != 1 ||
+            terminal_buffer[0] != 'm') {
                 return 80;
         }
         terminal_poll = (struct user_poll_descriptor){
@@ -1043,21 +1108,96 @@ static int run_syscall_test(void) {
             .events = USER_POLL_READABLE | USER_POLL_WRITABLE};
         if (rose_poll(&terminal_poll, 1U, 0) != 1 ||
             terminal_poll.returned_events != USER_POLL_WRITABLE ||
-            rose_read(terminals[0], &terminal_byte, 1U) !=
+            rose_read(terminals[0], terminal_buffer, 1U) !=
                 -USER_ERROR_TRY_AGAIN ||
-            rose_write(terminals[0], "m", 1U) != 1) {
+            rose_write(terminals[1], "s", 1U) != 1) {
                 return 80;
         }
-        terminal_poll = (struct user_poll_descriptor){
-            .descriptor = terminals[1], .events = USER_POLL_READABLE};
+        terminal_poll = (struct user_poll_descriptor){.descriptor = terminals[0],
+                                                     .events = USER_POLL_READABLE};
         if (rose_poll(&terminal_poll, 1U, 0) != 1 ||
             terminal_poll.returned_events != USER_POLL_READABLE ||
-            rose_read(terminals[1], &terminal_byte, 1U) != 1 ||
-            terminal_byte != 'm' || rose_write(terminals[1], "s", 1U) != 1 ||
-            rose_read(terminals[0], &terminal_byte, 1U) != 1 ||
-            terminal_byte != 's' ||
+            rose_read(terminals[0], terminal_buffer, 1U) != 1 ||
+            terminal_buffer[0] != 's' ||
             rose_fstat(terminals[0], &descriptor_status) != 0 ||
-            descriptor_status.type != USER_FILE_PIPE ||
+            descriptor_status.type != USER_FILE_PIPE) {
+                return 80;
+        }
+        terminal_attributes.flags = USER_TERMINAL_SIGNALS;
+        if (rose_tcsetattr(terminals[1], &terminal_attributes) != 0) {
+                return 80;
+        }
+        int independent_terminals[2];
+        struct user_terminal_attributes independent_attributes;
+        struct user_terminal_window_size independent_window_size;
+        if (rose_openpty(independent_terminals) != 0 ||
+            independent_terminals[0] != 5 || independent_terminals[1] != 6 ||
+            rose_tcgetattr(independent_terminals[0],
+                           &independent_attributes) != 0 ||
+            independent_attributes.flags !=
+                (USER_TERMINAL_CANONICAL | USER_TERMINAL_ECHO |
+                 USER_TERMINAL_SIGNALS) ||
+            rose_tcgetwinsize(independent_terminals[1],
+                              &independent_window_size) != 0 ||
+            independent_window_size.rows != 24U ||
+            independent_window_size.columns != 80U ||
+            rose_tcgetwinsize(terminals[0], &terminal_window_size) != 0 ||
+            terminal_window_size.rows != 40U ||
+            terminal_window_size.columns != 100U ||
+            rose_close(independent_terminals[0]) != 0 ||
+            rose_close(independent_terminals[1]) != 0) {
+                return 80;
+        }
+
+        long session_child = rose_fork();
+        if (session_child == 0) {
+                long session = rose_setsid();
+                const struct user_signal_action resize_action = {
+                    .handler = (uintptr_t)signal_test_handler,
+                    .flags = 0U,
+                };
+                user_signal_count = 0U;
+                if (session <= 0 || rose_getsid(0) != session ||
+                    rose_getpgrp() != session ||
+                    rose_tcsetctty(terminals[0]) !=
+                        -USER_ERROR_BAD_FILE_DESCRIPTOR ||
+                    rose_tcsetctty(terminals[1]) != 0 ||
+                    rose_tcgetpgrp(terminals[1]) != session ||
+                    rose_setpgid(0, 0) != -USER_ERROR_PERMISSION ||
+                    rose_sigaction(USER_SIGNAL_WINDOW_CHANGED, &resize_action,
+                                   NULL) != 0 ||
+                    rose_sigaction(USER_SIGNAL_INTERRUPT, &resize_action,
+                                   NULL) != 0 ||
+                    rose_write(terminals[1], "r", 1U) != 1) {
+                        rose_exit(1U);
+                }
+                while (user_signal_count < 2U) {
+                        rose_yield();
+                }
+                rose_exit(0U);
+        }
+        wait_status = -1;
+        long resize_marker = -USER_ERROR_TRY_AGAIN;
+        while (session_child > 0 &&
+               resize_marker == -USER_ERROR_TRY_AGAIN) {
+                resize_marker = rose_read(terminals[0], terminal_buffer, 1U);
+                if (resize_marker == -USER_ERROR_TRY_AGAIN) {
+                        rose_yield();
+                }
+        }
+        terminal_window_size.rows = 41U;
+        terminal_window_size.columns = 101U;
+        if (session_child <= 0 || resize_marker != 1 ||
+            terminal_buffer[0] != 'r' ||
+            rose_write(terminals[0], "\x03", 1U) != 1 ||
+            rose_tcsetwinsize(terminals[0], &terminal_window_size) != 0 ||
+            rose_waitpid(session_child, &wait_status, 0U) != session_child ||
+            !USER_WAIT_STATUS_EXITED(wait_status) ||
+            USER_WAIT_STATUS_EXIT_CODE(wait_status) != 0U ||
+            rose_getsid(0) <= 0 ||
+            rose_getsid(-1) != -USER_ERROR_INVALID_ARGUMENT ||
+            rose_tcsetpgrp(terminals[1], rose_getpgrp()) !=
+                -USER_ERROR_PERMISSION ||
             rose_close(terminals[0]) != 0 || rose_close(terminals[1]) != 0) {
                 return 80;
         }

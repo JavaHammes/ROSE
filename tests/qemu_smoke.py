@@ -214,6 +214,10 @@ def run_smoke_test(
                 session.command("desktop --test", timeout=15.0),
                 "Graphics userspace test passed",
             )
+            require(
+                session.command("desktop --stress", timeout=45.0),
+                "GUI capacity stress passed",
+            )
             require(session.graphical_keyboard_exit(), "rose> ")
 
         if graphics_only:
