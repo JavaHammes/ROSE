@@ -5,10 +5,6 @@ machine. It boots through OpenSBI, discovers its platform from the flattened
 device tree, enables Sv39 virtual memory, and runs independently linked C
 programs in user mode.
 
-The project is intentionally small enough to read end to end, but its current
-milestone has real protection boundaries, resource ownership, preemptive
-scheduling, and automated emulator tests.
-
 ## Current features
 
 - RV64 supervisor-mode kernel on one hart.
