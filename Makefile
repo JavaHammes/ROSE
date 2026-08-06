@@ -153,7 +153,7 @@ DEPS := \
 	$(foreach program,$(USER_PROGRAMS),$(BUILD_DIR)/user/$(program)/main.d)
 
 ARCH_FLAGS := \
-	-march=rv64imab_zicsr \
+	-march=rv64ima_zicsr \
 	-mabi=lp64 \
 	-mcmodel=medany
 
@@ -238,6 +238,50 @@ QEMU_GUI_FLAGS := \
 
 .PHONY: all
 all: $(KERNEL) $(ROOT_IMAGE)
+
+
+.PHONY: help
+help:
+	@printf '%s\n' \
+		'ROSE build targets:' \
+		'  make doctor         check the local build and emulator tools' \
+		'  make -j4            build the kernel and deterministic root disk' \
+		'  make run-gui         boot the graphical desktop' \
+		'  make run-rescue      boot directly to the text rescue shell' \
+		'  make test-host       run the fast host-side test suite' \
+		'  make check           run static analysis and every QEMU test' \
+		'  make verify          clean, rebuild, and run the release checks' \
+		'  make debug / gdb     start QEMU and attach a RISC-V debugger'
+
+
+.PHONY: doctor
+doctor:
+	@missing=0; \
+	for tool in "$(CC)" "$(OBJCOPY)" "$(SIZE)" "$(QEMU)" "$(PYTHON)"; do \
+		if command -v "$$tool" >/dev/null 2>&1; then \
+			printf '  [ok] %s\n' "$$tool"; \
+		else \
+			printf '  [missing] %s\n' "$$tool"; \
+			missing=1; \
+		fi; \
+	done; \
+	if [ "$$missing" -ne 0 ]; then \
+		printf '%s\n' 'Install the missing required tools; see README.md.'; \
+		exit 1; \
+	fi; \
+	if ! "$(PYTHON)" -c 'import sys; raise SystemExit(sys.version_info < (3, 9))'; then \
+		printf '%s\n' 'Python 3.9 or newer is required.'; \
+		exit 1; \
+	fi; \
+	printf '%s\n' 'Required build and runtime tools are ready.'; \
+	printf '%s\n' 'Optional development tools:'; \
+	for tool in "$(GDB)" "$(OBJDUMP)" "$(CLANG_TIDY)" clang-format pre-commit; do \
+		if command -v "$$tool" >/dev/null 2>&1; then \
+			printf '  [ok] %s\n' "$$tool"; \
+		else \
+			printf '  [optional] %s\n' "$$tool"; \
+		fi; \
+	done
 
 
 $(ROOT_IMAGE): tools/mkrosefs.py assets/font5x7.hex assets/gui-theme.conf assets/gui-icons.txt assets/gui-apps.conf assets/rose-init.conf assets/roserc $(USER_LOAD_ELFS) Makefile
@@ -407,7 +451,7 @@ tidy:
 		echo "TIDY $$source"; \
 		$(CLANG_TIDY) "$$source" -- \
 			--target=riscv64-unknown-elf \
-			-march=rv64imab_zicsr \
+			-march=rv64ima_zicsr \
 			-mabi=lp64 \
 			-ffreestanding \
 			-std=c11 \
@@ -418,7 +462,7 @@ tidy:
 		echo "TIDY $$source"; \
 		$(CLANG_TIDY) "$$source" -- \
 			--target=riscv64-unknown-elf \
-			-march=rv64imab_zicsr \
+			-march=rv64ima_zicsr \
 			-mabi=lp64 \
 			-ffreestanding \
 			-std=c11 \

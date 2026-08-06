@@ -1,13 +1,55 @@
-# ROSE — RISC-V Operating System
+# ROSE
 
-**This project is 100% AI-generated. I created it to explore the limits of what I can achieve with AI and to see how far I can push my ideas with these tools.**
+**A small graphical RISC-V operating system built from scratch for QEMU.**
 
-ROSE is a compact educational kernel for the 64-bit RISC-V QEMU `virt`
-machine. It boots through OpenSBI, discovers its platform from the flattened
-device tree, enables Sv39 virtual memory, and runs independently linked C
-programs in user mode.
+[![CI](https://github.com/JavaHammes/ROSE/actions/workflows/ci.yml/badge.svg)](https://github.com/JavaHammes/ROSE/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-5f7cff.svg)](LICENSE)
 
-## Current features
+ROSE boots through OpenSBI on the 64-bit RISC-V QEMU `virt` machine, discovers
+its hardware from the device tree, enables Sv39 virtual memory, and runs
+independently linked C programs in user mode. It includes a multi-process
+desktop, shell, writable filesystem, and network stack; it does not use Linux,
+libc, or BusyBox.
+
+> **Experiment:** The project is 100% AI-generated. I built it to explore how
+> far I could take an operating-system idea with AI tools while still requiring
+> the result to build cleanly and pass real end-to-end tests.
+
+## Highlights
+
+- A preemptive supervisor-mode kernel with protected user processes, `fork`,
+  `execve`, copy-on-write, signals, pipes, PTYs, shared memory, and lazy `mmap`.
+- A userspace window server and GUI toolkit with Terminal, Files, Editor, and
+  System Monitor applications.
+- A writable ext2 root, VFS, process-aware shell, job control, redirection,
+  pipelines, startup files, and practical command-line utilities.
+- VirtIO block, GPU, keyboard, tablet, and network devices, plus Ethernet, ARP,
+  IPv4, ICMP, UDP, DNS, outbound TCP, `ping`, `nslookup`, and HTTP `curl`.
+- Automated host and QEMU coverage for two RAM sizes, graphical recovery,
+  resource reclamation, filesystem determinism, and kernel/user isolation.
+
+ROSE is an educational, single-user OS with a deliberately bounded platform,
+not a production system or a security-hardened Linux replacement. The exact
+scope is documented under [Deliberate limitations](#deliberate-limitations).
+
+## Quick start
+
+After installing the [requirements](#requirements):
+
+```sh
+make doctor
+make -j4
+make run-gui
+```
+
+Use the **ROSE** button to launch an application or press Ctrl+Alt+T for a new
+terminal. For a serial-only boot, run `make run-rescue`. Run `make help` to see
+the main development and verification targets.
+
+<details>
+<summary><strong>Full feature inventory</strong></summary>
+
+### Current features
 
 - RV64 supervisor-mode kernel on one hart.
 - Device-tree discovery for RAM, reserved regions, timer frequency, UART, PLIC,
@@ -171,6 +213,8 @@ At idle, the kernel uses five physical pages for its Sv39 tables on the default
 QEMU configuration. User-process teardown is checked by the smoke test to
 ensure it returns to that baseline.
 
+</details>
+
 ## Repository layout
 
 ```text
@@ -188,15 +232,29 @@ tools/            deterministic ext2 root-image generator
 
 ## Requirements
 
-- `riscv64-elf-gcc`, binutils, and GDB
+- A bare-metal RISC-V GCC/binutils toolchain (`riscv64-elf-*` by default)
 - `qemu-system-riscv64` with the default OpenSBI firmware
-- Python 3.9 or newer for host tooling and automated tests
-- `clang-tidy` for static analysis
+- Python 3.9 or newer
 
-On Arch Linux, the relevant packages are `riscv64-elf-gcc`,
-`riscv64-elf-binutils`, `riscv64-elf-gdb`, `qemu-system-riscv`, and
-`qemu-system-riscv-firmware`. Package names differ on macOS and other Linux
-distributions.
+On Ubuntu 24.04, the CI uses:
+
+```sh
+sudo apt-get install binutils-riscv64-unknown-elf \
+  gcc-riscv64-unknown-elf opensbi qemu-system-misc
+make PREFIX=riscv64-unknown-elf- -j4
+```
+
+On macOS with Homebrew:
+
+```sh
+brew install riscv64-elf-binutils riscv64-elf-gcc qemu
+```
+
+GDB and `riscv64-elf-objdump` are only needed for debugging and disassembly.
+`clang-tidy` is needed by `make check`; `clang-format` and `pre-commit` support
+the optional local hooks. Arch Linux provides the core tools as
+`riscv64-elf-gcc`, `riscv64-elf-binutils`, `qemu-system-riscv`, and
+`qemu-system-riscv-firmware`.
 
 The tool prefix and executables can be overridden when necessary:
 
@@ -293,6 +351,7 @@ Useful commands are:
 | Command | Purpose |
 | --- | --- |
 | `help` | List shell built-ins and command lookup behavior. |
+| `clear` | Clear the graphical or serial terminal screen. |
 | `echo "hello world"` | Parse quotes and print arguments. |
 | `pwd` / `cd [DIR]` | Inspect or change the shell working directory. |
 | `ls [DIR]` | List a directory, marking child directories with `/`. |
@@ -448,12 +507,12 @@ another. `make disassemble` writes an annotated disassembly to
 ROSE currently targets one hart and one QEMU `virt` platform. Shell redirection
 is limited to the three standard descriptors and has no descriptor-close
 syntax; parameter expansion does not yet perform field splitting, pathname or
-command expansion, and the shell has no `bg` command, session management, or
-scripting language. The ext2 implementation is synchronous,
-write-through, limited to one block group and direct plus singly indirect block
-addressing (268 KiB files), and does not yet provide journaling or crash
-recovery. The VirtIO queue is polled synchronously; it is not yet connected to
-a scheduler completion channel. Signals do not yet have masks, alternate
+command expansion, and the shell has no general scripting language. The ext2
+implementation is synchronous, write-through, limited to one block group and
+direct plus singly indirect block addressing (268 KiB files), and does not yet
+provide journaling or crash recovery. VirtIO block completion is polled
+synchronously; it is not yet connected to a scheduler completion channel.
+Signals do not yet have masks, alternate
 stacks, or realtime queues. Anonymous mappings use a fixed
 thirty-two-entry VMA table and do not yet support file backing, shared mappings,
 or fixed addresses. Networking currently targets QEMU's fixed user-network
