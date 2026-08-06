@@ -81,29 +81,341 @@ static bool write_all(int descriptor, const char *buffer, size_t length) {
         return true;
 }
 
-/* PID 1 remains resident while the interactive shell runs. Keeping init as
- * the shell's parent gives the process hierarchy a stable userspace root and
- * lets init reap the shell before returning control to the kernel. */
-static int run_init(void) {
-        print("ROSE init: writable disk root online\n");
+static bool strings_equal(const char *left, const char *right);
 
-        char *arguments[] = {"/bin/sh", NULL};
-        char *environment[] = {"HOME=/", "PATH=/bin:/sbin", "TERM=rose", NULL};
-        long shell_pid = rose_spawn("/bin/sh", arguments, environment);
+enum init_target {
+        INIT_TARGET_TEXT,
+        INIT_TARGET_GRAPHICAL,
+};
 
-        if (shell_pid < 0) {
-                print("ROSE init: unable to start /bin/sh\n");
-                return 1;
+enum {
+        INIT_CONFIG_LIMIT = 256,
+};
+
+static bool init_span_equals(const char *text, size_t length,
+                             const char *expected) {
+        size_t index = 0U;
+
+        while (index < length && expected[index] != '\0' &&
+               text[index] == expected[index]) {
+                index++;
+        }
+        return index == length && expected[index] == '\0';
+}
+
+static bool init_boot_option_present(const char *options,
+                                     const char *expected) {
+        size_t offset = 0U;
+
+        while (options[offset] != '\0') {
+                while (options[offset] == ' ' || options[offset] == '\t' ||
+                       options[offset] == '\n') {
+                        offset++;
+                }
+                size_t start = offset;
+                while (options[offset] != '\0' && options[offset] != ' ' &&
+                       options[offset] != '\t' && options[offset] != '\n') {
+                        offset++;
+                }
+                if (init_span_equals(&options[start], offset - start,
+                                     expected)) {
+                        return true;
+                }
+        }
+        return false;
+}
+
+/* An absent or malformed configuration fails safe to the serial text target.
+ * The installed image explicitly opts into the graphical default. */
+static enum init_target init_configured_target(void) {
+        char config[INIT_CONFIG_LIMIT];
+        long descriptor = rose_open("/etc/rose-init.conf", USER_OPEN_READ);
+
+        if (descriptor < 0) {
+                print("ROSE init: target configuration unavailable; using "
+                      "text target\n");
+                return INIT_TARGET_TEXT;
         }
 
+        long count = rose_read((int)descriptor, config, sizeof(config) - 1U);
+        (void)rose_close((int)descriptor);
+        if (count < 0) {
+                print("ROSE init: target configuration unreadable; using "
+                      "text target\n");
+                return INIT_TARGET_TEXT;
+        }
+        config[(size_t)count] = '\0';
+
+        size_t offset = 0U;
+        while (offset < (size_t)count) {
+                size_t start = offset;
+                while (offset < (size_t)count && config[offset] != '\n') {
+                        offset++;
+                }
+                size_t end = offset;
+                if (offset < (size_t)count) offset++;
+
+                while (start < end &&
+                       (config[start] == ' ' || config[start] == '\t')) {
+                        start++;
+                }
+                while (end > start &&
+                       (config[end - 1U] == ' ' ||
+                        config[end - 1U] == '\t' ||
+                        config[end - 1U] == '\r')) {
+                        end--;
+                }
+                if (start == end || config[start] == '#') continue;
+                if (init_span_equals(&config[start], end - start,
+                                     "target=graphical")) {
+                        return INIT_TARGET_GRAPHICAL;
+                }
+                if (init_span_equals(&config[start], end - start,
+                                     "target=text")) {
+                        return INIT_TARGET_TEXT;
+                }
+        }
+
+        print("ROSE init: no valid target in configuration; using text "
+              "target\n");
+        return INIT_TARGET_TEXT;
+}
+
+static long init_spawn_rescue_shell(void) {
+        char *arguments[] = {"/bin/sh", NULL};
+        char *environment[] = {"HOME=/", "PATH=/bin:/sbin", "TERM=rose",
+                               NULL};
+        return rose_spawn("/bin/sh", arguments, environment);
+}
+
+static long init_spawn_desktop(void) {
+        char *arguments[] = {"/bin/desktop", "--session", NULL};
+        char *environment[] = {"HOME=/", "PATH=/bin:/sbin", "TERM=rose",
+                               NULL};
+        long pid = rose_spawn("/bin/desktop", arguments, environment);
+
+        if (pid >= 0 && rose_setpgid(pid, pid) < 0) {
+                (void)rose_kill(pid, USER_SIGNAL_KILL);
+                (void)rose_waitpid(pid, NULL, 0U);
+                return -1;
+        }
+        return pid;
+}
+
+static int init_wait_for_text_target(long shell_pid) {
         int status = 0;
+
         if (rose_waitpid(shell_pid, &status, 0U) != shell_pid ||
             !USER_WAIT_STATUS_EXITED(status)) {
-                print("ROSE init: unable to reap /bin/sh\n");
+                print("ROSE init: unable to reap serial rescue shell\n");
                 return 1;
         }
-
         return (int)USER_WAIT_STATUS_EXIT_CODE(status);
+}
+
+static int init_run_text_target(void) {
+        print("ROSE init: starting text target (serial rescue shell)\n");
+        long shell_pid = init_spawn_rescue_shell();
+
+        if (shell_pid < 0) {
+                print("ROSE init: unable to start serial rescue shell\n");
+                return 1;
+        }
+        return init_wait_for_text_target(shell_pid);
+}
+
+static void init_terminate_process_tree(long root_pid,
+                                        long root_process_group);
+
+static void init_stop_rescue_shell(long shell_pid) {
+        if (shell_pid < 0) return;
+
+        init_terminate_process_tree(shell_pid, shell_pid);
+        (void)rose_waitpid(shell_pid, NULL, 0U);
+}
+
+static void init_report_graphical_failure(int status, bool spawn_failed) {
+        if (spawn_failed) {
+                print("ROSE init: /bin/desktop could not be started\n");
+        } else if (USER_WAIT_STATUS_SIGNALED(status)) {
+                print("ROSE init: graphical session terminated by a signal\n");
+        } else {
+                print("ROSE init: graphical session exited unsuccessfully\n");
+        }
+}
+
+/* Snapshot an entire session tree before stopping it. Graphical terminals and
+ * shell jobs create separate process groups or sessions, so group signaling
+ * alone could otherwise leave invisible PID-0 orphans behind. */
+static void init_terminate_process_tree(long root_pid,
+                                        long root_process_group) {
+        static struct user_process_info processes[USER_PROCESS_INFO_LIMIT];
+        static bool selected[USER_PROCESS_INFO_LIMIT];
+        long count = rose_process_list(processes, USER_PROCESS_INFO_LIMIT);
+
+        if (count < 0) {
+                if (root_process_group > 0) {
+                        (void)rose_kill(-root_process_group, USER_SIGNAL_KILL);
+                }
+                if (root_pid > 0) {
+                        (void)rose_kill(root_pid, USER_SIGNAL_KILL);
+                }
+                return;
+        }
+
+        for (long index = 0; index < count; index++) {
+                selected[index] =
+                    processes[index].pid == (uint64_t)root_pid ||
+                    processes[index].process_group ==
+                        (uint64_t)root_process_group;
+        }
+        bool changed;
+        do {
+                changed = false;
+                for (long child = 0; child < count; child++) {
+                        if (selected[child]) continue;
+                        for (long parent = 0; parent < count; parent++) {
+                                if (selected[parent] &&
+                                    processes[child].parent_pid ==
+                                        processes[parent].pid) {
+                                        selected[child] = true;
+                                        changed = true;
+                                        break;
+                                }
+                        }
+                }
+        } while (changed);
+
+        for (long index = count; index != 0; index--) {
+                if (selected[index - 1]) {
+                        (void)rose_kill((int64_t)processes[index - 1].pid,
+                                       USER_SIGNAL_KILL);
+                }
+        }
+}
+
+/* The graphical target retains a separate serial shell throughout the GUI
+ * session. A failed compositor is restarted exactly once; a second failure
+ * leaves that shell as a diagnostic text target instead of boot-looping. */
+static int init_run_graphical_target(void) {
+        print("ROSE init: starting graphical target with serial rescue shell\n");
+        long shell_pid = init_spawn_rescue_shell();
+        if (shell_pid < 0) {
+                print("ROSE init: graphical target requires a serial rescue "
+                      "shell; falling back to text target\n");
+                return init_run_text_target();
+        }
+
+        long desktop_pid = -1;
+        unsigned int failure_count = 0U;
+        bool diagnostic_text = false;
+
+        while (true) {
+                if (desktop_pid < 0 && !diagnostic_text) {
+                        desktop_pid = init_spawn_desktop();
+                        if (desktop_pid < 0) {
+                                failure_count++;
+                                init_report_graphical_failure(0, true);
+                                if (failure_count == 1U) {
+                                        print("ROSE init: restarting graphical "
+                                              "session once\n");
+                                        continue;
+                                }
+                                diagnostic_text = true;
+                                print("ROSE init: graphical session failed "
+                                      "twice; diagnostic text session is "
+                                      "active\n");
+                                print("ROSE init: run 'desktop --session' to "
+                                      "retry manually\n");
+                        }
+                }
+
+                int status = 0;
+                long waited_pid = rose_waitpid(-1, &status, 0U);
+                if (waited_pid < 0) {
+                        print("ROSE init: unable to supervise session "
+                              "processes\n");
+                        init_stop_rescue_shell(shell_pid);
+                        return 1;
+                }
+                if (waited_pid == shell_pid) {
+                        if (diagnostic_text || desktop_pid < 0) {
+                                if (!USER_WAIT_STATUS_EXITED(status)) return 1;
+                                return (int)USER_WAIT_STATUS_EXIT_CODE(status);
+                        }
+                        print("ROSE init: serial rescue shell ended; "
+                              "restarting it\n");
+                        shell_pid = init_spawn_rescue_shell();
+                        if (shell_pid < 0) {
+                                print("ROSE init: unable to retain serial "
+                                      "rescue shell\n");
+                                init_terminate_process_tree(-1, desktop_pid);
+                                return 1;
+                        }
+                        continue;
+                }
+                if (waited_pid != desktop_pid) {
+                        /* Reap a client orphaned by a compositor crash. */
+                        continue;
+                }
+
+                long failed_desktop_pid = desktop_pid;
+                desktop_pid = -1;
+                if (USER_WAIT_STATUS_EXITED(status) &&
+                    (USER_WAIT_STATUS_EXIT_CODE(status) ==
+                         USER_SYSTEM_ACTION_SHUTDOWN ||
+                     USER_WAIT_STATUS_EXIT_CODE(status) ==
+                         USER_SYSTEM_ACTION_RESTART)) {
+                        uint32_t action =
+                            USER_WAIT_STATUS_EXIT_CODE(status);
+                        print(action == USER_SYSTEM_ACTION_RESTART
+                                  ? "ROSE init: system restart requested\n"
+                                  : "ROSE init: system shutdown requested\n");
+                        init_stop_rescue_shell(shell_pid);
+                        return (int)action;
+                }
+
+                /* Clients inherit the compositor's process group. Ensure an
+                 * abrupt compositor death does not leak an invisible session. */
+                init_terminate_process_tree(-1, failed_desktop_pid);
+                failure_count++;
+                init_report_graphical_failure(status, false);
+                if (failure_count == 1U) {
+                        print("ROSE init: restarting graphical session once\n");
+                } else {
+                        diagnostic_text = true;
+                        print("ROSE init: graphical session failed twice; "
+                              "diagnostic text session is active\n");
+                        print("ROSE init: run 'desktop --session' to retry "
+                              "manually\n");
+                }
+        }
+}
+
+/* PID 1 selects a configured target, applies a firmware override, and remains
+ * resident until the machine is shut down, restarted, or enters recovery. */
+static int run_init(int argc, char **argv) {
+        print("ROSE init: writable disk root online\n");
+        enum init_target target = init_configured_target();
+        const char *boot_options = argc >= 2 ? argv[1] : "";
+
+        if (init_boot_option_present(boot_options, "rose.rescue=1") ||
+            init_boot_option_present(boot_options, "rose.target=text")) {
+                target = INIT_TARGET_TEXT;
+                print("ROSE init: boot override selected text target\n");
+        } else if (init_boot_option_present(boot_options,
+                                            "rose.target=graphical")) {
+                target = INIT_TARGET_GRAPHICAL;
+                print("ROSE init: boot override selected graphical target\n");
+        } else {
+                print(target == INIT_TARGET_GRAPHICAL
+                          ? "ROSE init: configuration selected graphical "
+                            "target\n"
+                          : "ROSE init: configuration selected text target\n");
+        }
+
+        return target == INIT_TARGET_GRAPHICAL ? init_run_graphical_target()
+                                               : init_run_text_target();
 }
 
 static void preemption_delay(void) {
@@ -113,8 +425,6 @@ static void preemption_delay(void) {
              remaining--) {
         }
 }
-
-static bool strings_equal(const char *left, const char *right);
 
 static int run_anonymous_mapping_test(void) {
         const size_t page_size = 4096U;
@@ -1953,7 +2263,7 @@ int user_main(int argc, char **argv,
                 return run_console_read();
 
         case USER_PROGRAM_INIT:
-                return run_init();
+                return run_init(argc, argv);
 
         case USER_PROGRAM_FS_TEST:
                 return run_filesystem_test();

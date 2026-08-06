@@ -397,6 +397,13 @@ struct user_process_info {
         char name[USER_PROCESS_NAME_MAX];
 };
 
+/* Reserved process exit values used by the desktop-to-init machine lifecycle
+ * protocol. Ordinary programs may still return any 8-bit status. */
+enum user_system_action_status {
+        USER_SYSTEM_ACTION_SHUTDOWN = 64,
+        USER_SYSTEM_ACTION_RESTART = 65,
+};
+
 enum user_standard_file_descriptor {
         USER_STDIN_FILENO = 0,
         USER_STDOUT_FILENO = 1,

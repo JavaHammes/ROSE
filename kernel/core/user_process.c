@@ -346,14 +346,16 @@ static void process_release_shared_memory(struct process *process) {
         }
 }
 
-static void graphics_release_if_owned(uint64_t pid) {
+static void graphics_release_if_owned(uint64_t pid, bool restore_console) {
         if (pid == 0U || graphics_owner_pid != pid) {
                 return;
         }
         graphics_owner_pid = 0U;
         input_event_clear();
         input_set_console_captured(false);
-        graphics_console_init();
+        if (restore_console) {
+                graphics_console_init();
+        }
 }
 
 static void process_terminal_set_defaults(struct process_terminal *terminal,
@@ -2622,7 +2624,7 @@ static void process_commit_replacement(struct trap_frame *frame) {
         uintptr_t old_heap_start = active_process->heap_start;
         uintptr_t old_heap_break = active_process->heap_break;
 
-        graphics_release_if_owned(active_process->pid);
+        graphics_release_if_owned(active_process->pid, true);
         process_release_shared_memory(active_process);
         page_table_activate(new_address_space);
         process_release_anonymous_mappings(active_process);
@@ -5060,7 +5062,11 @@ static void user_process_finish(struct trap_frame *frame, uint64_t status) {
                 panic_trap("Invalid user process return state", frame);
         }
 
-        graphics_release_if_owned(active_process->pid);
+        bool restore_graphics_console =
+            status != USER_SYSTEM_ACTION_SHUTDOWN &&
+            status != USER_SYSTEM_ACTION_RESTART;
+        graphics_release_if_owned(active_process->pid,
+                                  restore_graphics_console);
         if (uart_write_owner == active_process) {
                 uart_write_owner = NULL;
                 (void)scheduler_wake_all(SCHEDULER_WAIT_UART_TX);
@@ -5390,19 +5396,23 @@ size_t user_process_reap_exited(void) {
 }
 
 /* Spawn the boot executable and run userspace until it exits. */
-void user_process_run_path(const char *path,
-                           const struct user_process_startup *startup) {
+uint64_t user_process_run_path(const char *path,
+                               const struct user_process_startup *startup) {
         uint64_t pid;
 
         if (!user_process_spawn(path, startup, &pid)) {
                 uart_puts("Unable to load program: ");
                 uart_puts(path);
                 uart_putc('\n');
-                return;
+                return UINT64_MAX;
         }
 
-        (void)pid;
         (void)scheduler_run_ready();
+        const struct process *initial_process = process_find_pid(pid);
+        return initial_process != NULL &&
+                       initial_process->state == PROCESS_EXITED
+                   ? initial_process->exit_status
+                   : UINT64_MAX;
 }
 
 bool user_process_is_active(void) {

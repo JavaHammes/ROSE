@@ -82,11 +82,12 @@ struct desktop {
         struct rose_gui_widget ui_root;
         struct rose_gui_widget panel;
         struct rose_gui_widget launcher;
-        struct rose_gui_widget panel_exit;
+        struct rose_gui_widget panel_power;
         struct rose_gui_widget menu;
-        struct rose_gui_widget exit_dialog;
-        struct rose_gui_widget exit_yes;
-        struct rose_gui_widget exit_no;
+        struct rose_gui_widget power_dialog;
+        struct rose_gui_widget power_shutdown;
+        struct rose_gui_widget power_restart;
+        struct rose_gui_widget power_cancel;
         struct desktop_window windows[WINDOW_LIMIT];
         size_t window_count;
         int32_t pointer_x;
@@ -103,6 +104,7 @@ struct desktop {
         struct rectangle dirty;
         bool has_dirty;
         bool exiting;
+        int exit_status;
         bool compact_surfaces;
 };
 
@@ -212,6 +214,28 @@ static void fill_rectangle(struct desktop *desktop, int32_t x, int32_t y,
 static void draw_text(struct desktop *desktop, int32_t x, int32_t y,
                       const char *text, uint32_t color, uint32_t scale) {
         rose_gui_canvas_text(&desktop->canvas, x, y, text, color, scale);
+}
+
+/* Keep machine transitions legible even when normal desktop resources fail to
+ * load. This uses only the already mapped framebuffer and built-in colors. */
+static bool show_lifecycle_screen(struct desktop *desktop, const char *title,
+                                  const char *detail, uint32_t background) {
+        const uint32_t title_scale = 5U;
+        int32_t title_width =
+            (int32_t)(string_length(title) * 6U * title_scale);
+        int32_t detail_width = (int32_t)(string_length(detail) * 6U);
+        int32_t center_y = (int32_t)desktop->graphics.height / 2;
+
+        fill_rectangle(desktop, 0, 0, (int32_t)desktop->graphics.width,
+                       (int32_t)desktop->graphics.height, background);
+        draw_text(desktop,
+                  ((int32_t)desktop->graphics.width - title_width) / 2,
+                  center_y - 48, title, UINT32_C(0x00f2f5f8), title_scale);
+        draw_text(desktop,
+                  ((int32_t)desktop->graphics.width - detail_width) / 2,
+                  center_y + 18, detail, UINT32_C(0x009ba9b8), 1U);
+        return rose_graphics_flush(0U, 0U, desktop->graphics.width,
+                                   desktop->graphics.height) == 0;
 }
 
 static void draw_background(struct desktop *desktop) {
@@ -1103,44 +1127,70 @@ static void launcher_action(struct rose_gui_widget *widget,
         invalidate_desktop(desktop);
 }
 
+static void show_desktop_dialog(struct desktop *desktop, const char *message,
+                                bool power_options);
+
 static void menu_action(struct rose_gui_widget *widget,
                         enum rose_gui_widget_action action, void *user_data) {
         if (action != ROSE_GUI_ACTION_SELECT) return;
         struct desktop *desktop = user_data;
-        (void)launch_catalog_app(desktop, widget->selected_index);
+        bool launched =
+            launch_catalog_app(desktop, widget->selected_index);
         widget->state |= ROSE_GUI_STATE_HIDDEN;
-        rose_gui_ui_focus(&desktop->ui, &desktop->launcher);
-        invalidate_desktop(desktop);
-}
-
-static void exit_button_action(struct rose_gui_widget *widget,
-                               enum rose_gui_widget_action action,
-                               void *user_data) {
-        if (action != ROSE_GUI_ACTION_ACTIVATE) return;
-        struct desktop *desktop = user_data;
-        if (widget == &desktop->exit_yes) {
-                desktop->exiting = true;
+        if (!launched) {
+                show_desktop_dialog(desktop,
+                                    "APPLICATION FAILED TO START", false);
         } else {
-                desktop->exit_dialog.state |= ROSE_GUI_STATE_HIDDEN;
                 rose_gui_ui_focus(&desktop->ui, &desktop->launcher);
                 invalidate_desktop(desktop);
         }
 }
 
-static void show_exit_dialog(struct desktop *desktop) {
+static void power_button_action(struct rose_gui_widget *widget,
+                                enum rose_gui_widget_action action,
+                                void *user_data) {
+        if (action != ROSE_GUI_ACTION_ACTIVATE) return;
+        struct desktop *desktop = user_data;
+        if (widget == &desktop->power_shutdown) {
+                desktop->exiting = true;
+                desktop->exit_status = USER_SYSTEM_ACTION_SHUTDOWN;
+        } else if (widget == &desktop->power_restart) {
+                desktop->exiting = true;
+                desktop->exit_status = USER_SYSTEM_ACTION_RESTART;
+        } else {
+                desktop->power_dialog.state |= ROSE_GUI_STATE_HIDDEN;
+                rose_gui_ui_focus(&desktop->ui, &desktop->launcher);
+                invalidate_desktop(desktop);
+        }
+}
+
+static void show_desktop_dialog(struct desktop *desktop, const char *message,
+                                bool power_options) {
         desktop->menu.state |= ROSE_GUI_STATE_HIDDEN;
-        desktop->exit_dialog.state &= ~ROSE_GUI_STATE_HIDDEN;
+        desktop->power_dialog.text = message;
+        desktop->power_dialog.state &= ~ROSE_GUI_STATE_HIDDEN;
+        if (power_options) {
+                desktop->power_shutdown.state &= ~ROSE_GUI_STATE_HIDDEN;
+                desktop->power_restart.state &= ~ROSE_GUI_STATE_HIDDEN;
+        } else {
+                desktop->power_shutdown.state |= ROSE_GUI_STATE_HIDDEN;
+                desktop->power_restart.state |= ROSE_GUI_STATE_HIDDEN;
+        }
         desktop->ui_keyboard_active = true;
-        rose_gui_ui_focus(&desktop->ui, &desktop->exit_no);
+        rose_gui_ui_focus(&desktop->ui, &desktop->power_cancel);
         invalidate_desktop(desktop);
 }
 
-static void panel_exit_action(struct rose_gui_widget *widget,
-                              enum rose_gui_widget_action action,
-                              void *user_data) {
+static void show_power_dialog(struct desktop *desktop) {
+        show_desktop_dialog(desktop, "POWER OPTIONS", true);
+}
+
+static void panel_power_action(struct rose_gui_widget *widget,
+                               enum rose_gui_widget_action action,
+                               void *user_data) {
         (void)widget;
         if (action == ROSE_GUI_ACTION_ACTIVATE)
-                show_exit_dialog(user_data);
+                show_power_dialog(user_data);
 }
 
 static void build_desktop_ui(struct desktop *desktop) {
@@ -1166,14 +1216,14 @@ static void build_desktop_ui(struct desktop *desktop) {
         desktop->launcher.user_data = desktop;
         rose_gui_widget_add(&desktop->ui_root, &desktop->launcher);
 
-        rose_gui_widget_initialize(&desktop->panel_exit,
-                                   ROSE_GUI_WIDGET_BUTTON, "EXIT");
-        desktop->panel_exit.flags |= ROSE_GUI_WIDGET_ABSOLUTE;
-        desktop->panel_exit.bounds = (struct rose_gui_rectangle){
+        rose_gui_widget_initialize(&desktop->panel_power,
+                                   ROSE_GUI_WIDGET_BUTTON, "POWER");
+        desktop->panel_power.flags |= ROSE_GUI_WIDGET_ABSOLUTE;
+        desktop->panel_power.bounds = (struct rose_gui_rectangle){
             (int32_t)desktop->graphics.width - 70, 12, 58, 30};
-        desktop->panel_exit.callback = panel_exit_action;
-        desktop->panel_exit.user_data = desktop;
-        rose_gui_widget_add(&desktop->ui_root, &desktop->panel_exit);
+        desktop->panel_power.callback = panel_power_action;
+        desktop->panel_power.user_data = desktop;
+        rose_gui_widget_add(&desktop->ui_root, &desktop->panel_power);
 
         for (size_t index = 0U; index < desktop->catalog.count; index++) {
                 const struct rose_gui_app_metadata *app =
@@ -1193,30 +1243,36 @@ static void build_desktop_ui(struct desktop *desktop) {
         desktop->menu.user_data = desktop;
         rose_gui_widget_add(&desktop->ui_root, &desktop->menu);
 
-        rose_gui_widget_initialize(&desktop->exit_dialog,
-                                   ROSE_GUI_WIDGET_DIALOG,
-                                   "EXIT THE ROSE DESKTOP?");
-        desktop->exit_dialog.flags |= ROSE_GUI_WIDGET_ABSOLUTE;
-        desktop->exit_dialog.padding = 38U;
-        desktop->exit_dialog.gap = 10U;
-        desktop->exit_dialog.bounds = (struct rose_gui_rectangle){
-            ((int32_t)desktop->graphics.width - 280) / 2,
-            ((int32_t)desktop->graphics.height - 160) / 2, 280, 160};
-        desktop->exit_dialog.state |= ROSE_GUI_STATE_HIDDEN;
+        rose_gui_widget_initialize(&desktop->power_dialog,
+                                   ROSE_GUI_WIDGET_DIALOG, "POWER OPTIONS");
+        desktop->power_dialog.flags |= ROSE_GUI_WIDGET_ABSOLUTE;
+        desktop->power_dialog.padding = 38U;
+        desktop->power_dialog.gap = 10U;
+        desktop->power_dialog.bounds = (struct rose_gui_rectangle){
+            ((int32_t)desktop->graphics.width - 330) / 2,
+            ((int32_t)desktop->graphics.height - 160) / 2, 330, 160};
+        desktop->power_dialog.state |= ROSE_GUI_STATE_HIDDEN;
 
-        rose_gui_widget_initialize(&desktop->exit_yes,
-                                   ROSE_GUI_WIDGET_BUTTON, "EXIT");
-        rose_gui_widget_initialize(&desktop->exit_no, ROSE_GUI_WIDGET_BUTTON,
-                                   "CANCEL");
-        rose_gui_widget_set_flex(&desktop->exit_yes, 1U);
-        rose_gui_widget_set_flex(&desktop->exit_no, 1U);
-        desktop->exit_yes.callback = exit_button_action;
-        desktop->exit_no.callback = exit_button_action;
-        desktop->exit_yes.user_data = desktop;
-        desktop->exit_no.user_data = desktop;
-        rose_gui_widget_add(&desktop->exit_dialog, &desktop->exit_yes);
-        rose_gui_widget_add(&desktop->exit_dialog, &desktop->exit_no);
-        rose_gui_widget_add(&desktop->ui_root, &desktop->exit_dialog);
+        rose_gui_widget_initialize(&desktop->power_shutdown,
+                                   ROSE_GUI_WIDGET_BUTTON, "SHUT DOWN");
+        rose_gui_widget_initialize(&desktop->power_restart,
+                                   ROSE_GUI_WIDGET_BUTTON, "RESTART");
+        rose_gui_widget_initialize(&desktop->power_cancel,
+                                   ROSE_GUI_WIDGET_BUTTON, "CANCEL");
+        rose_gui_widget_set_flex(&desktop->power_shutdown, 1U);
+        rose_gui_widget_set_flex(&desktop->power_restart, 1U);
+        rose_gui_widget_set_flex(&desktop->power_cancel, 1U);
+        desktop->power_shutdown.callback = power_button_action;
+        desktop->power_restart.callback = power_button_action;
+        desktop->power_cancel.callback = power_button_action;
+        desktop->power_shutdown.user_data = desktop;
+        desktop->power_restart.user_data = desktop;
+        desktop->power_cancel.user_data = desktop;
+        rose_gui_widget_add(&desktop->power_dialog,
+                            &desktop->power_shutdown);
+        rose_gui_widget_add(&desktop->power_dialog, &desktop->power_restart);
+        rose_gui_widget_add(&desktop->power_dialog, &desktop->power_cancel);
+        rose_gui_widget_add(&desktop->ui_root, &desktop->power_dialog);
 
         rose_gui_ui_initialize(&desktop->ui, &desktop->canvas,
                                &desktop->theme, &desktop->ui_root);
@@ -1322,6 +1378,8 @@ static bool handle_window_keyboard(struct desktop *desktop,
 
 int rose_desktop_main(int argc, char **argv) {
         static struct desktop desktop;
+        bool session_mode =
+            argc == 2 && strings_equal(argv[1], "--session");
         zero_bytes(&desktop, sizeof(desktop));
         desktop.compact_surfaces =
             argc == 2 && strings_equal(argv[1], "--stress");
@@ -1343,13 +1401,29 @@ int rose_desktop_main(int argc, char **argv) {
                                    desktop.graphics.width,
                                    desktop.graphics.height,
                                    desktop.pixel_stride);
+        if (session_mode &&
+            !show_lifecycle_screen(&desktop, "ROSE", "STARTING SYSTEM",
+                                   UINT32_C(0x000c1828))) {
+                return 2;
+        }
         if (!rose_gui_theme_load(&desktop.theme, "/share/gui/theme.conf")) {
                 print("desktop: theme resource unavailable\n");
+                if (session_mode) {
+                        (void)show_lifecycle_screen(
+                            &desktop, "ROSE", "STARTUP FAILED: THEME MISSING",
+                            UINT32_C(0x002b1118));
+                }
                 return 1;
         }
         if (!rose_gui_app_catalog_load(&desktop.catalog,
                                        "/share/gui/apps.conf")) {
                 print("desktop: application metadata unavailable\n");
+                if (session_mode) {
+                        (void)show_lifecycle_screen(
+                            &desktop, "ROSE",
+                            "STARTUP FAILED: APPLICATION DATA MISSING",
+                            UINT32_C(0x002b1118));
+                }
                 return 1;
         }
         desktop.input_context.width = desktop.graphics.width;
@@ -1398,18 +1472,20 @@ int rose_desktop_main(int argc, char **argv) {
                                         desktop.alt = pressed;
                                 }
                                 if (event.value == 1U && desktop.control &&
-                                    desktop.alt && event.code == KEY_ESCAPE) {
-                                        desktop.exiting = true;
-                                } else if (event.value == 1U &&
-                                           desktop.control && desktop.alt &&
-                                           event.code == KEY_Q) {
-                                        show_exit_dialog(&desktop);
+                                    desktop.alt &&
+                                    (event.code == KEY_ESCAPE ||
+                                     event.code == KEY_Q)) {
+                                        show_power_dialog(&desktop);
                                 } else if (event.value == 1U &&
                                            desktop.control && desktop.alt &&
                                            event.code == KEY_T) {
                                         if (!launch_terminal(&desktop)) {
                                                 print("desktop: unable to open "
                                                       "terminal\n");
+                                                show_desktop_dialog(
+                                                    &desktop,
+                                                    "TERMINAL FAILED TO START",
+                                                    false);
                                         }
                                 } else if (event.value == 1U &&
                                            desktop.control && desktop.alt &&
@@ -1430,7 +1506,7 @@ int rose_desktop_main(int argc, char **argv) {
                                                 (int32_t)desktop.graphics.width,
                                                 PANEL_HEIGHT});
                                 } else if (
-                                    (desktop.exit_dialog.state &
+                                    (desktop.power_dialog.state &
                                      ROSE_GUI_STATE_HIDDEN) == 0U) {
                                         (void)rose_gui_ui_handle_event(
                                             &desktop.ui,
@@ -1483,6 +1559,15 @@ int rose_desktop_main(int argc, char **argv) {
                         return 6;
                 }
         }
+        if (desktop.exit_status == USER_SYSTEM_ACTION_RESTART) {
+                (void)show_lifecycle_screen(
+                    &desktop, "ROSE", "RESTARTING SYSTEM",
+                    UINT32_C(0x000c1828));
+        } else if (desktop.exit_status == USER_SYSTEM_ACTION_SHUTDOWN) {
+                (void)show_lifecycle_screen(
+                    &desktop, "ROSE", "SHUTTING DOWN APPLICATIONS",
+                    UINT32_C(0x00090f18));
+        }
         close_windows(&desktop);
-        return 0;
+        return desktop.exit_status;
 }

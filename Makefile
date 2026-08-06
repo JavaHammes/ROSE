@@ -221,7 +221,7 @@ QEMU_GUI_FLAGS := \
 all: $(KERNEL) $(ROOT_IMAGE)
 
 
-$(ROOT_IMAGE): tools/mkrosefs.py assets/font5x7.hex assets/gui-theme.conf assets/gui-icons.txt assets/gui-apps.conf assets/roserc $(USER_LOAD_ELFS) Makefile
+$(ROOT_IMAGE): tools/mkrosefs.py assets/font5x7.hex assets/gui-theme.conf assets/gui-icons.txt assets/gui-apps.conf assets/rose-init.conf assets/roserc $(USER_LOAD_ELFS) Makefile
 	@mkdir -p $(dir $@)
 	$(PYTHON) tools/mkrosefs.py $@ \
 		--file /bin/hello=$(BUILD_DIR)/user/hello/program.load.elf \
@@ -260,6 +260,7 @@ $(ROOT_IMAGE): tools/mkrosefs.py assets/font5x7.hex assets/gui-theme.conf assets
 		--file /bin/kill=$(BUILD_DIR)/user/kill/program.load.elf \
 		--file /bin/sleep=$(BUILD_DIR)/user/sleep/program.load.elf \
 		--file /bin/ps=$(BUILD_DIR)/user/ps/program.load.elf \
+		--file /etc/rose-init.conf=assets/rose-init.conf \
 		--file /etc/roserc=assets/roserc \
 		--file /share/font5x7.hex=assets/font5x7.hex \
 		--file /share/gui/theme.conf=assets/gui-theme.conf \
@@ -350,6 +351,11 @@ run: $(KERNEL) $(RUN_ROOT_IMAGE)
 .PHONY: run-gui
 run-gui: $(KERNEL) $(RUN_ROOT_IMAGE)
 	$(QEMU) $(QEMU_GUI_FLAGS)
+
+
+.PHONY: run-rescue
+run-rescue: $(KERNEL) $(RUN_ROOT_IMAGE)
+	$(QEMU) $(QEMU_FLAGS) -append rose.rescue=1
 
 
 .PHONY: debug

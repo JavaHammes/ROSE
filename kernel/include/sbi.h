@@ -15,5 +15,6 @@ struct sbi_ret sbi_call(unsigned long extension_id, unsigned long function_id,
 
 long sbi_set_timer(uint64_t deadline);
 long sbi_shutdown(void);
+long sbi_reboot(void);
 
 #endif

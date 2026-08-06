@@ -8,6 +8,9 @@
 /* Parse the firmware-provided DTB. Must run before memory and driver setup. */
 void platform_init(const void *device_tree);
 
+/* Firmware supplies kernel command-line options through /chosen/bootargs. */
+const char *platform_boot_arguments(void);
+
 /* Discovered RAM is represented as one half-open physical range. */
 uintptr_t platform_ram_start(void);
 uintptr_t platform_ram_end(void);

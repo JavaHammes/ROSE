@@ -26,10 +26,11 @@
 #define SBI_FID_SYSTEM_RESET 0UL
 
 /*
- * A reset type of zero requests shutdown. A reset reason of zero means that
- * no specific failure caused the shutdown.
+ * Reset type zero requests shutdown and type one requests a cold reboot. A
+ * reset reason of zero means that no specific failure caused the reset.
  */
 #define SBI_RESET_TYPE_SHUTDOWN 0UL
+#define SBI_RESET_TYPE_COLD_REBOOT 1UL
 #define SBI_RESET_REASON_NONE 0UL
 
 /*
@@ -107,6 +108,15 @@ long sbi_shutdown(void) {
         struct sbi_ret result = sbi_call(
             SBI_EXT_SYSTEM_RESET, SBI_FID_SYSTEM_RESET, SBI_RESET_TYPE_SHUTDOWN,
             SBI_RESET_REASON_NONE, 0, 0, 0, 0);
+
+        return result.error;
+}
+
+/* Restart all harts and platform components through the same SRST extension. */
+long sbi_reboot(void) {
+        struct sbi_ret result = sbi_call(
+            SBI_EXT_SYSTEM_RESET, SBI_FID_SYSTEM_RESET,
+            SBI_RESET_TYPE_COLD_REBOOT, SBI_RESET_REASON_NONE, 0, 0, 0, 0);
 
         return result.error;
 }

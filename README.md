@@ -145,9 +145,13 @@ programs in user mode.
   parent/child ownership, orphan adoption by PID 0, waiting, reaping, typed
   block/wake channels, per-process monotonic deadlines, and an interruptible
   idle path with an atomic interrupt-masked readiness check. On a disk-root
-  boot, `/sbin/init` remains PID 1 while its `/bin/sh` child is running.
+  boot, `/sbin/init` remains PID 1, selects the configured text or graphical
+  target, and supervises its session. The graphical target retains a serial
+  rescue shell, restarts a failed compositor once, then falls back to that
+  shell with a diagnostic instead of boot-looping.
 - Interrupt-driven UART input, PLIC external interrupts, SBI timers, panic
-  diagnostics, and clean shutdown after the userspace shell exits.
+  diagnostics, firmware boot-argument forwarding, and clean SBI power-off and
+  cold-restart paths selected by PID 1.
 - Automated QEMU tests at two RAM sizes, including leak detection.
 
 At idle, the kernel uses five physical pages for its Sv39 tables on the default
@@ -205,20 +209,30 @@ For the graphical machine, launch QEMU with the GPU, keyboard, and tablet:
 make run-gui
 ```
 
-The shell is visible in both the QEMU window and the serial terminal. Run
-`desktop` to enter an empty userspace desktop, then use the ROSE launcher to
-open applications. Terminal runs the same shell over a pseudo-terminal,
-Files browses directories, and System Monitor reads live kernel counters. Click
+The installed `/etc/rose-init.conf` selects the graphical target. A graphical
+startup screen transitions into a clean desktop without opening applications,
+while startup failures remain visible even if normal desktop resources cannot
+load. A separate rescue shell remains available on the serial terminal. Use
+`make run-rescue`, or add
+`-append rose.rescue=1` (equivalently `rose.target=text`) to a QEMU boot, to
+bypass the graphical session. Setting `target=text` in `/etc/rose-init.conf`
+changes the persistent default.
+
+Use the ROSE launcher to open applications. Terminal runs the shell over a
+pseudo-terminal, Files browses directories, and System Monitor reads live
+kernel counters. Click
 a window to focus it, drag its title bar, use the red control to close it, the
 yellow control to collapse or restore it, and the green control to enter or
 leave fullscreen. Drag the Terminal's accented lower-right corner to resize it.
 The matching keyboard paths are Alt+Tab, Alt+F7 plus arrows, Alt+F4, Alt+F9,
 Alt+F10, and Alt+F8 plus arrows. F6 focuses the launcher; Tab/Shift+Tab traverse
-its controls and Enter or Space activates them. The panel's Exit button opens
-a shared dialog (Ctrl+Alt+Q is its shortcut), and Escape dismisses menus and
-dialogs. Page Up/Page Down browse terminal history; typing jumps back to live
-output. Ctrl+Alt+T launches another independent terminal, and Ctrl+Alt+Escape
-returns directly to the serial shell.
+its controls and Enter or Space activates them. The panel's Power button offers
+Shut Down, Restart, and Cancel (Ctrl+Alt+Q is its shortcut), and Escape
+dismisses menus and dialogs. Page Up/Page Down browse terminal history; typing
+jumps back to live output. Ctrl+Alt+T launches another independent terminal,
+and Ctrl+Alt+Escape opens the power dialog. Shutdown and restart first close
+graphical applications and display a machine-transition screen; there is no
+logout action in this single-user system.
 
 ### Small GUI applications
 
@@ -244,8 +258,7 @@ return rose_gui_application_run(&app);
 See `user/gui_files.c` for list activation and `user/gui_monitor.c` for timed
 updates and custom content inside the same layout system.
 
-After `/sbin/init` launches `/bin/sh` and waits for it, the shell starts at
-`rose>`.
+The text target and serial rescue session start the shell at `rose>`.
 Useful commands are:
 
 | Command | Purpose |
@@ -268,7 +281,7 @@ Useful commands are:
 | `console-read` | Block a child until one byte arrives on standard input. |
 | `fs-test` | Exercise writable files, directories, stat, and seek. |
 | `pipe-test` | Exercise inherited descriptors and blocking anonymous pipes. |
-| `desktop` | Enter the multi-application desktop (Escape returns). |
+| `desktop --session` | Enter the multi-application desktop. |
 | `env` | Show environment variables inherited by new programs. |
 | `export NAME=VALUE` / `unset NAME` | Change inherited environment variables. |
 | `alias NAME='COMMAND'` / `unalias NAME` | Define or remove a command alias. |
@@ -278,7 +291,7 @@ Useful commands are:
 | `cp`, `mv`, `touch`, `head`, `wc`, `find`, `ps`, `sleep` | File, text, process, and timing utilities. |
 | `echo "$HOME ($$): $?"` | Expand environment, shell PID, and prior status parameters. |
 | `run [PATH [ARG...]]` | Compatibility alias; defaults to `/bin/hello`. |
-| `exit` | Shut QEMU down through SBI SRST. |
+| `exit` | Shut down the text target; the always-on rescue shell is restarted while the graphical session is active. |
 
 ## Verification
 
@@ -326,7 +339,9 @@ The same clean verification runs automatically on pushes and pull requests.
 The local pre-commit configuration formats C sources, runs static analysis,
 and executes host-side tests for changes in `tests/` or `tools/`.
 
-The smoke tests cover disk-root boot through `/sbin/init` into `/bin/sh`,
+The smoke tests cover disk-root boot through `/sbin/init`, configured-target
+selection, graphical failure restart and text fallback, explicit rescue boot,
+graphical power-menu input, a full firmware-backed reboot,
 userspace line parsing and built-ins, `PATH` execution, VirtIO-backed ext2
 mutation, directory utilities, input/output redirection, multi-stage pipelines,
 quote-aware environment, status, PID, and redirection-path expansion,
@@ -345,8 +360,9 @@ stop/continue wait events, Ctrl-C and Ctrl-Z foreground handling, background
 commands, `jobs`/`fg`, child creation and waiting, memory reclamation,
 fallback-ramfs shell boot,
 graphical transport discovery, userspace framebuffer mapping and flushing,
-automatic graphical console restoration, and clean shutdown. The graphical
-smoke test repeatedly opens and closes twelve simultaneous graphical terminals,
+automatic graphical console restoration, clean shutdown, and cold restart. The
+graphical smoke test repeatedly opens and closes twelve simultaneous graphical
+terminals,
 checks process and physical-page reclamation after every cycle, then boots and
 closes the normal three-client desktop. The terminal path was also verified
 with a shell command entered through its pseudo-terminal.
@@ -374,10 +390,14 @@ another. `make disassemble` writes an annotated disassembly to
 4. The kernel mounts its embedded diagnostic ramfs, negotiates the modern
    VirtIO-MMIO block device, validates ext2, and replaces the VFS root with the
    disk filesystem. `/dev/console` remains a VFS character-device overlay.
-5. `/sbin/init` is read from disk as the first user process, spawns `/bin/sh`,
-   and waits to reap it; the fallback ramfs starts `/bin/sh` directly. A process
-   resolving any later executable receives a private Sv39 root, user stack,
-   kernel trap stack, and pages populated from that ELF.
+5. `/sbin/init` is read from disk as the first user process. It reads
+   `/etc/rose-init.conf`, applies any `rose.target=` or `rose.rescue=1` firmware
+   override, and starts the selected target. The graphical target supervises
+   `/bin/desktop --session` alongside a serial rescue shell; after one failed
+   compositor restart it leaves the shell active for diagnosis. The fallback
+   ramfs starts `/bin/sh` directly. A process resolving any later executable
+   receives a private Sv39 root, user stack, kernel trap stack, and pages
+   populated from that ELF.
 6. Traps switch from the untrusted user stack to the process kernel stack.
    Syscalls, faults, yields, and timer ticks may update the saved trap frame.
 7. `/bin/sh` reads and edits console input, parses commands and redirections,
@@ -387,9 +407,12 @@ another. `make disassemble` writes an annotated disassembly to
    I/O, and `waitpid` retain their `ecall` and resume through a fresh trap after
    their wait channel is woken. If every runnable process is blocked or
    stopped, the kernel scheduler waits in supervisor mode with `wfi`.
-8. Exiting `/bin/sh` wakes `/sbin/init`, which reaps the shell and exits. The
-   kernel then verifies that all user-owned pages were reclaimed and requests
-   SBI system shutdown. The fallback shell returns to the kernel directly.
+8. The desktop's Power menu requests either Shut Down or Restart. It displays
+   the transition, closes applications, and reports the selected action to
+   `/sbin/init`. Init stops the rescue process tree and exits with that machine
+   action; the kernel verifies that all user-owned pages were reclaimed, then
+   requests SBI shutdown or cold reboot. Exiting the text target powers off,
+   and the fallback shell returns to the kernel directly.
 
 ## Deliberate limitations
 

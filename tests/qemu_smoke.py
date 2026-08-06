@@ -13,7 +13,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Union
+from typing import Iterator, Optional, Union
 
 
 class QemuSession:
@@ -84,26 +84,54 @@ class QemuSession:
         self.process.stdin.flush()
         return before_input + self.read_until(b"rose> ", timeout)
 
-    def graphical_keyboard_exit(self) -> str:
-        """Launch the desktop and exit it through the emulated keyboard."""
+    def graphical_shortcut(self, key: str) -> str:
+        """Send one desktop shortcut through the emulated VirtIO keyboard."""
         assert self.process.stdin is not None
-        self.process.stdin.write(b"desktop\n")
+        self.process.stdin.write(b"\x01c")
         self.process.stdin.flush()
-        time.sleep(0.2)
+        output = self.read_until(b"(qemu) ", 5.0)
+        self.process.stdin.write(f"sendkey {key}\n".encode())
+        self.process.stdin.flush()
+        output += self.read_until(b"(qemu) ", 5.0)
+        self.process.stdin.write(b"\x01c")
+        self.process.stdin.flush()
+        return output
+
+    def graphical_power_action(self, action: str) -> str:
+        """Choose Restart or Shut Down through the graphical power dialog."""
+        if action not in ("restart", "shutdown"):
+            raise ValueError(f"unsupported graphical power action: {action}")
+        assert self.process.stdin is not None
 
         # -nographic multiplexes the serial port and HMP monitor. Switching to
         # HMP lets this test exercise VirtIO keyboard input instead of UART.
         self.process.stdin.write(b"\x01c")
         self.process.stdin.flush()
         output = self.read_until(b"(qemu) ", 5.0)
-        # Escape belongs to the focused terminal. The desktop-wide chord is
-        # deliberately harder to trigger from a character-mode application.
-        self.process.stdin.write(b"sendkey ctrl-alt-esc\n")
-        self.process.stdin.flush()
-        output += self.read_until(b"rose> ", 5.0)
+
+        # The power dialog deliberately focuses Cancel. Reverse traversal
+        # reaches Restart first and Shut Down second.
+        keys = ["ctrl-alt-q", "shift-tab"]
+        if action == "shutdown":
+            keys.append("shift-tab")
+        keys.append("ret")
+        for key in keys:
+            self.process.stdin.write(f"sendkey {key}\n".encode())
+            self.process.stdin.flush()
+            output += self.read_until(b"(qemu) ", 5.0)
+
         self.process.stdin.write(b"\x01c")
         self.process.stdin.flush()
         return output
+
+    def graphical_keyboard_exit(self) -> str:
+        """Launch the desktop and shut it down through the power dialog."""
+        assert self.process.stdin is not None
+        self.process.stdin.write(b"desktop\n")
+        self.process.stdin.flush()
+        time.sleep(0.2)
+        output = self.graphical_power_action("shutdown")
+        return output + self.read_until(b"rose> ", 5.0)
 
     def shutdown(self) -> None:
         """Exercise the guest exit command and require a successful QEMU exit."""
@@ -157,6 +185,127 @@ def ext2_free_counts(path: Path) -> tuple[int, int]:
     return struct.unpack("<II", counts)
 
 
+def process_pid(table: str, command: str) -> Optional[int]:
+    """Return a command's PID from the structured `ps` table."""
+    for line in table.splitlines():
+        columns = line.split(maxsplit=4)
+        if len(columns) == 5 and columns[0].isdigit() and columns[4] == command:
+            return int(columns[0])
+    return None
+
+
+def wait_for_process(session: QemuSession, command: str) -> tuple[int, str]:
+    """Poll the rescue shell until a graphical-session process appears."""
+    output = ""
+    for _ in range(20):
+        output = session.command("ps")
+        pid = process_pid(output, command)
+        if pid is not None:
+            return pid, output
+        time.sleep(0.05)
+    raise AssertionError(f"{command} did not start:\n{output}")
+
+
+def wait_for_message(
+    session: QemuSession, existing: str, marker: str, timeout: float = 10.0
+) -> str:
+    """Accept a supervisor message captured before or after a shell prompt."""
+    if marker in existing:
+        return existing
+    return existing + session.read_until(marker.encode(), timeout)
+
+
+def run_graphical_recovery_test(command: list[str]) -> None:
+    """Prove an empty desktop, manual Terminal launch, and crash recovery."""
+    session = QemuSession(command)
+    try:
+        boot = session.read_until(b"rose> ", 15.0)
+        require(
+            boot,
+            "ROSE init: configuration selected graphical target",
+            "ROSE init: starting graphical target with serial rescue shell",
+        )
+        first_desktop, processes = wait_for_process(session, "/bin/desktop")
+        if "/bin/gui-terminal" in processes:
+            raise AssertionError(f"desktop auto-started Terminal:\n{processes}")
+        session.graphical_shortcut("ctrl-alt-t")
+        _, processes = wait_for_process(session, "/bin/gui-terminal")
+        require(processes, "/bin/gui-terminal")
+
+        restart = session.graphical_power_action("restart")
+        restart += session.read_until(
+            b"ROSE init: writable disk root online", 15.0
+        )
+        restart += session.read_until(b"rose> ", 15.0)
+        require(
+            restart,
+            "ROSE init: system restart requested",
+            "ROSE: restarting system",
+            "ROSE init: writable disk root online",
+        )
+        first_desktop, processes = wait_for_process(session, "/bin/desktop")
+        if "/bin/gui-terminal" in processes:
+            raise AssertionError(
+                f"restarted desktop auto-started Terminal:\n{processes}"
+            )
+        session.graphical_shortcut("ctrl-alt-t")
+        _, processes = wait_for_process(session, "/bin/gui-terminal")
+        require(processes, "/bin/gui-terminal")
+
+        first_failure = session.command(f"kill -9 {first_desktop}")
+        first_failure = wait_for_message(
+            session,
+            first_failure,
+            "ROSE init: restarting graphical session once",
+        )
+        require(first_failure, "graphical session terminated by a signal")
+
+        second_desktop, processes = wait_for_process(session, "/bin/desktop")
+        if second_desktop == first_desktop:
+            raise AssertionError("graphical session restart reused its PID")
+        if "/bin/gui-terminal" in processes:
+            raise AssertionError(
+                f"recovered desktop auto-started Terminal:\n{processes}"
+            )
+        session.graphical_shortcut("ctrl-alt-t")
+        _, processes = wait_for_process(session, "/bin/gui-terminal")
+        require(processes, "/bin/gui-terminal")
+
+        second_failure = session.command(f"kill -9 {second_desktop}")
+        second_failure = wait_for_message(
+            session,
+            second_failure,
+            "diagnostic text session is active",
+        )
+        require(second_failure, "ROSE init: graphical session failed twice")
+        session.shutdown()
+    finally:
+        session.close()
+
+
+def run_graphical_shutdown_test(command: list[str]) -> None:
+    """Require the graphical power menu to stop the virtual machine."""
+    session = QemuSession(command)
+    try:
+        session.read_until(b"rose> ", 15.0)
+        _, processes = wait_for_process(session, "/bin/desktop")
+        if "/bin/gui-terminal" in processes:
+            raise AssertionError(f"desktop auto-started Terminal:\n{processes}")
+        shutdown = session.graphical_power_action("shutdown")
+        shutdown += session.read_until(
+            b"ROSE init: system shutdown requested", 10.0
+        )
+        require(shutdown, "ROSE init: system shutdown requested")
+        try:
+            return_code = session.process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            session._fail("graphical shutdown did not stop QEMU")
+        if return_code != 0:
+            session._fail(f"graphical shutdown returned status {return_code}")
+    finally:
+        session.close()
+
+
 @contextmanager
 def temporary_root_image(source: Path) -> Iterator[Path]:
     """Give one QEMU run a disposable copy of the writable root image."""
@@ -197,6 +346,7 @@ def run_smoke_test(
         "-global",
         "virtio-mmio.force-legacy=false",
     ]
+    graphical_session_command: Optional[list[str]] = None
     if graphics:
         command += [
             "-device",
@@ -206,10 +356,16 @@ def run_smoke_test(
             "-device",
             "virtio-tablet-device",
         ]
+        graphical_session_command = command.copy()
+        command += ["-append", "rose.rescue=1"]
 
     session = QemuSession(command)
     try:
         boot = session.read_until(b"rose> ", 15.0)
+        if not graphics:
+            boot += session.read_until(
+                b"diagnostic text session is active", 15.0
+            )
         require(
             boot,
             "ROSE init: writable disk root online",
@@ -220,6 +376,7 @@ def run_smoke_test(
                 boot,
                 "ROSE graphics: 1024x768",
                 "ROSE input: VirtIO keyboard/tablet online",
+                "ROSE init: boot override selected text target",
             )
             require(
                 session.command("desktop --test", timeout=15.0),
@@ -233,7 +390,17 @@ def run_smoke_test(
                 session.command("desktop --stress", timeout=45.0),
                 "GUI capacity stress passed",
             )
-            require(session.graphical_keyboard_exit(), "rose> ")
+            require(
+                session.graphical_keyboard_exit(),
+                "rose> ",
+            )
+        else:
+            require(
+                boot,
+                "ROSE init: configuration selected graphical target",
+                "ROSE init: restarting graphical session once",
+                "ROSE init: graphical session failed twice",
+            )
 
         if graphics_only:
             session.shutdown()
@@ -241,7 +408,14 @@ def run_smoke_test(
                 raise AssertionError(
                     "graphics guest test leaked blocks or inodes"
                 )
-            print(f"QEMU graphics smoke test passed ({memory})")
+            assert graphical_session_command is not None
+            run_graphical_recovery_test(graphical_session_command)
+            run_graphical_shutdown_test(graphical_session_command)
+            if ext2_free_counts(root_image) != initial_free_counts:
+                raise AssertionError(
+                    "graphical recovery test leaked blocks or inodes"
+                )
+            print(f"QEMU graphics and recovery smoke test passed ({memory})")
             return 0
 
         # The prompt, line editor, quote/backslash parser, and built-ins now run

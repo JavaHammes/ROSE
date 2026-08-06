@@ -16,8 +16,8 @@ struct user_process_startup {
 };
 
 /* Kernel boot entry for a userspace executable. */
-void user_process_run_path(const char *path,
-                           const struct user_process_startup *startup);
+uint64_t user_process_run_path(const char *path,
+                               const struct user_process_startup *startup);
 
 /* Reap kernel-owned zombies after the final userspace process exits. */
 size_t user_process_reap_exited(void);

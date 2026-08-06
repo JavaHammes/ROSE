@@ -34,6 +34,7 @@ enum {
         FDT_MAX_DEPTH = 16,
         PLATFORM_RESERVED_REGION_LIMIT = 32,
         PLATFORM_VIRTIO_LIMIT = 8,
+        PLATFORM_BOOT_ARGUMENT_LIMIT = 256,
 };
 
 /* These defaults are used only while reporting an early device-tree panic. */
@@ -73,6 +74,7 @@ struct fdt_node {
         bool is_plic;
         bool is_virtio;
         bool is_cpus;
+        bool is_chosen;
         bool is_reserved_container;
         bool parent_is_reserved_container;
 };
@@ -103,6 +105,7 @@ static size_t reserved_region_count;
 static bool ram_contains_kernel;
 static bool uart_found;
 static bool plic_found;
+static char boot_arguments[PLATFORM_BOOT_ARGUMENT_LIMIT];
 static struct virtio_region virtio_regions[PLATFORM_VIRTIO_LIMIT];
 static size_t virtio_region_count;
 static bool platform_initialized;
@@ -341,6 +344,17 @@ static void parse_node_property(const struct fdt_view *view,
         } else if (property_name_is(view, name, "timebase-frequency") &&
                    node->is_cpus && length >= sizeof(uint32_t)) {
                 timebase_frequency = read_be32(value);
+        } else if (property_name_is(view, name, "bootargs") &&
+                   node->is_chosen) {
+                size_t copy_length = 0U;
+
+                while (copy_length < length && value[copy_length] != '\0' &&
+                       copy_length + 1U < sizeof(boot_arguments)) {
+                        boot_arguments[copy_length] =
+                            (char)value[copy_length];
+                        copy_length++;
+                }
+                boot_arguments[copy_length] = '\0';
         } else if (property_name_is(view, name, "status") &&
                    bounded_string_equals((const char *)value, length,
                                          "disabled")) {
@@ -485,6 +499,8 @@ static bool parse_structure(const struct fdt_view *view) {
                             node_name, name_length, "virtio_mmio@");
                         node.is_cpus = bounded_string_equals(
                             node_name, name_length + 1U, "cpus");
+                        node.is_chosen = bounded_string_equals(
+                            node_name, name_length + 1U, "chosen");
                         node.is_reserved_container = bounded_string_equals(
                             node_name, name_length + 1U, "reserved-memory");
                         stack[depth] = node;
@@ -573,6 +589,8 @@ void platform_init(const void *device_tree) {
 }
 
 /* Read-only accessors used by the rest of the kernel after initialization. */
+const char *platform_boot_arguments(void) { return boot_arguments; }
+
 uintptr_t platform_ram_start(void) { return ram_start; }
 
 uintptr_t platform_ram_end(void) { return ram_end; }

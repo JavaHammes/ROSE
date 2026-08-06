@@ -12,6 +12,7 @@
 #include "trap.h"
 #include "uart.h"
 #include "user_process.h"
+#include "user_abi.h"
 #include "vfs.h"
 #include "virtio_block.h"
 #include "virtio_gpu.h"
@@ -65,13 +66,24 @@ void kernel_main(unsigned long hart_id, const void *dtb) {
 
         size_t idle_page_count = page_used_count();
 
-        /* A disk root enters its long-lived init image, which starts /bin/sh
-         * as a child and waits for it. The embedded ramfs starts the same shell
-         * directly as a diagnostic fallback when no valid disk mounts. */
+        /* A disk root enters its long-lived init image. Firmware boot options
+         * are forwarded as one argument so init can select or bypass its
+         * configured target. The embedded ramfs retains a direct diagnostic
+         * shell when no valid disk mounts. */
+        uint64_t userspace_status;
         if (vfs_uses_disk_root()) {
-                user_process_run_path("/sbin/init", NULL);
+                const char *boot_options = platform_boot_arguments();
+                const char *arguments[] = {"/sbin/init", boot_options};
+                const struct user_process_startup startup = {
+                    .argument_count = boot_options[0] == '\0' ? 1U : 2U,
+                    .arguments = arguments,
+                    .environment_count = 0U,
+                    .environment = NULL,
+                };
+                userspace_status =
+                    user_process_run_path("/sbin/init", &startup);
         } else {
-                user_process_run_path("/bin/sh", NULL);
+                userspace_status = user_process_run_path("/bin/sh", NULL);
         }
         (void)user_process_reap_exited();
         if (page_used_count() != idle_page_count) {
@@ -83,11 +95,18 @@ void kernel_main(unsigned long hart_id, const void *dtb) {
                 panic("User process page leak after userspace exit");
         }
 
-        /* Returning from init after it reaps the shell is the disk-root
-         * shutdown request; the fallback shell returns here directly. Keep a
-         * stopped machine quiescent if firmware rejects the request. */
-        if (sbi_shutdown() != 0) {
-                uart_puts("SBI shutdown request failed\n");
+        /* PID 1 may request a cold restart with its retained exit status. All
+         * other exits—including the diagnostic shell—power the machine off. */
+        long reset_result;
+        if (userspace_status == USER_SYSTEM_ACTION_RESTART) {
+                uart_puts("ROSE: restarting system\n");
+                reset_result = sbi_reboot();
+        } else {
+                uart_puts("ROSE: system halted safely\n");
+                reset_result = sbi_shutdown();
+        }
+        if (reset_result != 0) {
+                uart_puts("SBI system reset request failed\n");
         }
 
         while (1) {
