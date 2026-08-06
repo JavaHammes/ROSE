@@ -22,6 +22,15 @@ enum {
         SHELL_JOB_LIMIT = 4,
         SHELL_REDIRECTION_LIMIT = 6,
         SHELL_HISTORY_LIMIT = 16,
+        SHELL_ALIAS_LIMIT = 8,
+        SHELL_ALIAS_NAME_SIZE = 24,
+        SHELL_ALIAS_VALUE_SIZE = 96,
+};
+
+enum shell_job_state {
+        SHELL_JOB_RUNNING,
+        SHELL_JOB_STOPPED,
+        SHELL_JOB_DONE,
 };
 
 enum shell_redirection_operation {
@@ -50,6 +59,7 @@ struct shell_pipeline {
         size_t command_count;
         bool background;
         char storage[SHELL_LINE_SIZE];
+        const char *parse_error;
 };
 
 struct shell_job {
@@ -60,6 +70,14 @@ struct shell_job {
         bool stopped[SHELL_PIPELINE_LIMIT];
         int statuses[SHELL_PIPELINE_LIMIT];
         size_t child_count;
+        uint64_t generation;
+        enum shell_job_state reported_state;
+};
+
+struct shell_alias {
+        bool used;
+        char name[SHELL_ALIAS_NAME_SIZE];
+        char value[SHELL_ALIAS_VALUE_SIZE];
 };
 
 struct shell_saved_descriptors {
@@ -78,6 +96,12 @@ static int shell_last_status;
 static char shell_history[SHELL_HISTORY_LIMIT][SHELL_LINE_SIZE];
 static size_t shell_history_count;
 static char shell_history_draft[SHELL_LINE_SIZE];
+static struct shell_alias shell_aliases[SHELL_ALIAS_LIMIT];
+static uint64_t shell_job_generation;
+
+static bool shell_is_operator(char character);
+static bool shell_parameter_name_start(char character);
+static bool shell_parameter_name_character(char character);
 
 static size_t string_length(const char *text) {
         size_t length = 0U;
@@ -278,6 +302,134 @@ static void environment_initialize(char **environment) {
         }
 }
 
+static bool alias_name_is_valid(const char *name, size_t length) {
+        if (length == 0U || !shell_parameter_name_start(name[0])) {
+                return false;
+        }
+        for (size_t index = 1U; index < length; index++) {
+                if (!shell_parameter_name_character(name[index])) {
+                        return false;
+                }
+        }
+        return length < SHELL_ALIAS_NAME_SIZE;
+}
+
+static struct shell_alias *alias_find_length(const char *name, size_t length) {
+        for (size_t index = 0U; index < SHELL_ALIAS_LIMIT; index++) {
+                struct shell_alias *alias = &shell_aliases[index];
+                if (!alias->used || alias->name[length] != '\0') {
+                        continue;
+                }
+                bool equal = true;
+                for (size_t character = 0U; character < length; character++) {
+                        if (alias->name[character] != name[character]) {
+                                equal = false;
+                                break;
+                        }
+                }
+                if (equal) {
+                        return alias;
+                }
+        }
+        return NULL;
+}
+
+static struct shell_alias *alias_find(const char *name) {
+        return alias_find_length(name, string_length(name));
+}
+
+static bool alias_set(const char *assignment) {
+        const char *separator = assignment;
+        while (*separator != '\0' && *separator != '=') {
+                separator++;
+        }
+        if (*separator != '=') {
+                return false;
+        }
+        size_t name_length = (size_t)(separator - assignment);
+        const char *value = separator + 1;
+        if (!alias_name_is_valid(assignment, name_length) ||
+            string_length(value) >= SHELL_ALIAS_VALUE_SIZE) {
+                return false;
+        }
+
+        struct shell_alias *alias = alias_find_length(assignment, name_length);
+        if (alias == NULL) {
+                for (size_t index = 0U; index < SHELL_ALIAS_LIMIT; index++) {
+                        if (!shell_aliases[index].used) {
+                                alias = &shell_aliases[index];
+                                break;
+                        }
+                }
+        }
+        if (alias == NULL) {
+                return false;
+        }
+        alias->used = true;
+        for (size_t index = 0U; index < name_length; index++) {
+                alias->name[index] = assignment[index];
+        }
+        alias->name[name_length] = '\0';
+        copy_string(alias->value, value);
+        return true;
+}
+
+static void alias_print(const struct shell_alias *alias) {
+        print("alias ");
+        print(alias->name);
+        print("='");
+        print(alias->value);
+        print("'\n");
+}
+
+/* Alias substitution is deliberately limited to the command word. Repeating
+ * the lookup supports short alias chains while the bound rejects cycles. */
+static bool shell_expand_aliases(const char *line,
+                                 char expanded[SHELL_LINE_SIZE]) {
+        copy_string(expanded, line);
+        for (size_t depth = 0U; depth < SHELL_ALIAS_LIMIT; depth++) {
+                size_t start = 0U;
+                while (expanded[start] == ' ' || expanded[start] == '\t') {
+                        start++;
+                }
+                size_t end = start;
+                while (expanded[end] != '\0' && expanded[end] != ' ' &&
+                       expanded[end] != '\t' &&
+                       !shell_is_operator(expanded[end])) {
+                        if (expanded[end] == '\'' || expanded[end] == '"' ||
+                            expanded[end] == '\\') {
+                                return true;
+                        }
+                        end++;
+                }
+                struct shell_alias *alias =
+                    alias_find_length(&expanded[start], end - start);
+                if (alias == NULL) {
+                        return true;
+                }
+
+                size_t old_length = string_length(expanded);
+                size_t value_length = string_length(alias->value);
+                size_t new_length = start + value_length + old_length - end;
+                if (new_length >= SHELL_LINE_SIZE) {
+                        return false;
+                }
+                char replacement[SHELL_LINE_SIZE];
+                size_t output = 0U;
+                for (size_t index = 0U; index < start; index++) {
+                        replacement[output++] = expanded[index];
+                }
+                for (size_t index = 0U; index < value_length; index++) {
+                        replacement[output++] = alias->value[index];
+                }
+                for (size_t index = end; index <= old_length; index++) {
+                        replacement[output++] = expanded[index];
+                }
+                copy_string(expanded, replacement);
+        }
+        return false;
+}
+
 static void shell_redraw_line(const char line[SHELL_LINE_SIZE], size_t length,
                               size_t cursor) {
         print("\r\x1b[2Krose> ");
@@ -292,7 +444,8 @@ static void shell_redraw_line(const char line[SHELL_LINE_SIZE], size_t length,
 static void shell_set_edit_line(char line[SHELL_LINE_SIZE], const char *source,
                                 size_t *length, size_t *cursor) {
         *length = string_length(source);
-        if (*length >= SHELL_LINE_SIZE) *length = SHELL_LINE_SIZE - 1U;
+        if (*length >= SHELL_LINE_SIZE)
+                *length = SHELL_LINE_SIZE - 1U;
         for (size_t index = 0U; index < *length; index++) {
                 line[index] = source[index];
         }
@@ -305,12 +458,10 @@ static void shell_history_add(const char line[SHELL_LINE_SIZE], size_t length) {
                 return;
         }
         if (shell_history_count != 0U) {
-                const char *previous =
-                    shell_history[shell_history_count - 1U];
+                const char *previous = shell_history[shell_history_count - 1U];
                 bool duplicate = previous[length] == '\0';
 
-                for (size_t index = 0U; duplicate && index < length;
-                     index++) {
+                for (size_t index = 0U; duplicate && index < length; index++) {
                         duplicate = previous[index] == line[index];
                 }
                 if (duplicate) {
@@ -342,44 +493,50 @@ static bool shell_navigation(char final, size_t parameter,
                         copy_string(shell_history_draft, line);
                 }
                 (*history_index)--;
-                shell_set_edit_line(line, shell_history[*history_index],
-                                    length, cursor);
+                shell_set_edit_line(line, shell_history[*history_index], length,
+                                    cursor);
                 return true;
         }
         if (final == 'B') {
-                if (*history_index >= shell_history_count) return false;
+                if (*history_index >= shell_history_count)
+                        return false;
                 (*history_index)++;
-                shell_set_edit_line(
-                    line, *history_index == shell_history_count
-                              ? shell_history_draft
-                              : shell_history[*history_index],
-                    length, cursor);
+                shell_set_edit_line(line,
+                                    *history_index == shell_history_count
+                                        ? shell_history_draft
+                                        : shell_history[*history_index],
+                                    length, cursor);
                 return true;
         }
         if (final == 'C') {
-                if (*cursor == *length) return false;
+                if (*cursor == *length)
+                        return false;
                 (*cursor)++;
                 return true;
         }
         if (final == 'D') {
-                if (*cursor == 0U) return false;
+                if (*cursor == 0U)
+                        return false;
                 (*cursor)--;
                 return true;
         }
-        if (final == 'H' || (final == '~' &&
-                             (parameter == 1U || parameter == 7U))) {
-                if (*cursor == 0U) return false;
+        if (final == 'H' ||
+            (final == '~' && (parameter == 1U || parameter == 7U))) {
+                if (*cursor == 0U)
+                        return false;
                 *cursor = 0U;
                 return true;
         }
-        if (final == 'F' || (final == '~' &&
-                             (parameter == 4U || parameter == 8U))) {
-                if (*cursor == *length) return false;
+        if (final == 'F' ||
+            (final == '~' && (parameter == 4U || parameter == 8U))) {
+                if (*cursor == *length)
+                        return false;
                 *cursor = *length;
                 return true;
         }
         if (final == '~' && parameter == 3U) {
-                if (*cursor == *length) return false;
+                if (*cursor == *length)
+                        return false;
                 for (size_t index = *cursor; index < *length; index++) {
                         line[index] = line[index + 1U];
                 }
@@ -389,6 +546,112 @@ static bool shell_navigation(char final, size_t parameter,
         return false;
 }
 
+/* Complete one unquoted filesystem path component. The VFS already provides
+ * directory types, so a unique directory match receives '/' and a regular
+ * file receives a separating space. */
+static bool shell_complete_path(char line[SHELL_LINE_SIZE], size_t *length,
+                                size_t *cursor) {
+        size_t word_start = *cursor;
+        while (word_start != 0U) {
+                char previous = line[word_start - 1U];
+                if (previous == ' ' || previous == '\t' ||
+                    shell_is_operator(previous)) {
+                        break;
+                }
+                if (previous == '\'' || previous == '"' || previous == '\\') {
+                        return false;
+                }
+                word_start--;
+        }
+
+        size_t component_start = word_start;
+        for (size_t index = word_start; index < *cursor; index++) {
+                if (line[index] == '/') {
+                        component_start = index + 1U;
+                }
+        }
+
+        char directory[SHELL_PATH_SIZE];
+        if (component_start == word_start) {
+                directory[0] = '.';
+                directory[1] = '\0';
+        } else {
+                size_t directory_length = component_start - word_start - 1U;
+                if (directory_length == 0U) {
+                        directory[0] = '/';
+                        directory[1] = '\0';
+                } else {
+                        if (directory_length + 1U > sizeof(directory)) {
+                                return false;
+                        }
+                        for (size_t index = 0U; index < directory_length;
+                             index++) {
+                                directory[index] = line[word_start + index];
+                        }
+                        directory[directory_length] = '\0';
+                }
+        }
+
+        size_t prefix_length = *cursor - component_start;
+        long descriptor =
+            rose_open(directory, USER_OPEN_READ | USER_OPEN_DIRECTORY);
+        if (descriptor < 0) {
+                return false;
+        }
+
+        char match[USER_DIRECTORY_NAME_MAX];
+        uint32_t match_type = USER_FILE_REGULAR;
+        size_t match_count = 0U;
+        struct user_directory_entry entry;
+        while (rose_read_directory((int)descriptor, &entry) > 0) {
+                if (strings_equal(entry.name, ".") ||
+                    strings_equal(entry.name, "..")) {
+                        continue;
+                }
+                bool matches = true;
+                for (size_t index = 0U; index < prefix_length; index++) {
+                        if (entry.name[index] == '\0' ||
+                            entry.name[index] !=
+                                line[component_start + index]) {
+                                matches = false;
+                                break;
+                        }
+                }
+                if (matches) {
+                        if (match_count == 0U) {
+                                copy_string(match, entry.name);
+                                match_type = entry.type;
+                        }
+                        match_count++;
+                }
+        }
+        (void)rose_close((int)descriptor);
+        if (match_count != 1U) {
+                return false;
+        }
+
+        size_t match_length = string_length(match);
+        size_t suffix_length = match_length - prefix_length;
+        bool add_separator = *cursor == *length;
+        size_t addition = suffix_length + (add_separator ? 1U : 0U);
+        if (*length + addition >= SHELL_LINE_SIZE) {
+                return false;
+        }
+        for (size_t index = *length + 1U; index > *cursor; index--) {
+                line[index + addition - 1U] = line[index - 1U];
+        }
+        for (size_t index = 0U; index < suffix_length; index++) {
+                line[*cursor + index] = match[prefix_length + index];
+        }
+        if (add_separator) {
+                line[*cursor + suffix_length] =
+                    match_type == USER_FILE_DIRECTORY ? '/' : ' ';
+        }
+        *cursor += addition;
+        *length += addition;
+        return true;
+}
+
 /* Read and echo one editable command line from the console. Both the serial
  * keyboard and graphical frontend deliver conventional CSI/SS3 navigation
  * sequences, so consume them here instead of inserting their printable tail. */
@@ -396,8 +659,12 @@ static bool shell_read_line(char line[SHELL_LINE_SIZE]) {
         size_t length = 0U;
         size_t cursor = 0U;
         size_t history_index = shell_history_count;
-        enum { SHELL_INPUT_NORMAL, SHELL_INPUT_ESCAPE, SHELL_INPUT_CSI,
-               SHELL_INPUT_SS3 } input_state = SHELL_INPUT_NORMAL;
+        enum {
+                SHELL_INPUT_NORMAL,
+                SHELL_INPUT_ESCAPE,
+                SHELL_INPUT_CSI,
+                SHELL_INPUT_SS3
+        } input_state = SHELL_INPUT_NORMAL;
         size_t escape_parameter = 0U;
         bool escape_parameter_complete = false;
 
@@ -437,17 +704,17 @@ static bool shell_read_line(char line[SHELL_LINE_SIZE]) {
                                 escape_parameter_complete = true;
                                 continue;
                         }
-                        bool changed = shell_navigation(
-                            character, escape_parameter, line, &length,
-                            &cursor, &history_index);
+                        bool changed =
+                            shell_navigation(character, escape_parameter, line,
+                                             &length, &cursor, &history_index);
                         input_state = SHELL_INPUT_NORMAL;
                         if (changed)
                                 shell_redraw_line(line, length, cursor);
                         continue;
                 } else if (input_state == SHELL_INPUT_SS3) {
-                        bool changed = shell_navigation(
-                            character, 0U, line, &length, &cursor,
-                            &history_index);
+                        bool changed =
+                            shell_navigation(character, 0U, line, &length,
+                                             &cursor, &history_index);
                         input_state = SHELL_INPUT_NORMAL;
                         if (changed)
                                 shell_redraw_line(line, length, cursor);
@@ -476,12 +743,18 @@ static bool shell_read_line(char line[SHELL_LINE_SIZE]) {
                 }
                 if (character == '\b' || character == '\x7f') {
                         if (cursor != 0U) {
-                                for (size_t index = cursor - 1U;
-                                     index < length; index++) {
+                                for (size_t index = cursor - 1U; index < length;
+                                     index++) {
                                         line[index] = line[index + 1U];
                                 }
                                 length--;
                                 cursor--;
+                                shell_redraw_line(line, length, cursor);
+                        }
+                        continue;
+                }
+                if (character == '\t') {
+                        if (shell_complete_path(line, &length, &cursor)) {
                                 shell_redraw_line(line, length, cursor);
                         }
                         continue;
@@ -630,6 +903,12 @@ static bool shell_expand_parameter(const char **source, char **destination,
 /* Tokenize words while quotes and escapes are still visible, then build a
  * bounded pipeline description. Operators are special only outside quotes;
  * parameter expansion is disabled by single quotes and backslash escaping. */
+static bool shell_parse_fail(struct shell_pipeline *pipeline,
+                             const char *message) {
+        pipeline->parse_error = message;
+        return false;
+}
+
 static bool shell_parse_pipeline(const char *line,
                                  struct shell_pipeline *pipeline) {
         for (size_t index = 0U; index < SHELL_PIPELINE_LIMIT; index++) {
@@ -639,6 +918,7 @@ static bool shell_parse_pipeline(const char *line,
         }
         pipeline->command_count = 0U;
         pipeline->background = false;
+        pipeline->parse_error = NULL;
 
         const char *source = line;
         char *destination = pipeline->storage;
@@ -673,7 +953,9 @@ static bool shell_parse_pipeline(const char *line,
                         if (*number_end == '<' || *number_end == '>') {
                                 if (!descriptor_supported ||
                                     descriptor > USER_STDERR_FILENO) {
-                                        return false;
+                                        return shell_parse_fail(
+                                            pipeline,
+                                            "unsupported file descriptor");
                                 }
                                 explicit_descriptor = (int)descriptor;
                                 source = number_end;
@@ -698,7 +980,8 @@ static bool shell_parse_pipeline(const char *line,
                                     pending_redirection !=
                                         SHELL_REDIRECTION_LIMIT ||
                                     command->argument_count == 0) {
-                                        return false;
+                                        return shell_parse_fail(
+                                            pipeline, "unexpected '&'");
                                 }
                                 pipeline->background = true;
                                 break;
@@ -710,7 +993,8 @@ static bool shell_parse_pipeline(const char *line,
                                     command->argument_count == 0 ||
                                     pipeline->command_count + 1U >=
                                         SHELL_PIPELINE_LIMIT) {
-                                        return false;
+                                        return shell_parse_fail(
+                                            pipeline, "unexpected '|'");
                                 }
                                 command->arguments[command->argument_count] =
                                     NULL;
@@ -723,7 +1007,8 @@ static bool shell_parse_pipeline(const char *line,
                         if (pending_redirection != SHELL_REDIRECTION_LIMIT ||
                             command->redirection_count ==
                                 SHELL_REDIRECTION_LIMIT) {
-                                return false;
+                                return shell_parse_fail(
+                                    pipeline, "unexpected redirection");
                         }
 
                         int destination_descriptor = explicit_descriptor;
@@ -744,7 +1029,9 @@ static bool shell_parse_pipeline(const char *line,
                         if (!append && *source == '&') {
                                 source++;
                                 if (*source < '0' || *source > '2') {
-                                        return false;
+                                        return shell_parse_fail(
+                                            pipeline,
+                                            "expected descriptor after '&'");
                                 }
                                 redirection->operation =
                                     SHELL_REDIRECTION_DUPLICATE;
@@ -753,7 +1040,9 @@ static bool shell_parse_pipeline(const char *line,
                                     (*source != '\0' && *source != ' ' &&
                                      *source != '\t' &&
                                      !shell_is_operator(*source))) {
-                                        return false;
+                                        return shell_parse_fail(
+                                            pipeline,
+                                            "invalid descriptor duplication");
                                 }
                                 continue;
                         }
@@ -769,10 +1058,11 @@ static bool shell_parse_pipeline(const char *line,
 
                 if (pending_redirection == SHELL_REDIRECTION_LIMIT &&
                     command->argument_count == SHELL_ARGUMENT_LIMIT) {
-                        return false;
+                        return shell_parse_fail(pipeline, "too many arguments");
                 }
                 if (destination == storage_end) {
-                        return false;
+                        return shell_parse_fail(pipeline,
+                                                "command line is too long");
                 }
 
                 char *word = destination;
@@ -790,7 +1080,11 @@ static bool shell_parse_pipeline(const char *line,
                         if (character == '\\' && quote != '\'') {
                                 if (*source == '\0' ||
                                     destination == storage_end) {
-                                        return false;
+                                        return shell_parse_fail(
+                                            pipeline,
+                                            *source == '\0'
+                                                ? "trailing escape"
+                                                : "command line is too long");
                                 }
                                 *destination++ = *source++;
                                 continue;
@@ -810,19 +1104,26 @@ static bool shell_parse_pipeline(const char *line,
                                 if (!shell_expand_parameter(&parameter,
                                                             &destination,
                                                             storage_end)) {
-                                        return false;
+                                        return shell_parse_fail(
+                                            pipeline,
+                                            "invalid parameter expansion");
                                 }
                                 source = parameter;
                                 continue;
                         }
                         if (destination == storage_end) {
-                                return false;
+                                return shell_parse_fail(
+                                    pipeline, "command line is too long");
                         }
                         *destination++ = character;
                 }
 
-                if (quote != '\0' || destination == storage_end) {
-                        return false;
+                if (quote != '\0') {
+                        return shell_parse_fail(pipeline, "unterminated quote");
+                }
+                if (destination == storage_end) {
+                        return shell_parse_fail(pipeline,
+                                                "command line is too long");
                 }
                 *destination++ = '\0';
                 saw_token = true;
@@ -840,7 +1141,10 @@ static bool shell_parse_pipeline(const char *line,
         }
         if (pending_redirection != SHELL_REDIRECTION_LIMIT ||
             command->argument_count == 0) {
-                return false;
+                return shell_parse_fail(
+                    pipeline, pending_redirection != SHELL_REDIRECTION_LIMIT
+                                  ? "expected path after redirection"
+                                  : "expected command");
         }
         command->arguments[command->argument_count] = NULL;
         pipeline->command_count++;
@@ -945,6 +1249,8 @@ static void shell_job_initialize(struct shell_job *job, uint64_t process_group,
         job->used = true;
         job->process_group = process_group;
         job->child_count = child_count;
+        job->generation = ++shell_job_generation;
+        job->reported_state = SHELL_JOB_RUNNING;
         for (size_t index = 0U; index < SHELL_PIPELINE_LIMIT; index++) {
                 job->children[index] =
                     index < child_count ? children[index] : 0;
@@ -976,6 +1282,14 @@ static bool shell_job_is_stopped(const struct shell_job *job) {
                 }
         }
         return has_live_child;
+}
+
+static enum shell_job_state shell_job_state_of(const struct shell_job *job) {
+        if (shell_job_is_complete(job)) {
+                return SHELL_JOB_DONE;
+        }
+        return shell_job_is_stopped(job) ? SHELL_JOB_STOPPED
+                                         : SHELL_JOB_RUNNING;
 }
 
 static void shell_job_record_status(struct shell_job *job, size_t index,
@@ -1048,6 +1362,8 @@ static size_t shell_job_store(const struct shell_job *job) {
                         destination->used = job->used;
                         destination->process_group = job->process_group;
                         destination->child_count = job->child_count;
+                        destination->generation = job->generation;
+                        destination->reported_state = shell_job_state_of(job);
                         for (size_t child = 0U; child < SHELL_PIPELINE_LIMIT;
                              child++) {
                                 destination->children[child] =
@@ -1140,9 +1456,10 @@ static int run_foreground(char **arguments, bool report_status) {
 }
 
 static void shell_help(void) {
-        print("Built-ins: cd pwd echo env setenv unsetenv jobs fg clear help "
-              "exit\n");
-        print("Commands: ls cat echo pwd env mkdir rm\n");
+        print("Built-ins: cd pwd echo export unset alias unalias type history "
+              "jobs fg bg kill clear help exit\n");
+        print("Commands: ls cat echo pwd env mkdir rm cp mv touch head wc find "
+              "ps kill sleep\n");
         print("Syntax: command [ARG...] [< FILE] [> FILE|>> FILE] [2> FILE] "
               "[2>&1] [| command...] [&]\n");
         print("Expansion: $NAME ${NAME} $? $$ (except in single quotes)\n");
@@ -1164,13 +1481,39 @@ static void shell_list_jobs(void) {
                 } else if (shell_job_is_stopped(job)) {
                         shell_print_job(index + 1U, "Stopped",
                                         job->process_group);
+                        job->reported_state = SHELL_JOB_STOPPED;
                 } else {
                         shell_print_job(index + 1U, "Running",
                                         job->process_group);
+                        job->reported_state = SHELL_JOB_RUNNING;
                 }
         }
         if (!found) {
                 print("No jobs\n");
+        }
+}
+
+static void shell_notify_jobs(void) {
+        for (size_t index = 0U; index < SHELL_JOB_LIMIT; index++) {
+                struct shell_job *job = &shell_jobs[index];
+                if (!job->used) {
+                        continue;
+                }
+                shell_job_poll(job);
+                enum shell_job_state state = shell_job_state_of(job);
+                if (state == job->reported_state) {
+                        continue;
+                }
+                shell_print_job(
+                    index + 1U,
+                    state == SHELL_JOB_DONE
+                        ? "Done"
+                        : (state == SHELL_JOB_STOPPED ? "Stopped" : "Running"),
+                    job->process_group);
+                job->reported_state = state;
+                if (state == SHELL_JOB_DONE) {
+                        job->used = false;
+                }
         }
 }
 
@@ -1190,13 +1533,47 @@ static size_t shell_parse_job_identifier(const char *text) {
         return *text == '\0' ? value : 0U;
 }
 
+static size_t shell_relative_job_identifier(bool previous) {
+        uint64_t newest = 0U;
+        uint64_t second = 0U;
+        size_t newest_identifier = 0U;
+        size_t second_identifier = 0U;
+        for (size_t index = 0U; index < SHELL_JOB_LIMIT; index++) {
+                if (!shell_jobs[index].used) {
+                        continue;
+                }
+                uint64_t generation = shell_jobs[index].generation;
+                if (generation > newest) {
+                        second = newest;
+                        second_identifier = newest_identifier;
+                        newest = generation;
+                        newest_identifier = index + 1U;
+                } else if (generation > second) {
+                        second = generation;
+                        second_identifier = index + 1U;
+                }
+        }
+        return previous ? second_identifier : newest_identifier;
+}
+
+static size_t shell_select_job(const char *text) {
+        if (text == NULL || strings_equal(text, "%") ||
+            strings_equal(text, "%%") || strings_equal(text, "%+")) {
+                return shell_relative_job_identifier(false);
+        }
+        if (strings_equal(text, "%-")) {
+                return shell_relative_job_identifier(true);
+        }
+        return shell_parse_job_identifier(text);
+}
+
 static int shell_foreground_job(int count, char **arguments) {
-        if (count != 2) {
-                print_error("Usage: fg JOB\n");
+        if (count > 2) {
+                print_error("Usage: fg [JOB]\n");
                 return 1;
         }
 
-        size_t identifier = shell_parse_job_identifier(arguments[1]);
+        size_t identifier = shell_select_job(count == 2 ? arguments[1] : NULL);
         if (identifier == 0U || identifier > SHELL_JOB_LIMIT ||
             !shell_jobs[identifier - 1U].used) {
                 print_error("fg: no such job\n");
@@ -1204,6 +1581,7 @@ static int shell_foreground_job(int count, char **arguments) {
         }
 
         struct shell_job *job = &shell_jobs[identifier - 1U];
+        job->generation = ++shell_job_generation;
         shell_job_poll(job);
         if (shell_job_is_complete(job)) {
                 shell_print_job(identifier, "Done", job->process_group);
@@ -1242,9 +1620,181 @@ static int shell_foreground_job(int count, char **arguments) {
                                        status);
         } else if (shell_job_is_stopped(job)) {
                 shell_print_job(identifier, "Stopped", job->process_group);
+                job->reported_state = SHELL_JOB_STOPPED;
                 return 128 + USER_SIGNAL_TERMINAL_STOP;
         }
         return 1;
+}
+
+static int shell_background_job(int count, char **arguments) {
+        if (count > 2) {
+                print_error("Usage: bg [JOB]\n");
+                return 1;
+        }
+        size_t identifier = shell_select_job(count == 2 ? arguments[1] : NULL);
+        if (identifier == 0U || identifier > SHELL_JOB_LIMIT ||
+            !shell_jobs[identifier - 1U].used) {
+                print_error("bg: no such job\n");
+                return 1;
+        }
+
+        struct shell_job *job = &shell_jobs[identifier - 1U];
+        shell_job_poll(job);
+        if (shell_job_is_complete(job)) {
+                shell_print_job(identifier, "Done", job->process_group);
+                job->used = false;
+                return 1;
+        }
+        for (size_t index = 0U; index < job->child_count; index++) {
+                if (!job->finished[index]) {
+                        job->stopped[index] = false;
+                }
+        }
+        if (rose_kill(-(int64_t)job->process_group, USER_SIGNAL_CONTINUE) < 0) {
+                print_error("bg: unable to continue job\n");
+                return 1;
+        }
+        job->generation = ++shell_job_generation;
+        job->reported_state = SHELL_JOB_RUNNING;
+        shell_print_job(identifier, "Running", job->process_group);
+        return 0;
+}
+
+static bool shell_set_assignment(const char *assignment) {
+        const char *separator = assignment;
+        while (*separator != '\0' && *separator != '=') {
+                separator++;
+        }
+        if (*separator != '=') {
+                return false;
+        }
+        size_t length = (size_t)(separator - assignment);
+        if (length == 0U || length >= SHELL_ENVIRONMENT_ENTRY_SIZE) {
+                return false;
+        }
+        char name[SHELL_ENVIRONMENT_ENTRY_SIZE];
+        for (size_t index = 0U; index < length; index++) {
+                name[index] = assignment[index];
+        }
+        name[length] = '\0';
+        return environment_set(name, separator + 1);
+}
+
+static bool shell_parse_positive_number(const char *text, uint64_t *value) {
+        if (*text < '0' || *text > '9') {
+                return false;
+        }
+        uint64_t result = 0U;
+        while (*text >= '0' && *text <= '9') {
+                uint64_t digit = (uint64_t)(*text++ - '0');
+                if (result > (UINT64_MAX - digit) / 10U) {
+                        return false;
+                }
+                result = result * 10U + digit;
+        }
+        if (*text != '\0' || result == 0U) {
+                return false;
+        }
+        *value = result;
+        return true;
+}
+
+static int shell_kill_builtin(int count, char **arguments) {
+        int signal = USER_SIGNAL_TERMINATE;
+        int first_target = 1;
+        if (count >= 2 && arguments[1][0] == '-') {
+                uint64_t parsed;
+                if (!shell_parse_positive_number(&arguments[1][1], &parsed) ||
+                    parsed > USER_SIGNAL_MAX) {
+                        print_error("kill: invalid signal\n");
+                        return 1;
+                }
+                signal = (int)parsed;
+                first_target = 2;
+        }
+        if (first_target == count) {
+                print_error("Usage: kill [-SIGNAL] PID|%JOB...\n");
+                return 1;
+        }
+
+        int status = 0;
+        for (int index = first_target; index < count; index++) {
+                int64_t target;
+                if (arguments[index][0] == '%') {
+                        size_t identifier = shell_select_job(arguments[index]);
+                        if (identifier == 0U || identifier > SHELL_JOB_LIMIT ||
+                            !shell_jobs[identifier - 1U].used) {
+                                print_error("kill: no such job\n");
+                                status = 1;
+                                continue;
+                        }
+                        target =
+                            -(int64_t)shell_jobs[identifier - 1U].process_group;
+                } else {
+                        uint64_t pid;
+                        if (!shell_parse_positive_number(arguments[index],
+                                                         &pid) ||
+                            pid > INT64_MAX) {
+                                print_error("kill: invalid process ID\n");
+                                status = 1;
+                                continue;
+                        }
+                        target = (int64_t)pid;
+                }
+                if (rose_kill(target, signal) != 0) {
+                        print_error("kill: unable to signal target\n");
+                        status = 1;
+                }
+        }
+        return status;
+}
+
+static bool shell_resolve_command(const char *name,
+                                  char result[SHELL_PATH_SIZE]) {
+        if (string_contains(name, '/')) {
+                struct user_file_status status;
+                if (string_length(name) >= SHELL_PATH_SIZE ||
+                    rose_stat(name, &status) != 0 ||
+                    status.type != USER_FILE_REGULAR) {
+                        return false;
+                }
+                copy_string(result, name);
+                return true;
+        }
+
+        const char *path = environment_value("PATH");
+        if (path == NULL) {
+                return false;
+        }
+        while (true) {
+                size_t length = 0U;
+                while (*path != '\0' && *path != ':') {
+                        if (length + 1U >= SHELL_PATH_SIZE) {
+                                length = SHELL_PATH_SIZE;
+                        } else {
+                                result[length++] = *path;
+                        }
+                        path++;
+                }
+                if (length != 0U && length < SHELL_PATH_SIZE) {
+                        if (result[length - 1U] != '/') {
+                                result[length++] = '/';
+                        }
+                        size_t name_length = string_length(name);
+                        if (length + name_length + 1U <= SHELL_PATH_SIZE) {
+                                copy_string(&result[length], name);
+                                struct user_file_status status;
+                                if (rose_stat(result, &status) == 0 &&
+                                    status.type == USER_FILE_REGULAR) {
+                                        return true;
+                                }
+                        }
+                }
+                if (*path == '\0') {
+                        return false;
+                }
+                path++;
+        }
 }
 
 static bool shell_is_builtin(const char *name) {
@@ -1252,8 +1802,13 @@ static bool shell_is_builtin(const char *name) {
                strings_equal(name, "echo") || strings_equal(name, "clear") ||
                strings_equal(name, "pwd") || strings_equal(name, "cd") ||
                strings_equal(name, "env") || strings_equal(name, "setenv") ||
-               strings_equal(name, "unsetenv") || strings_equal(name, "jobs") ||
-               strings_equal(name, "fg") || strings_equal(name, "run");
+               strings_equal(name, "unsetenv") ||
+               strings_equal(name, "export") || strings_equal(name, "unset") ||
+               strings_equal(name, "alias") || strings_equal(name, "unalias") ||
+               strings_equal(name, "type") || strings_equal(name, "history") ||
+               strings_equal(name, "jobs") || strings_equal(name, "fg") ||
+               strings_equal(name, "bg") || strings_equal(name, "kill") ||
+               strings_equal(name, "run");
 }
 
 static int shell_execute_builtin(int count, char **arguments,
@@ -1339,6 +1894,130 @@ static int shell_execute_builtin(int count, char **arguments,
                 }
                 return 0;
         }
+        if (strings_equal(arguments[0], "export")) {
+                if (count == 1) {
+                        for (size_t index = 0U; index < shell_environment_count;
+                             index++) {
+                                print("export ");
+                                print(shell_environment[index]);
+                                print("\n");
+                        }
+                        return 0;
+                }
+                if (count == 3 && string_contains(arguments[1], '=') == false) {
+                        if (!environment_set(arguments[1], arguments[2])) {
+                                print_error("export: invalid assignment\n");
+                                return 1;
+                        }
+                        return 0;
+                }
+                for (int index = 1; index < count; index++) {
+                        if (!shell_set_assignment(arguments[index])) {
+                                print_error("Usage: export NAME=VALUE...\n");
+                                return 1;
+                        }
+                }
+                return 0;
+        }
+        if (strings_equal(arguments[0], "unset")) {
+                if (count < 2) {
+                        print_error("Usage: unset NAME...\n");
+                        return 1;
+                }
+                for (int index = 1; index < count; index++) {
+                        if (!environment_name_is_valid(arguments[index])) {
+                                print_error("unset: invalid name\n");
+                                return 1;
+                        }
+                        environment_unset(arguments[index]);
+                }
+                return 0;
+        }
+        if (strings_equal(arguments[0], "alias")) {
+                if (count == 1) {
+                        for (size_t index = 0U; index < SHELL_ALIAS_LIMIT;
+                             index++) {
+                                if (shell_aliases[index].used) {
+                                        alias_print(&shell_aliases[index]);
+                                }
+                        }
+                        return 0;
+                }
+                int status = 0;
+                for (int index = 1; index < count; index++) {
+                        struct shell_alias *existing =
+                            alias_find(arguments[index]);
+                        if (existing != NULL) {
+                                alias_print(existing);
+                        } else if (!alias_set(arguments[index])) {
+                                print_error("alias: expected NAME=VALUE\n");
+                                status = 1;
+                        }
+                }
+                return status;
+        }
+        if (strings_equal(arguments[0], "unalias")) {
+                if (count < 2) {
+                        print_error("Usage: unalias NAME...\n");
+                        return 1;
+                }
+                int status = 0;
+                for (int index = 1; index < count; index++) {
+                        struct shell_alias *alias =
+                            alias_find(arguments[index]);
+                        if (alias == NULL) {
+                                print_error("unalias: no such alias: ");
+                                print_error(arguments[index]);
+                                print_error("\n");
+                                status = 1;
+                        } else {
+                                alias->used = false;
+                        }
+                }
+                return status;
+        }
+        if (strings_equal(arguments[0], "type")) {
+                if (count < 2) {
+                        print_error("Usage: type NAME...\n");
+                        return 1;
+                }
+                int status = 0;
+                for (int index = 1; index < count; index++) {
+                        struct shell_alias *alias =
+                            alias_find(arguments[index]);
+                        char resolved[SHELL_PATH_SIZE];
+                        print(arguments[index]);
+                        if (alias != NULL) {
+                                print(" is an alias for '");
+                                print(alias->value);
+                                print("'\n");
+                        } else if (shell_is_builtin(arguments[index])) {
+                                print(" is a shell builtin\n");
+                        } else if (shell_resolve_command(arguments[index],
+                                                         resolved)) {
+                                print(" is ");
+                                print(resolved);
+                                print("\n");
+                        } else {
+                                print(" not found\n");
+                                status = 1;
+                        }
+                }
+                return status;
+        }
+        if (strings_equal(arguments[0], "history")) {
+                if (count != 1) {
+                        print_error("Usage: history\n");
+                        return 1;
+                }
+                for (size_t index = 0U; index < shell_history_count; index++) {
+                        print_unsigned(index + 1U);
+                        print("  ");
+                        print(shell_history[index]);
+                        print("\n");
+                }
+                return 0;
+        }
         if (strings_equal(arguments[0], "jobs")) {
                 if (count != 1) {
                         print_error("Usage: jobs\n");
@@ -1350,6 +2029,12 @@ static int shell_execute_builtin(int count, char **arguments,
         }
         if (strings_equal(arguments[0], "fg")) {
                 return shell_foreground_job(count, arguments);
+        }
+        if (strings_equal(arguments[0], "bg")) {
+                return shell_background_job(count, arguments);
+        }
+        if (strings_equal(arguments[0], "kill")) {
+                return shell_kill_builtin(count, arguments);
         }
 
         /* Keep the former terminal's run command as a compatibility alias,
@@ -1693,6 +2378,109 @@ static bool shell_execute(struct shell_pipeline *pipeline) {
         return true;
 }
 
+static bool shell_execute_line(const char *line) {
+        while (*line == ' ' || *line == '\t') {
+                line++;
+        }
+        if (*line == '\0' || *line == '#') {
+                return true;
+        }
+
+        char expanded[SHELL_LINE_SIZE];
+        struct shell_pipeline pipeline;
+        if (!shell_expand_aliases(line, expanded)) {
+                print_error("sh: alias expansion is too long or recursive\n");
+                shell_last_status = 2;
+                return true;
+        }
+        if (!shell_parse_pipeline(expanded, &pipeline)) {
+                print_error("sh: syntax error: ");
+                print_error(pipeline.parse_error == NULL
+                                ? "invalid command"
+                                : pipeline.parse_error);
+                print_error("\n");
+                shell_last_status = 2;
+                return true;
+        }
+        return shell_execute(&pipeline);
+}
+
+static bool shell_run_startup_file(const char *path) {
+        long descriptor = rose_open(path, USER_OPEN_READ);
+        if (descriptor < 0) {
+                return true;
+        }
+
+        char line[SHELL_LINE_SIZE];
+        size_t length = 0U;
+        bool overflow = false;
+        bool keep_running = true;
+        char character;
+        while (keep_running &&
+               rose_read((int)descriptor, &character, 1U) == 1) {
+                if (character == '\n') {
+                        if (overflow) {
+                                print_error("sh: startup line is too long: ");
+                                print_error(path);
+                                print_error("\n");
+                                shell_last_status = 2;
+                        } else {
+                                line[length] = '\0';
+                                keep_running = shell_execute_line(line);
+                        }
+                        length = 0U;
+                        overflow = false;
+                } else if (character != '\r') {
+                        if (length + 1U < sizeof(line)) {
+                                line[length++] = character;
+                        } else {
+                                overflow = true;
+                        }
+                }
+        }
+        if (keep_running && (length != 0U || overflow)) {
+                if (overflow) {
+                        print_error("sh: startup line is too long: ");
+                        print_error(path);
+                        print_error("\n");
+                        shell_last_status = 2;
+                } else {
+                        line[length] = '\0';
+                        keep_running = shell_execute_line(line);
+                }
+        }
+        (void)rose_close((int)descriptor);
+        return keep_running;
+}
+
+static bool shell_run_startup_files(void) {
+        if (!shell_run_startup_file("/etc/roserc")) {
+                return false;
+        }
+        const char *home = environment_value("HOME");
+        if (home == NULL) {
+                return true;
+        }
+        char path[SHELL_PATH_SIZE];
+        size_t length = string_length(home);
+        static const char suffix[] = "/.roserc";
+        size_t suffix_start = length;
+        if (length == 1U && home[0] == '/') {
+                suffix_start = 0U;
+        }
+        if (suffix_start + sizeof(suffix) > sizeof(path)) {
+                print_error("sh: HOME is too long for ~/.roserc\n");
+                return true;
+        }
+        for (size_t index = 0U; index < length; index++) {
+                path[index] = home[index];
+        }
+        for (size_t index = 0U; index < sizeof(suffix); index++) {
+                path[suffix_start + index] = suffix[index];
+        }
+        return shell_run_startup_file(path);
+}
+
 static void shell_initialize_job_control(void) {
         long pid = rose_getpid();
         long process_group = rose_getpgrp();
@@ -1746,26 +2534,42 @@ int rose_shell_main(char **environment) { // NOLINT(misc-use-internal-linkage)
         environment_initialize(environment);
         shell_initialize_job_control();
         shell_last_status = 0;
+        if (!shell_run_startup_files()) {
+                shell_terminate_jobs();
+                return 0;
+        }
         print("ROSE userspace shell\n");
 
         while (true) {
                 char line[SHELL_LINE_SIZE];
-                struct shell_pipeline pipeline;
+
+                shell_notify_jobs();
 
                 if (!shell_read_line(line)) {
                         print("Shutting down...\n");
                         shell_terminate_jobs();
                         return 0;
                 }
-
-                if (!shell_parse_pipeline(line, &pipeline)) {
-                        print_error("sh: invalid or too long command line\n");
-                        shell_last_status = 2;
-                        continue;
-                }
-                if (!shell_execute(&pipeline)) {
+                if (!shell_execute_line(line)) {
                         shell_terminate_jobs();
                         return 0;
                 }
         }
 }
+
+#ifdef ROSE_SHELL_PARSE_TEST
+/* Narrow host-test adapter. Section garbage collection drops the interactive
+ * shell and leaves only the allocation-free parser plus a getpid stub. */
+int rose_shell_parse_test(const char *line, size_t *command_count,
+                          bool *background, const char **error) {
+        char *environment[] = {"HOME=/", "PATH=/bin:/sbin", NULL};
+        struct shell_pipeline pipeline;
+        environment_initialize(environment);
+        shell_last_status = 7;
+        bool parsed = shell_parse_pipeline(line, &pipeline);
+        *command_count = pipeline.command_count;
+        *background = pipeline.background;
+        *error = pipeline.parse_error;
+        return parsed ? 0 : 1;
+}
+#endif

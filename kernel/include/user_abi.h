@@ -58,6 +58,7 @@
 #define USER_SYSCALL_CREATE_SESSION 52
 #define USER_SYSCALL_GET_SESSION 53
 #define USER_SYSCALL_TERMINAL_SET_CONTROLLING 54
+#define USER_SYSCALL_PROCESS_LIST 55
 
 #else
 
@@ -117,6 +118,7 @@ enum user_syscall_number {
         USER_SYSCALL_CREATE_SESSION = 52,
         USER_SYSCALL_GET_SESSION = 53,
         USER_SYSCALL_TERMINAL_SET_CONTROLLING = 54,
+        USER_SYSCALL_PROCESS_LIST = 55,
 };
 
 /* Stable negative error values returned in a0 by failed system calls. */
@@ -369,6 +371,27 @@ struct user_system_info {
         uint32_t reserved;
 };
 
+enum user_process_state {
+        USER_PROCESS_READY,
+        USER_PROCESS_RUNNING,
+        USER_PROCESS_BLOCKED,
+        USER_PROCESS_STOPPED,
+};
+
+enum {
+        USER_PROCESS_INFO_LIMIT = 48,
+        USER_PROCESS_NAME_MAX = 48,
+};
+
+struct user_process_info {
+        uint64_t pid;
+        uint64_t parent_pid;
+        uint64_t process_group;
+        uint32_t state;
+        uint32_t reserved;
+        char name[USER_PROCESS_NAME_MAX];
+};
+
 enum user_standard_file_descriptor {
         USER_STDIN_FILENO = 0,
         USER_STDOUT_FILENO = 1,
@@ -404,6 +427,15 @@ enum user_program {
         USER_PROGRAM_GUI_TERMINAL,
         USER_PROGRAM_GUI_FILES,
         USER_PROGRAM_GUI_SYSTEM_MONITOR,
+        USER_PROGRAM_CP,
+        USER_PROGRAM_MV,
+        USER_PROGRAM_TOUCH,
+        USER_PROGRAM_HEAD,
+        USER_PROGRAM_WC,
+        USER_PROGRAM_FIND,
+        USER_PROGRAM_KILL,
+        USER_PROGRAM_SLEEP,
+        USER_PROGRAM_PS,
 };
 
 #endif

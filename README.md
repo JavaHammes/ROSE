@@ -86,6 +86,8 @@ programs in user mode.
   and optional nonblocking polling.
   Programs start with conventional `argc`, `argv`, and `envp` values copied to
   their private stack.
+  A validated process snapshot ABI exposes PID, parent, process group, state,
+  and executable name to the userspace `ps` tool.
   Private anonymous `mmap` reservations allocate zero-filled pages lazily on
   first access. `mprotect` changes complete or partial ranges, including
   no-access mappings, without losing resident contents and preserves W^X and
@@ -107,15 +109,24 @@ programs in user mode.
   characters generate signals for the terminal's foreground process group;
   background controlling-terminal reads stop with `SIGTTIN`. Separate PTY
   sessions keep nested shells and graphical terminals independent.
-- Interactive `/bin/sh` process with console line editing, quoted and escaped
-  argument parsing, mutable environment variables, quote-aware `$NAME`,
+- Interactive `/bin/sh` process with console line editing, command history,
+  unique path completion, quoted and escaped argument parsing, aliases,
+  mutable environment variables, quote-aware `$NAME`,
   `${NAME}`, `$?`, and `$$` parameter expansion, `PATH` lookup, working
   directory built-ins, and ordered standard-descriptor redirection with `<`,
   truncating `>`, appending `>>`, `2>`, `2>>`, and descriptor duplication such
   as `2>&1`. Foreground and `&` background pipelines support up to six commands,
-  with `jobs`/`fg` job management.
+  with `jobs`/`fg`/`bg`, current and previous job selectors, job-aware `kill`,
+  and prompt-boundary Done/Stopped notifications. The shell reads
+  `/etc/roserc` and then `~/.roserc`, and syntax diagnostics identify the
+  unexpected construct. Stateful built-ins include `export`, `unset`,
+  `alias`, `unalias`, `type`, and `history` (`setenv`/`unsetenv` remain as
+  compatibility aliases).
   Practical `/bin` utilities include `ls`, `cat`, `echo`, `pwd`, `env`,
-  `mkdir`, and `rm`. Command syntax and dispatch do not run in supervisor mode.
+  `mkdir`, `rm`, `cp`, `mv`, `touch`, `head`, `wc`, `find`, `ps`, `kill`, and
+  `sleep`. Shared allocation-free string, number, and I/O helpers live in a
+  small userspace runtime. Command syntax and dispatch do not run in supervisor
+  mode.
 - Sixteen-slot round-robin process scheduler with timer preemption, guarded user
   stacks, per-process kernel trap stacks, process creation, termination,
   parent/child ownership, orphan adoption by PID 0, waiting, reaping, typed
@@ -216,8 +227,12 @@ Useful commands are:
 | `pipe-test` | Exercise inherited descriptors and blocking anonymous pipes. |
 | `desktop` | Enter the multi-application desktop (Escape returns). |
 | `env` | Show environment variables inherited by new programs. |
-| `setenv NAME VALUE` | Set an inherited environment variable. |
-| `unsetenv NAME` | Remove an inherited environment variable. |
+| `export NAME=VALUE` / `unset NAME` | Change inherited environment variables. |
+| `alias NAME='COMMAND'` / `unalias NAME` | Define or remove a command alias. |
+| `history` / `type NAME` | Inspect recalled commands or command resolution. |
+| `jobs` / `fg [%JOB]` / `bg [%JOB]` | Inspect and resume shell jobs. |
+| `kill [-SIGNAL] PID\|%JOB` | Signal a process or shell job. |
+| `cp`, `mv`, `touch`, `head`, `wc`, `find`, `ps`, `sleep` | File, text, process, and timing utilities. |
 | `echo "$HOME ($$): $?"` | Expand environment, shell PID, and prior status parameters. |
 | `run [PATH [ARG...]]` | Compatibility alias; defaults to `/bin/hello`. |
 | `exit` | Shut QEMU down through SBI SRST. |

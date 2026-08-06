@@ -82,8 +82,7 @@ _Static_assert((uint32_t)USER_OPEN_READ == (uint32_t)VFS_OPEN_READ &&
                        (uint32_t)VFS_OPEN_TRUNCATE &&
                    (uint32_t)USER_OPEN_DIRECTORY ==
                        (uint32_t)VFS_OPEN_DIRECTORY &&
-                   (uint32_t)USER_OPEN_APPEND ==
-                       (uint32_t)VFS_OPEN_APPEND,
+                   (uint32_t)USER_OPEN_APPEND == (uint32_t)VFS_OPEN_APPEND,
                "User and VFS open flags must match");
 
 /*
@@ -219,6 +218,7 @@ struct process {
         bool continued_event;
         bool exit_reported;
         char current_directory[USER_PATH_MAX];
+        char executable[USER_PROCESS_NAME_MAX];
         struct process_descriptor descriptors[PROCESS_DESCRIPTOR_LIMIT];
         struct process_shared_memory_mapping
             shared_memory[SHARED_MEMORY_PROCESS_LIMIT];
@@ -363,11 +363,10 @@ static void process_terminal_set_defaults(struct process_terminal *terminal,
         terminal->console = console;
         /* Preserve the serial console's established userspace line editor.
          * PTYs start with the conventional cooked discipline. */
-        terminal->attributes.flags = console
-                                         ? USER_TERMINAL_SIGNALS
-                                         : USER_TERMINAL_CANONICAL |
-                                               USER_TERMINAL_ECHO |
-                                               USER_TERMINAL_SIGNALS;
+        terminal->attributes.flags = console ? USER_TERMINAL_SIGNALS
+                                             : USER_TERMINAL_CANONICAL |
+                                                   USER_TERMINAL_ECHO |
+                                                   USER_TERMINAL_SIGNALS;
         terminal->attributes.interrupt_character = UINT8_C(0x03);
         terminal->attributes.quit_character = UINT8_C(0x1c);
         terminal->attributes.erase_character = UINT8_C(0x7f);
@@ -395,8 +394,7 @@ static struct process_terminal *process_terminal_allocate(void) {
         return NULL;
 }
 
-static void process_terminal_maybe_destroy(
-    struct process_terminal *terminal) {
+static void process_terminal_maybe_destroy(struct process_terminal *terminal) {
         if (terminal == NULL || terminal->console || !terminal->used) {
                 return;
         }
@@ -976,6 +974,16 @@ static size_t string_length(const char *text) {
         return length;
 }
 
+static void process_set_executable(struct process *process, const char *path) {
+        size_t index = 0U;
+        while (path[index] != '\0' &&
+               index + 1U < sizeof(process->executable)) {
+                process->executable[index] = path[index];
+                index++;
+        }
+        process->executable[index] = '\0';
+}
+
 static bool stack_copy_string(void *stack_page, uintptr_t *cursor,
                               const char *text, uintptr_t *user_address) {
         size_t length = string_length(text) + 1U;
@@ -1168,9 +1176,8 @@ static uint64_t process_create(struct process *process, const char *path,
                                   ? process->pid
                                   : descriptor_source->session_id;
         process->controlling_terminal =
-            descriptor_source == NULL
-                ? process_console_terminal()
-                : descriptor_source->controlling_terminal;
+            descriptor_source == NULL ? process_console_terminal()
+                                      : descriptor_source->controlling_terminal;
         process->state = PROCESS_READY;
         /* SPIE causes sret to enable supervisor interrupts while U-mode runs.
          */
@@ -1178,6 +1185,7 @@ static uint64_t process_create(struct process *process, const char *path,
         process->exit_status = UINT64_MAX;
         process->current_directory[0] = '/';
         process->current_directory[1] = '\0';
+        process_set_executable(process, path);
         bool descriptors_ready =
             descriptor_source == NULL
                 ? process_descriptors_initialize(process)
@@ -1185,8 +1193,7 @@ static uint64_t process_create(struct process *process, const char *path,
         if (!descriptors_ready) {
                 process_release_resources(process);
                 bytes_zero(process, sizeof(*process));
-                return (uint64_t)-(
-                    int64_t)USER_ERROR_FILE_TABLE_OVERFLOW;
+                return (uint64_t)-(int64_t)USER_ERROR_FILE_TABLE_OVERFLOW;
         }
         next_pid++;
         if (next_pid == 0U) {
@@ -1566,6 +1573,7 @@ static uint64_t syscall_fork(const struct trap_frame *frame) {
                 child->current_directory[index] =
                     parent->current_directory[index];
         }
+        process_set_executable(child, parent->executable);
 
         child->address_space = virtual_memory_create_address_space();
         child->kernel_trap_stack = page_alloc();
@@ -1741,8 +1749,7 @@ static bool process_signal_ignored_by_default(uint32_t signal) {
  * the normal trusted return boundary can terminate it. */
 static void process_queue_signal(struct process *target, uint32_t signal) {
         if (process_signal_ignored_by_default(signal) &&
-            target->signal_dispositions[signal].handler <=
-                USER_SIGNAL_IGNORE) {
+            target->signal_dispositions[signal].handler <= USER_SIGNAL_IGNORE) {
                 return;
         }
         if (signal == USER_SIGNAL_CONTINUE) {
@@ -1920,8 +1927,8 @@ static uint64_t syscall_set_process_group(int64_t pid, int64_t process_group) {
         return 0U;
 }
 
-static struct process_terminal *process_descriptor_terminal(
-    uint64_t descriptor, uint8_t *endpoint) {
+static struct process_terminal *process_descriptor_terminal(uint64_t descriptor,
+                                                            uint8_t *endpoint) {
         if (descriptor >= PROCESS_DESCRIPTOR_LIMIT) {
                 return NULL;
         }
@@ -1961,9 +1968,9 @@ static uint64_t syscall_terminal_set_foreground_group(uint64_t descriptor,
             terminal->controlling_session != active_process->session_id) {
                 return (uint64_t)-(int64_t)USER_ERROR_PERMISSION;
         }
-        if (process_group <= 0 || !process_group_belongs_to_session(
-                                      (uint64_t)process_group,
-                                      active_process->session_id)) {
+        if (process_group <= 0 ||
+            !process_group_belongs_to_session((uint64_t)process_group,
+                                              active_process->session_id)) {
                 return (uint64_t)-(int64_t)USER_ERROR_NO_PROCESS;
         }
         terminal->foreground_process_group = (uint64_t)process_group;
@@ -1980,8 +1987,9 @@ static uint64_t syscall_terminal_get_foreground_group(uint64_t descriptor) {
         return terminal->foreground_process_group;
 }
 
-static bool process_terminal_signal_foreground(
-    const struct process_terminal *terminal, uint32_t signal) {
+static bool
+process_terminal_signal_foreground(const struct process_terminal *terminal,
+                                   uint32_t signal) {
         bool matched = false;
         if (terminal == NULL || terminal->foreground_process_group == 0U) {
                 return false;
@@ -2001,8 +2009,9 @@ static bool process_terminal_signal_foreground(
         return matched;
 }
 
-static uint32_t process_terminal_control_signal(
-    const struct process_terminal *terminal, uint8_t character) {
+static uint32_t
+process_terminal_control_signal(const struct process_terminal *terminal,
+                                uint8_t character) {
         if ((terminal->attributes.flags & USER_TERMINAL_SIGNALS) == 0U) {
                 return 0U;
         }
@@ -2041,12 +2050,13 @@ static void process_pipe_discard_last(struct process_pipe *pipe) {
 
 /* Process one byte written to a PTY master. False means that accepting this
  * byte would overrun the input or echo ring and the write must wait. */
-static bool process_terminal_master_write_character(
-    struct process_terminal *terminal, uint8_t character) {
+static bool
+process_terminal_master_write_character(struct process_terminal *terminal,
+                                        uint8_t character) {
         struct process_pipe *input = terminal->input_pipe;
         struct process_pipe *output = terminal->output_pipe;
-        bool canonical = (terminal->attributes.flags &
-                          USER_TERMINAL_CANONICAL) != 0U;
+        bool canonical =
+            (terminal->attributes.flags & USER_TERMINAL_CANONICAL) != 0U;
         bool echo = (terminal->attributes.flags & USER_TERMINAL_ECHO) != 0U;
         uint32_t signal = process_terminal_control_signal(terminal, character);
         bool erase = canonical && terminal->attributes.erase_character != 0U &&
@@ -2058,9 +2068,9 @@ static bool process_terminal_master_write_character(
         size_t echo_length = 0U;
 
         if (echo && signal == 0U && !eof) {
-                echo_length = erase ? (terminal->canonical_pending != 0U ? 3U
-                                                                         : 0U)
-                                    : (newline ? 2U : 1U);
+                echo_length =
+                    erase ? (terminal->canonical_pending != 0U ? 3U : 0U)
+                          : (newline ? 2U : 1U);
         }
         if (echo_length > PIPE_BUFFER_SIZE - output->count) {
                 return false;
@@ -2160,9 +2170,9 @@ static uint64_t syscall_terminal_set_attributes(uint64_t descriptor,
         struct user_terminal_attributes attributes;
         user_copy_from((uint8_t *)&attributes, user_attributes,
                        sizeof(attributes));
-        if ((attributes.flags & ~(uint32_t)(USER_TERMINAL_CANONICAL |
-                                            USER_TERMINAL_ECHO |
-                                            USER_TERMINAL_SIGNALS)) != 0U) {
+        if ((attributes.flags &
+             ~(uint32_t)(USER_TERMINAL_CANONICAL | USER_TERMINAL_ECHO |
+                         USER_TERMINAL_SIGNALS)) != 0U) {
                 return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
         }
         for (size_t index = 0U; index < sizeof(attributes.reserved); index++) {
@@ -2171,10 +2181,9 @@ static uint64_t syscall_terminal_set_attributes(uint64_t descriptor,
                 }
         }
 
-        bool was_canonical = (terminal->attributes.flags &
-                              USER_TERMINAL_CANONICAL) != 0U;
-        bool canonical =
-            (attributes.flags & USER_TERMINAL_CANONICAL) != 0U;
+        bool was_canonical =
+            (terminal->attributes.flags & USER_TERMINAL_CANONICAL) != 0U;
+        bool canonical = (attributes.flags & USER_TERMINAL_CANONICAL) != 0U;
         terminal->attributes = attributes;
         if (was_canonical != canonical && terminal->input_pipe != NULL) {
                 /* Never strand bytes across a mode transition. Existing input
@@ -2200,8 +2209,7 @@ static uint64_t syscall_terminal_get_window_size(uint64_t descriptor,
                                  VM_PAGE_WRITE)) {
                 return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
         }
-        user_copy_to(user_window_size,
-                     (const uint8_t *)&terminal->window_size,
+        user_copy_to(user_window_size, (const uint8_t *)&terminal->window_size,
                      sizeof(terminal->window_size));
         return 0U;
 }
@@ -2209,8 +2217,7 @@ static uint64_t syscall_terminal_get_window_size(uint64_t descriptor,
 static bool process_terminal_window_sizes_equal(
     const struct user_terminal_window_size *left,
     const struct user_terminal_window_size *right) {
-        return left->rows == right->rows &&
-               left->columns == right->columns &&
+        return left->rows == right->rows && left->columns == right->columns &&
                left->pixel_width == right->pixel_width &&
                left->pixel_height == right->pixel_height;
 }
@@ -2254,8 +2261,9 @@ static bool process_session_has_live_member(uint64_t session_id) {
         return false;
 }
 
-static void process_terminal_release_empty_session(
-    struct process_terminal *terminal, uint64_t session_id) {
+static void
+process_terminal_release_empty_session(struct process_terminal *terminal,
+                                       uint64_t session_id) {
         if (terminal != NULL && terminal->controlling_session == session_id &&
             !process_session_has_live_member(session_id)) {
                 terminal->controlling_session = 0U;
@@ -2284,9 +2292,8 @@ static uint64_t syscall_get_session(int64_t pid) {
         }
         struct process *target =
             pid == 0 ? active_process : process_find_pid((uint64_t)pid);
-        return target == NULL
-                   ? (uint64_t)-(int64_t)USER_ERROR_NO_PROCESS
-                   : target->session_id;
+        return target == NULL ? (uint64_t)-(int64_t)USER_ERROR_NO_PROCESS
+                              : target->session_id;
 }
 
 static uint64_t syscall_terminal_set_controlling(uint64_t descriptor) {
@@ -2681,6 +2688,7 @@ static uint64_t syscall_execve(struct trap_frame *frame, uintptr_t user_path,
 
         process_descriptors_close_on_exec(active_process);
         process_commit_replacement(frame);
+        process_set_executable(active_process, path);
         return 0U;
 }
 
@@ -3000,8 +3008,7 @@ static uint64_t syscall_open(uintptr_t user_path, uint32_t flags) {
 
         struct process_open_file *open_file = process_open_file_allocate();
         if (open_file == NULL) {
-                return (uint64_t)-(
-                    int64_t)USER_ERROR_FILE_TABLE_OVERFLOW;
+                return (uint64_t)-(int64_t)USER_ERROR_FILE_TABLE_OVERFLOW;
         }
         open_file->access = access;
         open_file->append = (flags & VFS_OPEN_APPEND) != 0U;
@@ -4144,6 +4151,62 @@ static uint64_t syscall_system_info(uintptr_t user_information) {
         return 0U;
 }
 
+static uint64_t syscall_process_list(uintptr_t user_processes,
+                                     size_t capacity) {
+        if (capacity > USER_PROCESS_INFO_LIMIT) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+        if (capacity != 0U &&
+            !user_range_is_valid(user_processes,
+                                 capacity * sizeof(struct user_process_info),
+                                 VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+
+        size_t count = 0U;
+        for (size_t index = 0U; index < PROCESS_LIMIT && count < capacity;
+             index++) {
+                const struct process *process = &process_table[index];
+                if (process->state == PROCESS_UNUSED ||
+                    process->state == PROCESS_EXITED) {
+                        continue;
+                }
+                struct user_process_info information;
+                bytes_zero(&information, sizeof(information));
+                information.pid = process->pid;
+                information.parent_pid = process->parent_pid;
+                information.process_group = process->process_group;
+                switch (process->state) {
+                case PROCESS_READY:
+                        information.state = USER_PROCESS_READY;
+                        break;
+                case PROCESS_RUNNING:
+                        information.state = USER_PROCESS_RUNNING;
+                        break;
+                case PROCESS_BLOCKED:
+                        information.state = USER_PROCESS_BLOCKED;
+                        break;
+                case PROCESS_STOPPED:
+                        information.state = USER_PROCESS_STOPPED;
+                        break;
+                case PROCESS_UNUSED:
+                case PROCESS_EXITED:
+                default:
+                        panic("Invalid process state in snapshot");
+                }
+                for (size_t character = 0U;
+                     character < sizeof(information.name); character++) {
+                        information.name[character] =
+                            process->executable[character];
+                }
+                user_copy_to(
+                    user_processes + count * sizeof(struct user_process_info),
+                    (const uint8_t *)&information, sizeof(information));
+                count++;
+        }
+        return count;
+}
+
 static uint64_t saturating_add(uint64_t left, uint64_t right) {
         return left > UINT64_MAX - right ? UINT64_MAX : left + right;
 }
@@ -4153,8 +4216,7 @@ static uint64_t milliseconds_to_nanoseconds(int64_t milliseconds) {
         if (milliseconds <= 0) {
                 return 0U;
         }
-        if ((uint64_t)milliseconds >
-            UINT64_MAX / nanoseconds_per_millisecond) {
+        if ((uint64_t)milliseconds > UINT64_MAX / nanoseconds_per_millisecond) {
                 return UINT64_MAX;
         }
         return (uint64_t)milliseconds * nanoseconds_per_millisecond;
@@ -4167,10 +4229,9 @@ static void process_wait_begin(enum process_pending_wait wait,
                 active_process->pending_wait = wait;
                 active_process->pending_wait_has_deadline = has_deadline;
                 active_process->pending_wait_deadline =
-                    has_deadline
-                        ? saturating_add(timer_monotonic_nanoseconds(),
-                                         duration_nanoseconds)
-                        : 0U;
+                    has_deadline ? saturating_add(timer_monotonic_nanoseconds(),
+                                                  duration_nanoseconds)
+                                 : 0U;
                 return;
         }
         if (active_process->pending_wait != wait) {
@@ -4223,15 +4284,13 @@ static uint32_t descriptor_ready_events(int32_t descriptor,
                     open_file->terminal_endpoint == PROCESS_TERMINAL_SLAVE &&
                     (open_file->terminal->attributes.flags &
                      USER_TERMINAL_CANONICAL) != 0U;
-                bool input_ready =
-                    !canonical_slave ||
-                    open_file->terminal->canonical_ready != 0U ||
-                    open_file->terminal->canonical_eof;
+                bool input_ready = !canonical_slave ||
+                                   open_file->terminal->canonical_ready != 0U ||
+                                   open_file->terminal->canonical_eof;
                 if ((requested & USER_POLL_READABLE) != 0U &&
                     ((pipe->count != 0U && input_ready) ||
                      pipe->writers == 0U ||
-                     (canonical_slave &&
-                      open_file->terminal->canonical_eof))) {
+                     (canonical_slave && open_file->terminal->canonical_eof))) {
                         returned |= USER_POLL_READABLE;
                 }
                 if (pipe->writers == 0U) {
@@ -4294,9 +4353,8 @@ static uint64_t poll_validate(uintptr_t user_descriptors, size_t count) {
 static size_t poll_scan(uintptr_t user_descriptors, size_t count) {
         size_t ready = 0U;
         for (size_t index = 0U; index < count; index++) {
-                uintptr_t address =
-                    user_descriptors +
-                    index * sizeof(struct user_poll_descriptor);
+                uintptr_t address = user_descriptors +
+                                    index * sizeof(struct user_poll_descriptor);
                 struct user_poll_descriptor descriptor;
                 user_copy_from((uint8_t *)&descriptor, address,
                                sizeof(descriptor));
@@ -4323,9 +4381,8 @@ static void syscall_sleep(struct trap_frame *frame,
         process_wait_block(frame, SCHEDULER_WAIT_TIMER);
 }
 
-static void syscall_poll(struct trap_frame *frame,
-                         uintptr_t user_descriptors, size_t count,
-                         int64_t timeout_milliseconds) {
+static void syscall_poll(struct trap_frame *frame, uintptr_t user_descriptors,
+                         size_t count, int64_t timeout_milliseconds) {
         uint64_t validation = poll_validate(user_descriptors, count);
         if (validation != 0U) {
                 process_wait_complete();
@@ -4386,8 +4443,7 @@ static uint64_t wait_item_scan(struct user_wait_item *item) {
                         0U ||
                     item->identifier < INT32_MIN ||
                     item->identifier > INT32_MAX) {
-                        return (uint64_t)-(
-                            int64_t)USER_ERROR_INVALID_ARGUMENT;
+                        return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
                 }
                 item->returned_events = descriptor_ready_events(
                     (int32_t)item->identifier, item->events);
@@ -4396,8 +4452,7 @@ static uint64_t wait_item_scan(struct user_wait_item *item) {
         case USER_WAIT_OBJECT_INPUT:
                 if (item->identifier != 0 || item->value != 0U ||
                     item->events != USER_WAIT_EVENT_READABLE) {
-                        return (uint64_t)-(
-                            int64_t)USER_ERROR_INVALID_ARGUMENT;
+                        return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
                 }
                 if (graphics_owner_pid != active_process->pid) {
                         return (uint64_t)-(int64_t)USER_ERROR_PERMISSION;
@@ -4408,28 +4463,24 @@ static uint64_t wait_item_scan(struct user_wait_item *item) {
                 return 0U;
 
         case USER_WAIT_OBJECT_CHILD: {
-                const uint32_t child_events =
-                    USER_WAIT_EVENT_CHILD_EXITED |
-                    USER_WAIT_EVENT_CHILD_STOPPED |
-                    USER_WAIT_EVENT_CHILD_CONTINUED;
+                const uint32_t child_events = USER_WAIT_EVENT_CHILD_EXITED |
+                                              USER_WAIT_EVENT_CHILD_STOPPED |
+                                              USER_WAIT_EVENT_CHILD_CONTINUED;
                 if ((item->events & ~child_events) != 0U ||
                     item->events == 0U || item->value != 0U ||
                     item->identifier == INT64_MIN) {
-                        return (uint64_t)-(
-                            int64_t)USER_ERROR_INVALID_ARGUMENT;
+                        return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
                 }
                 bool found_child;
                 item->returned_events = (uint32_t)child_ready_events(
                     item->identifier, item->events, &found_child);
-                return found_child
-                           ? 0U
-                           : (uint64_t)-(int64_t)USER_ERROR_NO_CHILD;
+                return found_child ? 0U
+                                   : (uint64_t)-(int64_t)USER_ERROR_NO_CHILD;
         }
 
         case USER_WAIT_OBJECT_SHARED_WORD: {
                 if (item->events != USER_WAIT_EVENT_CHANGED) {
-                        return (uint64_t)-(
-                            int64_t)USER_ERROR_INVALID_ARGUMENT;
+                        return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
                 }
                 if (item->identifier <= 0 ||
                     !user_range_is_valid((uintptr_t)item->identifier,
@@ -4437,8 +4488,8 @@ static uint64_t wait_item_scan(struct user_wait_item *item) {
                         return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
                 }
                 uint32_t current;
-                user_copy_from((uint8_t *)&current,
-                               (uintptr_t)item->identifier, sizeof(current));
+                user_copy_from((uint8_t *)&current, (uintptr_t)item->identifier,
+                               sizeof(current));
                 if (current != (uint32_t)item->value) {
                         item->returned_events = USER_WAIT_EVENT_CHANGED;
                         item->value = current;
@@ -4484,9 +4535,8 @@ static uint64_t wait_events_scan(uintptr_t user_items, size_t count,
         return 0U;
 }
 
-static void syscall_wait_events(struct trap_frame *frame,
-                                uintptr_t user_items, size_t count,
-                                int64_t timeout_nanoseconds) {
+static void syscall_wait_events(struct trap_frame *frame, uintptr_t user_items,
+                                size_t count, int64_t timeout_nanoseconds) {
         uint64_t validation = wait_events_validate(user_items, count);
         if (validation != 0U) {
                 process_wait_complete();
@@ -4707,21 +4757,22 @@ static void process_continue_write(struct trap_frame *frame) {
                         while (process->write_offset < process->write_length &&
                                process_terminal_master_write_character(
                                    open_file->terminal,
-                                   (uint8_t)process->write_buffer
-                                       [process->write_offset])) {
+                                   (uint8_t)process
+                                       ->write_buffer[process->write_offset])) {
                                 process->write_offset++;
                         }
                         if (process->write_offset != process->write_length) {
-                                if (process->descriptors
-                                        [process->write_descriptor]
-                                            .nonblocking) {
-                                        size_t completed = process->write_offset;
+                                if (process
+                                        ->descriptors[process->write_descriptor]
+                                        .nonblocking) {
+                                        size_t completed =
+                                            process->write_offset;
                                         process->pending_write = false;
-                                        frame->a0 = completed == 0U
-                                                        ? (uint64_t)-(
-                                                              int64_t)
-                                                              USER_ERROR_TRY_AGAIN
-                                                        : completed;
+                                        frame->a0 =
+                                            completed == 0U
+                                                ? (uint64_t)-(int64_t)
+                                                      USER_ERROR_TRY_AGAIN
+                                                : completed;
                                         frame->sepc += 4U;
                                         return;
                                 }
@@ -4874,7 +4925,8 @@ static void process_continue_read(struct trap_frame *frame) {
                 }
                 if (canonical) {
                         size_t scan = pipe->read_offset;
-                        for (size_t offset = 0U; offset < pipe_count; offset++) {
+                        for (size_t offset = 0U; offset < pipe_count;
+                             offset++) {
                                 if (pipe->buffer[scan] == (uint8_t)'\n') {
                                         pipe_count = offset + 1U;
                                         break;
@@ -5339,8 +5391,7 @@ void user_process_handle_syscall(struct trap_frame *frame) {
         if (process_has_deliverable_signal(active_process)) {
                 if (active_process->pending_wait != PROCESS_WAIT_NONE) {
                         process_wait_complete();
-                        frame->a0 =
-                            (uint64_t)-(int64_t)USER_ERROR_INTERRUPTED;
+                        frame->a0 = (uint64_t)-(int64_t)USER_ERROR_INTERRUPTED;
                         frame->sepc += 4U;
                 }
                 return;
@@ -5621,6 +5672,12 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 frame->sepc += 4U;
                 return;
 
+        case USER_SYSCALL_PROCESS_LIST:
+                frame->a0 = syscall_process_list((uintptr_t)frame->a0,
+                                                 (size_t)frame->a1);
+                frame->sepc += 4U;
+                return;
+
         case USER_SYSCALL_MMAP:
                 frame->a0 =
                     syscall_mmap((size_t)frame->a0, (uint32_t)frame->a1);
@@ -5650,14 +5707,13 @@ void user_process_handle_syscall(struct trap_frame *frame) {
                 return;
 
         case USER_SYSCALL_POLL:
-                syscall_poll(frame, (uintptr_t)frame->a0,
-                             (size_t)frame->a1, (int64_t)frame->a2);
+                syscall_poll(frame, (uintptr_t)frame->a0, (size_t)frame->a1,
+                             (int64_t)frame->a2);
                 return;
 
         case USER_SYSCALL_WAIT_EVENTS:
                 syscall_wait_events(frame, (uintptr_t)frame->a0,
-                                    (size_t)frame->a1,
-                                    (int64_t)frame->a2);
+                                    (size_t)frame->a1, (int64_t)frame->a2);
                 return;
 
         case USER_SYSCALL_EVENT_NOTIFY:

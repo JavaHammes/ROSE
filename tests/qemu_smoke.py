@@ -268,6 +268,35 @@ def run_smoke_test(
             "Syntax: command",
             "Expansion: $NAME ${NAME} $? $$",
         )
+        require(session.command("echo startup=$ROSE_VERSION"), "startup=4")
+        require(
+            session.command("type cd ll cp"),
+            "cd is a shell builtin",
+            "ll is an alias for 'ls'",
+            "cp is /bin/cp",
+        )
+        require(session.command("ll /etc"), "motd", "roserc")
+        session.command("export EXPORTED=value")
+        require(session.command("echo $EXPORTED"), "\nvalue\n")
+        session.command("unset EXPORTED")
+        require(session.command("echo x${EXPORTED}x"), "\nxx\n")
+        session.command("alias greet='echo alias works'")
+        require(session.command("greet"), "\nalias works\n")
+        session.command("unalias greet")
+        require(
+            session.command("history"), "alias greet='echo alias works'", "history"
+        )
+        session.command("echo personal-startup > /.roserc")
+        session.command("echo exit >> /.roserc")
+        require(session.command("/bin/sh"), "personal-startup", "Shutting down")
+        session.command("rm /.roserc")
+
+        require(
+            session.command("echo bad |"), "sh: syntax error: expected command"
+        )
+        require(
+            session.command("echo 'bad"), "sh: syntax error: unterminated quote"
+        )
 
         require(
             session.command("ls /"),
@@ -291,6 +320,13 @@ def run_smoke_test(
         require(
             session.command("hello"),
             "Hello from U-mode C",
+        )
+        require(
+            session.command("ps"),
+            "PID PPID PGID STATE COMMAND",
+            "/sbin/init",
+            "/bin/sh",
+            "/bin/ps",
         )
         require(
             session.command("fault"),
@@ -328,8 +364,21 @@ def run_smoke_test(
 
         motd = "Welcome to ROSE. This message was read from writable ext2."
         require(session.command("cat /etc/motd"), motd)
+        require(session.edited_command(b"cat /etc/mo\t\n"), motd)
 
         require(session.command("mkdir /tmp"), "rose> ")
+        session.command("touch /tmp/empty")
+        session.command("echo first line > /tmp/lines")
+        session.command("echo second row >> /tmp/lines")
+        require(session.command("head -n 1 /tmp/lines"), "\nfirst line\n")
+        require(session.command("wc /tmp/lines"), "2 4 22 /tmp/lines")
+        session.command("cp /tmp/lines /tmp/copy")
+        require(session.command("cat /tmp/copy"), "first line", "second row")
+        session.command("mv /tmp/copy /tmp/moved")
+        require(
+            session.command("find /tmp"), "/tmp/empty", "/tmp/lines", "/tmp/moved"
+        )
+        require(session.command("sleep 0"), "rose> ")
         session.command("setenv ROSE_OUTPUT /tmp/expanded-output")
         session.command('echo expanded-redirection > "$ROSE_OUTPUT"')
         require(session.command("cat /tmp/expanded-output"), "expanded-redirection")
@@ -387,6 +436,9 @@ def run_smoke_test(
         session.command("rm /tmp/two-stage")
         session.command("rm /tmp/three-stage")
         session.command("rm /tmp/expanded-output")
+        session.command("rm /tmp/empty")
+        session.command("rm /tmp/lines")
+        session.command("rm /tmp/moved")
         session.command("rm /tmp")
         session.command("unsetenv ROSE_OUTPUT")
 
@@ -464,6 +516,39 @@ def run_smoke_test(
         require(session.command("jobs"), "[1] Stopped")
         resumed_reader = session.command_with_input("fg 1", b"fg 1\r\n", b"B")
         require(resumed_reader, "Console read: B")
+
+        require(session.command("sleep 5 &"), "Running")
+        require(session.command("sleep 5 &"), "Running")
+        previous_kill = session.command("kill %-")
+        current_kill = session.command("kill %+")
+        if "no such job" in previous_kill + current_kill:
+            raise AssertionError(
+                "current/previous job selection failed:\n"
+                f"{previous_kill}{current_kill}"
+            )
+        session.command("sleep 0")
+
+        stopped_sleep = session.command("sleep 5 &")
+        require(stopped_sleep, "Running")
+        session.command("kill -19 %+")
+        require(session.command("jobs"), "Stopped")
+        require(session.command("bg"), "Running")
+        session.command("kill %+")
+        session.command("jobs")
+
+        require(session.command("sleep 1 &"), "Running")
+        require(session.command("sleep 2", timeout=5.0), "Done")
+
+        external_kill_job = session.command("sleep 5 &")
+        running_lines = [
+            line for line in external_kill_job.splitlines()
+            if "] Running " in line
+        ]
+        if not running_lines:
+            raise AssertionError(f"missing background PID:\n{external_kill_job}")
+        background_pid = running_lines[-1].rsplit(" ", 1)[-1]
+        session.command(f"/bin/kill {background_pid}")
+        session.command("jobs")
 
         require(
             session.command("pipe-test"),

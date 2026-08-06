@@ -464,6 +464,16 @@ rose_system_info:
     ret
 .size rose_system_info, . - rose_system_info
 
+.section .text.rose_process_list,"ax",@progbits
+.align 2
+.globl rose_process_list
+.type rose_process_list, @function
+rose_process_list:
+    li a7, USER_SYSCALL_PROCESS_LIST
+    ecall
+    ret
+.size rose_process_list, . - rose_process_list
+
 .section .text.rose_mmap,"ax",@progbits
 .align 2
 .globl rose_mmap

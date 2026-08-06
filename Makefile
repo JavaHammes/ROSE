@@ -13,6 +13,12 @@ SIZE       := $(PREFIX)size
 CLANG_TIDY := clang-tidy
 PYTHON     ?= python3
 HOST_CC    ?= cc
+HOST_SYSTEM := $(shell uname -s)
+ifeq ($(HOST_SYSTEM),Darwin)
+HOST_GC_SECTIONS := -Wl,-dead_strip
+else
+HOST_GC_SECTIONS := -Wl,--gc-sections
+endif
 
 QEMU ?= qemu-system-riscv64
 
@@ -47,7 +53,7 @@ USER_COMMON_OBJECTS := \
 # Each userspace path is a distinct ELF. Demonstrations share a build-time
 # selected source, while /bin/sh adds its own implementation object. The disk
 # receives every image; the diagnostic ramfs retains its programs and shell.
-USER_PROGRAMS := hello fault process_a process_b syscall_test cat console_read init fs_test args_env execve execve_target pipe_test pipe_writer sh ls echo pwd env mkdir rm descriptor_test signal_exec_test desktop gui_terminal gui_files gui_monitor
+USER_PROGRAMS := hello fault process_a process_b syscall_test cat console_read init fs_test args_env execve execve_target pipe_test pipe_writer sh ls echo pwd env mkdir rm descriptor_test signal_exec_test desktop gui_terminal gui_files gui_monitor cp mv touch head wc find kill sleep ps
 # Use the ABI enum names directly so adding or reordering an enum cannot
 # silently build a program with the wrong implementation.
 USER_PROGRAM_hello := USER_PROGRAM_HELLO
@@ -77,6 +83,15 @@ USER_PROGRAM_desktop := USER_PROGRAM_DESKTOP
 USER_PROGRAM_gui_terminal := USER_PROGRAM_GUI_TERMINAL
 USER_PROGRAM_gui_files := USER_PROGRAM_GUI_FILES
 USER_PROGRAM_gui_monitor := USER_PROGRAM_GUI_SYSTEM_MONITOR
+USER_PROGRAM_cp := USER_PROGRAM_CP
+USER_PROGRAM_mv := USER_PROGRAM_MV
+USER_PROGRAM_touch := USER_PROGRAM_TOUCH
+USER_PROGRAM_head := USER_PROGRAM_HEAD
+USER_PROGRAM_wc := USER_PROGRAM_WC
+USER_PROGRAM_find := USER_PROGRAM_FIND
+USER_PROGRAM_kill := USER_PROGRAM_KILL
+USER_PROGRAM_sleep := USER_PROGRAM_SLEEP
+USER_PROGRAM_ps := USER_PROGRAM_PS
 USER_ELFS := $(foreach program,$(USER_PROGRAMS),$(BUILD_DIR)/user/$(program)/program.elf)
 USER_LOAD_ELFS := $(USER_ELFS:.elf=.load.elf)
 USER_FALLBACK_PROGRAMS := hello fault process_a process_b syscall_test cat console_read sh ls echo pwd env mkdir rm descriptor_test signal_exec_test
@@ -88,6 +103,16 @@ USER_EXTRA_OBJECTS_desktop := $(BUILD_DIR)/user/desktop.o $(BUILD_DIR)/user/font
 USER_EXTRA_OBJECTS_gui_terminal := $(BUILD_DIR)/user/gui_terminal.o $(BUILD_DIR)/user/terminal.o $(BUILD_DIR)/user/gui.o $(BUILD_DIR)/user/font.o
 USER_EXTRA_OBJECTS_gui_files := $(BUILD_DIR)/user/gui_files.o $(BUILD_DIR)/user/gui.o $(BUILD_DIR)/user/font.o
 USER_EXTRA_OBJECTS_gui_monitor := $(BUILD_DIR)/user/gui_monitor.o $(BUILD_DIR)/user/gui.o $(BUILD_DIR)/user/font.o
+USER_UTILITY_OBJECTS := $(BUILD_DIR)/user/utilities.o $(BUILD_DIR)/user/runtime.o
+USER_EXTRA_OBJECTS_cp := $(USER_UTILITY_OBJECTS)
+USER_EXTRA_OBJECTS_mv := $(USER_UTILITY_OBJECTS)
+USER_EXTRA_OBJECTS_touch := $(USER_UTILITY_OBJECTS)
+USER_EXTRA_OBJECTS_head := $(USER_UTILITY_OBJECTS)
+USER_EXTRA_OBJECTS_wc := $(USER_UTILITY_OBJECTS)
+USER_EXTRA_OBJECTS_find := $(USER_UTILITY_OBJECTS)
+USER_EXTRA_OBJECTS_kill := $(USER_UTILITY_OBJECTS)
+USER_EXTRA_OBJECTS_sleep := $(USER_UTILITY_OBJECTS)
+USER_EXTRA_OBJECTS_ps := $(USER_UTILITY_OBJECTS)
 
 # Compiler-generated dependency files keep incremental header rebuilds correct.
 DEPS := \
@@ -101,6 +126,8 @@ DEPS := \
 	$(BUILD_DIR)/user/gui_terminal.d \
 	$(BUILD_DIR)/user/gui_files.d \
 	$(BUILD_DIR)/user/gui_monitor.d \
+	$(BUILD_DIR)/user/utilities.d \
+	$(BUILD_DIR)/user/runtime.d \
 	$(foreach program,$(USER_PROGRAMS),$(BUILD_DIR)/user/$(program)/main.d)
 
 ARCH_FLAGS := \
@@ -187,7 +214,7 @@ QEMU_GUI_FLAGS := \
 all: $(KERNEL) $(ROOT_IMAGE)
 
 
-$(ROOT_IMAGE): tools/mkrosefs.py assets/font5x7.hex $(USER_LOAD_ELFS) Makefile
+$(ROOT_IMAGE): tools/mkrosefs.py assets/font5x7.hex assets/roserc $(USER_LOAD_ELFS) Makefile
 	@mkdir -p $(dir $@)
 	$(PYTHON) tools/mkrosefs.py $@ \
 		--file /bin/hello=$(BUILD_DIR)/user/hello/program.load.elf \
@@ -216,6 +243,16 @@ $(ROOT_IMAGE): tools/mkrosefs.py assets/font5x7.hex $(USER_LOAD_ELFS) Makefile
 		--file /bin/gui-terminal=$(BUILD_DIR)/user/gui_terminal/program.load.elf \
 		--file /bin/gui-files=$(BUILD_DIR)/user/gui_files/program.load.elf \
 		--file /bin/gui-monitor=$(BUILD_DIR)/user/gui_monitor/program.load.elf \
+		--file /bin/cp=$(BUILD_DIR)/user/cp/program.load.elf \
+		--file /bin/mv=$(BUILD_DIR)/user/mv/program.load.elf \
+		--file /bin/touch=$(BUILD_DIR)/user/touch/program.load.elf \
+		--file /bin/head=$(BUILD_DIR)/user/head/program.load.elf \
+		--file /bin/wc=$(BUILD_DIR)/user/wc/program.load.elf \
+		--file /bin/find=$(BUILD_DIR)/user/find/program.load.elf \
+		--file /bin/kill=$(BUILD_DIR)/user/kill/program.load.elf \
+		--file /bin/sleep=$(BUILD_DIR)/user/sleep/program.load.elf \
+		--file /bin/ps=$(BUILD_DIR)/user/ps/program.load.elf \
+		--file /etc/roserc=assets/roserc \
 		--file /share/font5x7.hex=assets/font5x7.hex \
 		--file /sbin/init=$(BUILD_DIR)/user/init/program.load.elf
 
@@ -370,6 +407,7 @@ test-graphics: $(KERNEL) $(ROOT_IMAGE)
 .PHONY: test-host
 test-host:
 	$(MAKE) test-terminal-model
+	$(MAKE) test-shell-parser
 	$(PYTHON) -m unittest discover -s tests -t . -p 'test_*.py'
 	$(PYTHON) -m py_compile tests/qemu_smoke.py tools/mkrosefs.py
 
@@ -381,6 +419,16 @@ test-terminal-model:
 		user/terminal.c tests/terminal_model_test.c \
 		-o $(BUILD_DIR)/tests/terminal_model_test
 	$(BUILD_DIR)/tests/terminal_model_test
+
+
+.PHONY: test-shell-parser
+test-shell-parser:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -ffunction-sections \
+		-fdata-sections -DROSE_SHELL_PARSE_TEST -Iuser/include -Ikernel/include \
+		user/sh.c tests/shell_parser_test.c $(HOST_GC_SECTIONS) \
+		-o $(BUILD_DIR)/tests/shell_parser_test
+	$(BUILD_DIR)/tests/shell_parser_test
 
 
 .PHONY: check

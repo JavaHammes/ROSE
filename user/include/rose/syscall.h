@@ -60,7 +60,8 @@ long rose_tcgetpgrp(int descriptor);
 /* Terminal line discipline, PTY geometry, sessions, and controlling-terminal
  * ownership. A freshly created session has no controlling terminal; its
  * leader may claim one slave endpoint with rose_tcsetctty. */
-long rose_tcgetattr(int descriptor, struct user_terminal_attributes *attributes);
+long rose_tcgetattr(int descriptor,
+                    struct user_terminal_attributes *attributes);
 long rose_tcsetattr(int descriptor,
                     const struct user_terminal_attributes *attributes);
 long rose_tcgetwinsize(int descriptor,
@@ -100,6 +101,7 @@ long rose_openpty(int descriptors[2]);
 
 /* Snapshot memory, process, and scheduler activity for system monitors. */
 long rose_system_info(struct user_system_info *information);
+long rose_process_list(struct user_process_info *processes, size_t capacity);
 
 /* Terminate the calling process or voluntarily give another process a turn. */
 _Noreturn void rose_exit(uint64_t status);

@@ -37,6 +37,15 @@ int rose_desktop_main(int argc, char **argv);
 int rose_gui_terminal_main(int argc, char **argv);
 int rose_gui_files_main(int argc, char **argv);
 int rose_gui_monitor_main(int argc, char **argv);
+int rose_cp_main(int argc, char **argv);
+int rose_mv_main(int argc, char **argv);
+int rose_touch_main(int argc, char **argv);
+int rose_head_main(int argc, char **argv);
+int rose_wc_main(int argc, char **argv);
+int rose_find_main(int argc, char **argv);
+int rose_kill_main(int argc, char **argv);
+int rose_sleep_main(int argc, char **argv);
+int rose_ps_main(int argc, char **argv);
 
 /* Small libc replacements keep the user executable completely freestanding. */
 static size_t string_length(const char *text) {
@@ -1081,13 +1090,16 @@ static int run_syscall_test(void) {
             terminal_window_size.pixel_width != 800U ||
             terminal_window_size.pixel_height != 600U ||
             rose_write(terminals[0], "ab", 2U) != 2 ||
-            rose_read(terminals[1], terminal_buffer,
-                      sizeof(terminal_buffer)) != -USER_ERROR_TRY_AGAIN ||
+            rose_read(terminals[1], terminal_buffer, sizeof(terminal_buffer)) !=
+                -USER_ERROR_TRY_AGAIN ||
             rose_read(terminals[0], terminal_buffer, 2U) != 2 ||
             terminal_buffer[0] != 'a' || terminal_buffer[1] != 'b' ||
-            rose_write(terminals[0], "\x7f" "c\r", 3U) != 3 ||
-            rose_read(terminals[1], terminal_buffer,
-                      sizeof(terminal_buffer)) != 3 ||
+            rose_write(terminals[0],
+                       "\x7f"
+                       "c\r",
+                       3U) != 3 ||
+            rose_read(terminals[1], terminal_buffer, sizeof(terminal_buffer)) !=
+                3 ||
             terminal_buffer[0] != 'a' || terminal_buffer[1] != 'c' ||
             terminal_buffer[2] != '\n' ||
             rose_read(terminals[0], terminal_buffer, 6U) != 6 ||
@@ -1113,8 +1125,8 @@ static int run_syscall_test(void) {
             rose_write(terminals[1], "s", 1U) != 1) {
                 return 80;
         }
-        terminal_poll = (struct user_poll_descriptor){.descriptor = terminals[0],
-                                                     .events = USER_POLL_READABLE};
+        terminal_poll = (struct user_poll_descriptor){
+            .descriptor = terminals[0], .events = USER_POLL_READABLE};
         if (rose_poll(&terminal_poll, 1U, 0) != 1 ||
             terminal_poll.returned_events != USER_POLL_READABLE ||
             rose_read(terminals[0], terminal_buffer, 1U) != 1 ||
@@ -1132,8 +1144,8 @@ static int run_syscall_test(void) {
         struct user_terminal_window_size independent_window_size;
         if (rose_openpty(independent_terminals) != 0 ||
             independent_terminals[0] != 5 || independent_terminals[1] != 6 ||
-            rose_tcgetattr(independent_terminals[0],
-                           &independent_attributes) != 0 ||
+            rose_tcgetattr(independent_terminals[0], &independent_attributes) !=
+                0 ||
             independent_attributes.flags !=
                 (USER_TERMINAL_CANONICAL | USER_TERMINAL_ECHO |
                  USER_TERMINAL_SIGNALS) ||
@@ -1178,8 +1190,7 @@ static int run_syscall_test(void) {
         }
         wait_status = -1;
         long resize_marker = -USER_ERROR_TRY_AGAIN;
-        while (session_child > 0 &&
-               resize_marker == -USER_ERROR_TRY_AGAIN) {
+        while (session_child > 0 && resize_marker == -USER_ERROR_TRY_AGAIN) {
                 resize_marker = rose_read(terminals[0], terminal_buffer, 1U);
                 if (resize_marker == -USER_ERROR_TRY_AGAIN) {
                         rose_yield();
@@ -1204,13 +1215,20 @@ static int run_syscall_test(void) {
         print("Pseudo-terminal passed\n");
 
         struct user_system_info system_information;
+        struct user_process_info process_information[2];
         if (rose_system_info((struct user_system_info *)kernel_address) !=
                 -USER_ERROR_BAD_ADDRESS ||
             rose_system_info(&system_information) != 0 ||
             system_information.total_pages == 0U ||
             system_information.used_pages == 0U ||
             system_information.copy_on_write_faults == 0U ||
-            system_information.copy_on_write_copies == 0U) {
+            system_information.copy_on_write_copies == 0U ||
+            rose_process_list((struct user_process_info *)kernel_address, 1U) !=
+                -USER_ERROR_BAD_ADDRESS ||
+            rose_process_list(process_information,
+                              USER_PROCESS_INFO_LIMIT + 1U) !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_process_list(process_information, 2U) <= 0) {
                 return 81;
         }
         print("System telemetry passed\n");
@@ -1766,7 +1784,6 @@ static int run_pipe_test(void) {
                 return 43;
         }
 
-
         readiness[0] = (struct user_poll_descriptor){
             .descriptor = descriptors[0], .events = USER_POLL_READABLE};
         if (rose_poll(readiness, 1U, 1000) != 1 ||
@@ -1963,6 +1980,33 @@ int user_main(int argc, char **argv,
 
         case USER_PROGRAM_GUI_SYSTEM_MONITOR:
                 return rose_gui_monitor_main(argc, argv);
+
+        case USER_PROGRAM_CP:
+                return rose_cp_main(argc, argv);
+
+        case USER_PROGRAM_MV:
+                return rose_mv_main(argc, argv);
+
+        case USER_PROGRAM_TOUCH:
+                return rose_touch_main(argc, argv);
+
+        case USER_PROGRAM_HEAD:
+                return rose_head_main(argc, argv);
+
+        case USER_PROGRAM_WC:
+                return rose_wc_main(argc, argv);
+
+        case USER_PROGRAM_FIND:
+                return rose_find_main(argc, argv);
+
+        case USER_PROGRAM_KILL:
+                return rose_kill_main(argc, argv);
+
+        case USER_PROGRAM_SLEEP:
+                return rose_sleep_main(argc, argv);
+
+        case USER_PROGRAM_PS:
+                return rose_ps_main(argc, argv);
 
         default:
                 return 2;
