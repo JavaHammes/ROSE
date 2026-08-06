@@ -285,3 +285,13 @@ int vfs_unlink(const char *path) {
         }
         return root_operations->unlink(root_context, path);
 }
+
+int vfs_rename(const char *old_path, const char *new_path) {
+        if (old_path == NULL || new_path == NULL) {
+                return -VFS_ERROR_INVALID;
+        }
+        if (root_operations == NULL || root_operations->rename == NULL) {
+                return -VFS_ERROR_READ_ONLY;
+        }
+        return root_operations->rename(root_context, old_path, new_path);
+}

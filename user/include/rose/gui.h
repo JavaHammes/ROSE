@@ -10,7 +10,7 @@
 
 enum {
         ROSE_GUI_SURFACE_MAGIC = 0x52475549U,
-        ROSE_GUI_SURFACE_VERSION = 2,
+        ROSE_GUI_SURFACE_VERSION = 3,
         ROSE_GUI_SURFACE_PIXEL_OFFSET = 4096,
         ROSE_GUI_EVENT_CAPACITY = 32,
         ROSE_GUI_FONT_WIDTH = ROSE_FONT_WIDTH,
@@ -20,6 +20,7 @@ enum {
         ROSE_GUI_APP_NAME_LIMIT = 24,
         ROSE_GUI_APP_TITLE_LIMIT = 32,
         ROSE_GUI_APP_PATH_LIMIT = 48,
+        ROSE_GUI_APPLICATION_ARGUMENT_LIMIT = 64,
 };
 
 struct rose_gui_rectangle {
@@ -70,6 +71,13 @@ struct rose_gui_surface {
         volatile uint32_t resize_sequence;
         volatile uint32_t input_read;
         volatile uint32_t input_write;
+        volatile uint32_t application_request_sequence;
+        volatile uint32_t application_request_consumed;
+        uint32_t application_request_width;
+        uint32_t application_request_height;
+        char application_request_title[ROSE_GUI_APP_TITLE_LIMIT];
+        char application_request_program[ROSE_GUI_APP_PATH_LIMIT];
+        char application_request_argument[ROSE_GUI_APPLICATION_ARGUMENT_LIMIT];
         struct user_input_event input_events[ROSE_GUI_EVENT_CAPACITY];
 };
 
@@ -270,6 +278,13 @@ bool rose_gui_application_initialize(struct rose_gui_application *app,
                                      struct rose_gui_widget *root);
 int rose_gui_application_run(struct rose_gui_application *app);
 void rose_gui_application_render(struct rose_gui_application *app);
+bool rose_gui_request_application(struct rose_gui_context *context,
+                                  const char *title, const char *program,
+                                  const char *argument, uint32_t width,
+                                  uint32_t height);
+/* Resolve a filesystem object through the system association service. Text
+ * files open in Editor; executable files open in Terminal. */
+bool rose_gui_open_path(struct rose_gui_context *context, const char *path);
 
 /* Pixel drawing, clipping, compositing, text, and images. */
 void rose_gui_canvas_initialize(struct rose_gui_canvas *canvas,

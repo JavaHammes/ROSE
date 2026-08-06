@@ -46,8 +46,8 @@ struct rectangle {
 };
 
 struct desktop_window {
-        const char *title;
-        const char *program;
+        char title[ROSE_GUI_APP_TITLE_LIMIT];
+        char program[ROSE_GUI_APP_PATH_LIMIT];
         int32_t x;
         int32_t y;
         uint32_t width;
@@ -66,6 +66,7 @@ struct desktop_window {
         struct rose_gui_surface *surface;
         uint32_t *pixels;
         uint32_t last_damage_sequence;
+        uint32_t last_application_request_sequence;
 };
 
 struct desktop {
@@ -117,6 +118,16 @@ static bool strings_equal(const char *left, const char *right) {
                 right++;
         }
         return *left == *right;
+}
+
+static void string_copy_bounded(char *destination, size_t capacity,
+                                const char *source) {
+        size_t index = 0U;
+        while (index + 1U < capacity && source[index] != '\0') {
+                destination[index] = source[index];
+                index++;
+        }
+        destination[index] = '\0';
 }
 
 static void print(const char *text) {
@@ -362,7 +373,8 @@ static void format_identifier(uint32_t identifier, char text[11]) {
 
 static bool create_window(struct desktop *desktop, const char *title,
                           const char *program, int32_t x, int32_t y,
-                          uint32_t width, uint32_t height) {
+                          uint32_t width, uint32_t height,
+                          const char *argument) {
         uint32_t capacity_width = width;
         uint32_t capacity_height = height;
         if (!desktop->compact_surfaces) {
@@ -388,8 +400,8 @@ static bool create_window(struct desktop *desktop, const char *title,
         if (rose_shared_memory_create(size, &window->mapping) != 0) {
                 return false;
         }
-        window->title = title;
-        window->program = program;
+        string_copy_bounded(window->title, sizeof(window->title), title);
+        string_copy_bounded(window->program, sizeof(window->program), program);
         window->x = x;
         window->y = y;
         window->width = width;
@@ -411,7 +423,10 @@ static bool create_window(struct desktop *desktop, const char *title,
 
         char identifier[11];
         format_identifier(window->mapping.identifier, identifier);
-        char *arguments[] = {(char *)program, identifier, NULL};
+        char *arguments[4] = {(char *)program, identifier, NULL, NULL};
+        if (argument != NULL && argument[0] != '\0') {
+                arguments[2] = (char *)argument;
+        }
         char *environment[] = {"HOME=/", "PATH=/bin:/sbin",
                                "TERM=rose-gui", NULL};
         window->pid = rose_spawn(program, arguments, environment);
@@ -718,6 +733,54 @@ static void collect_damage(struct desktop *desktop) {
         }
 }
 
+static void collect_application_requests(struct desktop *desktop) {
+        size_t requesters = desktop->window_count;
+        for (size_t index = 0U; index < requesters; index++) {
+                struct desktop_window *source = &desktop->windows[index];
+                uint32_t sequence =
+                    source->surface->application_request_sequence;
+                if (sequence == source->last_application_request_sequence)
+                        continue;
+                char title[ROSE_GUI_APP_TITLE_LIMIT];
+                char program[ROSE_GUI_APP_PATH_LIMIT];
+                char argument[ROSE_GUI_APPLICATION_ARGUMENT_LIMIT];
+                string_copy_bounded(
+                    title, sizeof(title),
+                    source->surface->application_request_title);
+                string_copy_bounded(
+                    program, sizeof(program),
+                    source->surface->application_request_program);
+                string_copy_bounded(
+                    argument, sizeof(argument),
+                    source->surface->application_request_argument);
+                uint32_t width =
+                    source->surface->application_request_width;
+                uint32_t height =
+                    source->surface->application_request_height;
+                source->last_application_request_sequence = sequence;
+                source->surface->application_request_consumed = sequence;
+                (void)rose_event_notify(
+                    &source->surface->application_request_consumed);
+                if (title[0] == '\0' || program[0] != '/' || width == 0U ||
+                    height == 0U) {
+                        continue;
+                }
+                int32_t x = 42 + (int32_t)desktop->window_count * 36;
+                int32_t y = 78 + (int32_t)desktop->window_count * 24;
+                int32_t max_x = (int32_t)desktop->graphics.width -
+                                (int32_t)width - WINDOW_BORDER * 2 - 10;
+                int32_t max_y = (int32_t)desktop->graphics.height -
+                                (int32_t)height - WINDOW_TITLE_HEIGHT -
+                                WINDOW_BORDER - 10;
+                if (x > max_x) x = max_x;
+                if (y > max_y) y = max_y;
+                if (!create_window(desktop, title, program, x, y, width,
+                                   height, argument)) {
+                        print("desktop: unable to open requested application\n");
+                }
+        }
+}
+
 static void remove_window(struct desktop *desktop, size_t index) {
         struct rectangle old =
             window_damage_rectangle(&desktop->windows[index]);
@@ -782,7 +845,7 @@ static void close_windows(struct desktop *desktop) {
 }
 
 static long desktop_wait_for_activity(struct desktop *desktop) {
-        struct user_wait_item items[WINDOW_LIMIT + 2U];
+        struct user_wait_item items[WINDOW_LIMIT * 2U + 2U];
         size_t count = 0U;
 
         items[count++] = (struct user_wait_item){
@@ -804,6 +867,14 @@ static long desktop_wait_for_activity(struct desktop *desktop) {
                     .identifier = (int64_t)(uintptr_t)&window->surface
                                       ->damage_sequence,
                     .value = window->last_damage_sequence,
+                };
+                items[count++] = (struct user_wait_item){
+                    .type = USER_WAIT_OBJECT_SHARED_WORD,
+                    .events = USER_WAIT_EVENT_CHANGED,
+                    .identifier =
+                        (int64_t)(uintptr_t)&window->surface
+                            ->application_request_sequence,
+                    .value = window->last_application_request_sequence,
                 };
         }
         return rose_wait_events(items, count, -1);
@@ -883,7 +954,7 @@ static bool run_capacity_stress(struct desktop *desktop) {
                         int32_t y = 62 + (int32_t)(index / 4U) * 215;
                         if (!create_window(desktop, "TERMINAL",
                                            "/bin/gui-terminal", x, y, 220,
-                                           150)) {
+                                           150, NULL)) {
                                 print("desktop: capacity exhausted while "
                                       "opening terminals\n");
                                 close_windows(desktop);
@@ -935,7 +1006,7 @@ static bool run_window_control_test(struct desktop *desktop) {
         const uint32_t initial_width = 500U;
         const uint32_t initial_height = 350U;
         if (!create_window(desktop, "FILES", "/bin/gui-files", initial_x,
-                           initial_y, initial_width, initial_height)) {
+                           initial_y, initial_width, initial_height, NULL)) {
                 return false;
         }
         struct desktop_window *window = &desktop->windows[0];
@@ -991,7 +1062,7 @@ static bool launch_terminal(struct desktop *desktop) {
         return create_window(
             desktop, terminal != NULL ? terminal->title : "TERMINAL",
             terminal != NULL ? terminal->program : "/bin/gui-terminal", x, y,
-            width, height);
+            width, height, NULL);
 }
 
 static void invalidate_desktop(struct desktop *desktop) {
@@ -1015,7 +1086,7 @@ static bool launch_catalog_app(struct desktop *desktop, size_t index) {
         if (x > max_x) x = max_x;
         if (y > max_y) y = max_y;
         return create_window(desktop, app->title, app->program, x, y,
-                             app->width, app->height);
+                             app->width, app->height, NULL);
 }
 
 static void launcher_action(struct rose_gui_widget *widget,
@@ -1311,6 +1382,7 @@ int rose_desktop_main(int argc, char **argv) {
 
         while (!desktop.exiting) {
                 collect_damage(&desktop);
+                collect_application_requests(&desktop);
                 reap_windows(&desktop);
                 struct user_input_event event;
                 long result;

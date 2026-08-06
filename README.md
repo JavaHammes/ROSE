@@ -30,10 +30,14 @@ programs in user mode.
   damage-tracked composition. Page-backed shared-memory objects carry client
   pixels and event rings. A layered userspace GUI toolkit provides a shared
   event loop, clipped canvas drawing, alpha compositing, image blits,
-  file-backed themes/icons/application metadata, deterministic retained
-  row/column layout, and standard controls. Separate graphical terminal,
-  Files, and live system monitor processes render through that toolkit and expose
-  copy-on-write activity alongside scheduler and memory counters. Shared-word
+  file-backed themes/icons/application metadata, centralized file/application
+  associations, deterministic retained row/column layout, and standard
+  controls. Separate graphical Terminal, Files, Editor, and System Monitor
+  processes render through that toolkit. Files provides create, rename, delete,
+  copy, move, properties, and association-based opening. Editor provides
+  open/save, selection, clipboard editing, undo, and unsaved-change protection.
+  System Monitor combines scheduler and memory counters with per-process detail
+  and terminate/kill actions. Shared-word
   notifications let compositor and clients sleep until input, damage, focus,
   close, or PTY state changes, and the monitor updates from monotonic
   deadlines. Screen/input ownership and shared mappings are reclaimed
@@ -56,7 +60,9 @@ programs in user mode.
   blocks, 1 KiB blocks, 128-byte inodes, and file-type directory entries. A
   linker-embedded ramfs is retained as a boot-diagnostic fallback.
 - VFS regular files, directories, and character devices with canonical path
-  lookup, create/truncate, stat, seek, directory iteration, mkdir, and unlink.
+  lookup, create/truncate, stat, seek, directory iteration, mkdir, unlink, and
+  inode-preserving rename. Rename supports files and directories, destination
+  replacement, parent-link maintenance, and subtree-cycle rejection.
 - Sixteen-entry per-process descriptor tables backed by a bounded global
   open-file table, with standard input, output, and error attached to
   `/dev/console`; aliases inherited by `dup`, `fork`, and `spawn` share their
@@ -71,7 +77,7 @@ programs in user mode.
   attributes plus shared row/column and pixel dimensions; size changes notify
   its foreground process group with `SIGWINCH`.
 - U-mode C runtime with descriptor I/O, `open`, `close`, `stat`, `fstat`,
-  `lseek`, `dup`, `dup2`, directory iteration, `mkdir`, `unlink`, `chdir`,
+  `lseek`, `dup`, `dup2`, directory iteration, `mkdir`, `unlink`, `rename`, `chdir`,
   `getcwd`, `pipe`, descriptor flags, `fork`, `spawn`, `execve`, `getpid`,
   `waitpid`, `sigaction`, `kill`, process groups, sessions, controlling-terminal
   and foreground-group control, terminal attributes and window sizing, shared
@@ -92,8 +98,9 @@ programs in user mode.
   and optional nonblocking polling.
   Programs start with conventional `argc`, `argv`, and `envp` values copied to
   their private stack.
-  A validated process snapshot ABI exposes PID, parent, process group, state,
-  and executable name to the userspace `ps` tool.
+  A validated process snapshot ABI exposes PID, parent, process group, session,
+  state, executable name, resident pages, descriptor count, and pending signals
+  to the userspace `ps` tool and System Monitor.
   Private anonymous `mmap` reservations allocate zero-filled pages lazily on
   first access. `mprotect` changes complete or partial ranges, including
   no-access mappings, without losing resident contents and preserves W^X and

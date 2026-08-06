@@ -132,11 +132,13 @@ int rose_mv_main(int argc, char **argv) {
                 rose_print_error("Usage: mv SOURCE DESTINATION\n");
                 return 1;
         }
-        if (utility_copy_file(argv[1], argv[2]) != 0) {
+        char destination_path[UTILITY_PATH_SIZE];
+        if (!utility_destination_path(argv[1], argv[2], destination_path)) {
+                utility_error_path("mv", "invalid destination", argv[2]);
                 return 1;
         }
-        if (rose_unlink(argv[1]) != 0) {
-                utility_error_path("mv", "unable to remove source", argv[1]);
+        if (rose_rename(argv[1], destination_path) != 0) {
+                utility_error_path("mv", "unable to rename", argv[1]);
                 return 1;
         }
         return 0;

@@ -1064,6 +1064,196 @@ static bool directory_is_empty(const struct ext2_inode *directory) {
         return true;
 }
 
+static int directory_set_parent(struct ext2_filesystem *fs,
+                                uint32_t directory_number,
+                                uint32_t parent_number) {
+        struct ext2_inode directory;
+        if (!read_inode(fs, directory_number, &directory) ||
+            mode_type(directory.mode) != VFS_NODE_DIRECTORY) {
+                return -VFS_ERROR_NOT_DIRECTORY;
+        }
+        static uint8_t block[BLOCK_CACHE_BLOCK_SIZE];
+        for (size_t block_index = 0U;
+             block_index * BLOCK_CACHE_BLOCK_SIZE < directory.size;
+             block_index++) {
+                uint32_t block_number;
+                if (!inode_data_block(&directory, block_index, &block_number) ||
+                    block_number == 0U ||
+                    !block_cache_read(block_number, block)) {
+                        return -VFS_ERROR_IO;
+                }
+                size_t within = 0U;
+                while (within < BLOCK_CACHE_BLOCK_SIZE) {
+                        uint16_t record_length =
+                            read_u16(&block[within + 4U]);
+                        uint8_t name_length = block[within + 6U];
+                        if (record_length < EXT2_DIRECTORY_HEADER_SIZE ||
+                            within + record_length > BLOCK_CACHE_BLOCK_SIZE) {
+                                return -VFS_ERROR_IO;
+                        }
+                        if (read_u32(&block[within]) != 0U &&
+                            name_length == 2U &&
+                            block[within + 8U] == '.' &&
+                            block[within + 9U] == '.') {
+                                write_u32(&block[within], parent_number);
+                                return block_cache_write(block_number, block)
+                                           ? 0
+                                           : -VFS_ERROR_IO;
+                        }
+                        within += record_length;
+                }
+        }
+        return -VFS_ERROR_IO;
+}
+
+static bool directory_is_within(struct ext2_filesystem *fs,
+                                uint32_t directory_number,
+                                uint32_t possible_ancestor) {
+        uint32_t current = directory_number;
+        for (size_t depth = 0U; depth < fs->inodes_count; depth++) {
+                if (current == possible_ancestor) return true;
+                if (current == EXT2_ROOT_INODE) return false;
+                uint32_t parent;
+                if (lookup_child(fs, current, "..", 2U, &parent) != 0 ||
+                    parent == current) {
+                        return true;
+                }
+                current = parent;
+        }
+        return true;
+}
+
+static int release_replaced_inode(struct ext2_filesystem *fs,
+                                  uint32_t number,
+                                  struct ext2_inode *inode) {
+        bool directory = mode_type(inode->mode) == VFS_NODE_DIRECTORY;
+        int result = truncate_inode(fs, number, inode);
+        if (result != 0) return result;
+        inode->mode = 0U;
+        inode->link_count = 0U;
+        if (!write_inode(fs, number, inode) || !release_inode(fs, number)) {
+                return -VFS_ERROR_IO;
+        }
+        if (directory) fs->used_directories--;
+        return 0;
+}
+
+/* Rename is a filesystem primitive rather than a Files-app convention. The
+ * single-hart VFS exposes the complete directory-entry transaction as one
+ * operation, so readers can observe either name but never copy/delete
+ * intermediate file contents. Open descriptions remain valid by inode. */
+static int ext2_rename_path(void *context, const char *old_path,
+                            const char *new_path) {
+        struct ext2_filesystem *fs = context;
+        uint32_t old_parent;
+        uint32_t new_parent;
+        const char *old_name;
+        const char *new_name;
+        size_t old_name_length;
+        size_t new_name_length;
+        int result = resolve_parent(fs, old_path, &old_parent, &old_name,
+                                    &old_name_length);
+        if (result != 0) return result;
+        result = resolve_parent(fs, new_path, &new_parent, &new_name,
+                                &new_name_length);
+        if (result != 0) return result;
+
+        uint32_t source_number;
+        result = lookup_child(fs, old_parent, old_name, old_name_length,
+                              &source_number);
+        if (result != 0) return result;
+        struct ext2_inode source_inode;
+        if (!read_inode(fs, source_number, &source_inode)) {
+                return -VFS_ERROR_IO;
+        }
+        enum vfs_node_type source_type = mode_type(source_inode.mode);
+        if (source_type == VFS_NODE_DIRECTORY &&
+            directory_is_within(fs, new_parent, source_number)) {
+                return -VFS_ERROR_INVALID;
+        }
+
+        uint32_t replaced_number = 0U;
+        struct ext2_inode replaced_inode;
+        bool replaced = false;
+        result = lookup_child(fs, new_parent, new_name, new_name_length,
+                              &replaced_number);
+        if (result == 0) {
+                if (replaced_number == source_number) return 0;
+                if (!read_inode(fs, replaced_number, &replaced_inode)) {
+                        return -VFS_ERROR_IO;
+                }
+                enum vfs_node_type replaced_type =
+                    mode_type(replaced_inode.mode);
+                if (replaced_type != source_type) {
+                        return source_type == VFS_NODE_DIRECTORY
+                                   ? -VFS_ERROR_NOT_DIRECTORY
+                                   : -VFS_ERROR_IS_DIRECTORY;
+                }
+                if (replaced_type == VFS_NODE_DIRECTORY &&
+                    !directory_is_empty(&replaced_inode)) {
+                        return -VFS_ERROR_NOT_EMPTY;
+                }
+                result = remove_directory_entry(fs, new_parent, new_name,
+                                                new_name_length);
+                if (result != 0) return result;
+                replaced = true;
+        } else if (result != -VFS_ERROR_NO_ENTRY) {
+                return result;
+        }
+
+        result = add_directory_entry(fs, new_parent, new_name, new_name_length,
+                                     source_number, source_type);
+        if (result != 0) {
+                if (replaced) {
+                        (void)add_directory_entry(
+                            fs, new_parent, new_name, new_name_length,
+                            replaced_number, mode_type(replaced_inode.mode));
+                }
+                return result;
+        }
+        result = remove_directory_entry(fs, old_parent, old_name,
+                                        old_name_length);
+        if (result != 0) {
+                (void)remove_directory_entry(fs, new_parent, new_name,
+                                             new_name_length);
+                if (replaced) {
+                        (void)add_directory_entry(
+                            fs, new_parent, new_name, new_name_length,
+                            replaced_number, mode_type(replaced_inode.mode));
+                }
+                return result;
+        }
+
+        if (source_type == VFS_NODE_DIRECTORY) {
+                if (old_parent != new_parent &&
+                    directory_set_parent(fs, source_number, new_parent) != 0) {
+                        return -VFS_ERROR_IO;
+                }
+                struct ext2_inode old_parent_inode;
+                struct ext2_inode new_parent_inode;
+                if (!read_inode(fs, old_parent, &old_parent_inode) ||
+                    !read_inode(fs, new_parent, &new_parent_inode)) {
+                        return -VFS_ERROR_IO;
+                }
+                if (old_parent != new_parent) old_parent_inode.link_count--;
+                if (old_parent != new_parent && !replaced)
+                        new_parent_inode.link_count++;
+                if (old_parent == new_parent && replaced)
+                        old_parent_inode.link_count--;
+                if (!write_inode(fs, old_parent, &old_parent_inode) ||
+                    (old_parent != new_parent &&
+                     !write_inode(fs, new_parent, &new_parent_inode))) {
+                        return -VFS_ERROR_IO;
+                }
+        }
+        if (replaced) {
+                result = release_replaced_inode(fs, replaced_number,
+                                                &replaced_inode);
+                if (result != 0) return result;
+        }
+        return write_free_counts(fs) ? 0 : -VFS_ERROR_IO;
+}
+
 static int ext2_unlink_path(void *context, const char *path) {
         struct ext2_filesystem *fs = context;
         uint32_t parent;
@@ -1122,6 +1312,7 @@ static const struct vfs_filesystem_operations ext2_operations = {
     .read_directory = ext2_read_directory,
     .make_directory = ext2_make_directory,
     .unlink = ext2_unlink_path,
+    .rename = ext2_rename_path,
 };
 
 bool ext2_mount(struct block_device *device) {

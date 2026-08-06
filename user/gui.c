@@ -17,6 +17,19 @@ static void bytes_zero(void *destination, size_t size) {
         }
 }
 
+static bool copy_text(char *destination, size_t capacity,
+                      const char *source) {
+        if (destination == NULL || capacity == 0U || source == NULL)
+                return false;
+        size_t index = 0U;
+        while (source[index] != '\0' && index + 1U < capacity) {
+                destination[index] = source[index];
+                index++;
+        }
+        destination[index] = '\0';
+        return source[index] == '\0';
+}
+
 static bool parse_identifier(const char *text, uint32_t *identifier) {
         uint32_t value = 0U;
         if (text == NULL || *text == '\0') {
@@ -334,6 +347,50 @@ void rose_gui_application_render(struct rose_gui_application *app) {
         rose_gui_ui_draw(&app->ui);
         rose_gui_present(&app->context, 0, 0, (int32_t)app->context.width,
                          (int32_t)app->context.height);
+}
+
+bool rose_gui_request_application(struct rose_gui_context *context,
+                                  const char *title, const char *program,
+                                  const char *argument, uint32_t width,
+                                  uint32_t height) {
+        if (context == NULL || context->surface == NULL || width == 0U ||
+            height == 0U ||
+            !copy_text(context->surface->application_request_title,
+                       sizeof(context->surface->application_request_title),
+                       title) ||
+            !copy_text(context->surface->application_request_program,
+                       sizeof(context->surface->application_request_program),
+                       program) ||
+            !copy_text(context->surface->application_request_argument,
+                       sizeof(context->surface->application_request_argument),
+                       argument != NULL ? argument : "")) {
+                return false;
+        }
+        context->surface->application_request_width = width;
+        context->surface->application_request_height = height;
+        __sync_synchronize();
+        context->surface->application_request_sequence++;
+        (void)rose_event_notify(
+            &context->surface->application_request_sequence);
+        return true;
+}
+
+bool rose_gui_open_path(struct rose_gui_context *context, const char *path) {
+        struct user_file_status status;
+        if (path == NULL || rose_stat(path, &status) != 0 ||
+            status.type != USER_FILE_REGULAR) {
+                return false;
+        }
+        const char *name = path;
+        for (const char *cursor = path; *cursor != '\0'; cursor++) {
+                if (*cursor == '/' && cursor[1] != '\0') name = cursor + 1;
+        }
+        if ((status.mode & 0111U) != 0U) {
+                return rose_gui_request_application(
+                    context, name, "/bin/gui-terminal", path, 570U, 390U);
+        }
+        return rose_gui_request_application(context, name, "/bin/gui-editor",
+                                            path, 560U, 430U);
 }
 
 int rose_gui_application_run(struct rose_gui_application *app) {

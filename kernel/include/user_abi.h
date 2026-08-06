@@ -59,6 +59,7 @@
 #define USER_SYSCALL_GET_SESSION 53
 #define USER_SYSCALL_TERMINAL_SET_CONTROLLING 54
 #define USER_SYSCALL_PROCESS_LIST 55
+#define USER_SYSCALL_RENAME 56
 
 #else
 
@@ -119,6 +120,7 @@ enum user_syscall_number {
         USER_SYSCALL_GET_SESSION = 53,
         USER_SYSCALL_TERMINAL_SET_CONTROLLING = 54,
         USER_SYSCALL_PROCESS_LIST = 55,
+        USER_SYSCALL_RENAME = 56,
 };
 
 /* Stable negative error values returned in a0 by failed system calls. */
@@ -387,8 +389,11 @@ struct user_process_info {
         uint64_t pid;
         uint64_t parent_pid;
         uint64_t process_group;
+        uint64_t session_id;
+        uint64_t resident_pages;
+        uint64_t pending_signals;
         uint32_t state;
-        uint32_t reserved;
+        uint32_t open_descriptors;
         char name[USER_PROCESS_NAME_MAX];
 };
 
@@ -427,6 +432,7 @@ enum user_program {
         USER_PROGRAM_GUI_TERMINAL,
         USER_PROGRAM_GUI_FILES,
         USER_PROGRAM_GUI_SYSTEM_MONITOR,
+        USER_PROGRAM_GUI_EDITOR,
         USER_PROGRAM_CP,
         USER_PROGRAM_MV,
         USER_PROGRAM_TOUCH,

@@ -53,7 +53,7 @@ USER_COMMON_OBJECTS := \
 # Each userspace path is a distinct ELF. Demonstrations share a build-time
 # selected source, while /bin/sh adds its own implementation object. The disk
 # receives every image; the diagnostic ramfs retains its programs and shell.
-USER_PROGRAMS := hello fault process_a process_b syscall_test cat console_read init fs_test args_env execve execve_target pipe_test pipe_writer sh ls echo pwd env mkdir rm descriptor_test signal_exec_test desktop gui_terminal gui_files gui_monitor cp mv touch head wc find kill sleep ps
+USER_PROGRAMS := hello fault process_a process_b syscall_test cat console_read init fs_test args_env execve execve_target pipe_test pipe_writer sh ls echo pwd env mkdir rm descriptor_test signal_exec_test desktop gui_terminal gui_files gui_monitor gui_editor cp mv touch head wc find kill sleep ps
 # Use the ABI enum names directly so adding or reordering an enum cannot
 # silently build a program with the wrong implementation.
 USER_PROGRAM_hello := USER_PROGRAM_HELLO
@@ -83,6 +83,7 @@ USER_PROGRAM_desktop := USER_PROGRAM_DESKTOP
 USER_PROGRAM_gui_terminal := USER_PROGRAM_GUI_TERMINAL
 USER_PROGRAM_gui_files := USER_PROGRAM_GUI_FILES
 USER_PROGRAM_gui_monitor := USER_PROGRAM_GUI_SYSTEM_MONITOR
+USER_PROGRAM_gui_editor := USER_PROGRAM_GUI_EDITOR
 USER_PROGRAM_cp := USER_PROGRAM_CP
 USER_PROGRAM_mv := USER_PROGRAM_MV
 USER_PROGRAM_touch := USER_PROGRAM_TOUCH
@@ -104,6 +105,7 @@ USER_EXTRA_OBJECTS_desktop := $(BUILD_DIR)/user/desktop.o $(USER_GUI_OBJECTS)
 USER_EXTRA_OBJECTS_gui_terminal := $(BUILD_DIR)/user/gui_terminal.o $(BUILD_DIR)/user/terminal.o $(USER_GUI_OBJECTS)
 USER_EXTRA_OBJECTS_gui_files := $(BUILD_DIR)/user/gui_files.o $(USER_GUI_OBJECTS)
 USER_EXTRA_OBJECTS_gui_monitor := $(BUILD_DIR)/user/gui_monitor.o $(USER_GUI_OBJECTS)
+USER_EXTRA_OBJECTS_gui_editor := $(BUILD_DIR)/user/gui_editor.o $(USER_GUI_OBJECTS)
 USER_UTILITY_OBJECTS := $(BUILD_DIR)/user/utilities.o $(BUILD_DIR)/user/runtime.o
 USER_EXTRA_OBJECTS_cp := $(USER_UTILITY_OBJECTS)
 USER_EXTRA_OBJECTS_mv := $(USER_UTILITY_OBJECTS)
@@ -130,6 +132,7 @@ DEPS := \
 	$(BUILD_DIR)/user/gui_terminal.d \
 	$(BUILD_DIR)/user/gui_files.d \
 	$(BUILD_DIR)/user/gui_monitor.d \
+	$(BUILD_DIR)/user/gui_editor.d \
 	$(BUILD_DIR)/user/utilities.d \
 	$(BUILD_DIR)/user/runtime.d \
 	$(foreach program,$(USER_PROGRAMS),$(BUILD_DIR)/user/$(program)/main.d)
@@ -247,6 +250,7 @@ $(ROOT_IMAGE): tools/mkrosefs.py assets/font5x7.hex assets/gui-theme.conf assets
 		--file /bin/gui-terminal=$(BUILD_DIR)/user/gui_terminal/program.load.elf \
 		--file /bin/gui-files=$(BUILD_DIR)/user/gui_files/program.load.elf \
 		--file /bin/gui-monitor=$(BUILD_DIR)/user/gui_monitor/program.load.elf \
+		--file /bin/gui-editor=$(BUILD_DIR)/user/gui_editor/program.load.elf \
 		--file /bin/cp=$(BUILD_DIR)/user/cp/program.load.elf \
 		--file /bin/mv=$(BUILD_DIR)/user/mv/program.load.elf \
 		--file /bin/touch=$(BUILD_DIR)/user/touch/program.load.elf \

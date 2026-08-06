@@ -17,6 +17,7 @@ long rose_lseek(int descriptor, int64_t offset, uint32_t whence);
 long rose_read_directory(int descriptor, struct user_directory_entry *entry);
 long rose_mkdir(const char *path);
 long rose_unlink(const char *path);
+long rose_rename(const char *old_path, const char *new_path);
 long rose_chdir(const char *path);
 long rose_getcwd(char *buffer, size_t size);
 long rose_dup(int descriptor);

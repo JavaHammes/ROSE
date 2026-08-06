@@ -112,6 +112,17 @@ rose_unlink:
     ret
 .size rose_unlink, . - rose_unlink
 
+.section .text.rose_rename,"ax",@progbits
+.align 2
+.globl rose_rename
+.type rose_rename, @function
+rose_rename:
+    /* a0 and a1 point at the old and new paths. */
+    li a7, USER_SYSCALL_RENAME
+    ecall
+    ret
+.size rose_rename, . - rose_rename
+
 .section .text.rose_chdir,"ax",@progbits
 .align 2
 .globl rose_chdir

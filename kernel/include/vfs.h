@@ -88,6 +88,8 @@ struct vfs_filesystem_operations {
                                struct vfs_directory_entry *entry);
         int (*make_directory)(void *context, const char *path);
         int (*unlink)(void *context, const char *path);
+        int (*rename)(void *context, const char *old_path,
+                      const char *new_path);
 };
 
 struct vfs_file {
@@ -119,5 +121,6 @@ long vfs_read_directory(struct vfs_file *directory, uint64_t offset,
                         struct vfs_directory_entry *entry);
 int vfs_make_directory(const char *path);
 int vfs_unlink(const char *path);
+int vfs_rename(const char *old_path, const char *new_path);
 
 #endif

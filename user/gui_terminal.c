@@ -171,7 +171,8 @@ static bool terminal_set_window_size(int descriptor,
         return rose_tcsetwinsize(descriptor, &window_size) == 0;
 }
 
-static _Noreturn void terminal_child(int master, int slave) {
+static _Noreturn void terminal_child(int master, int slave,
+                                     const char *program) {
         if (rose_setsid() < 0 || rose_tcsetctty(slave) < 0) {
                 rose_exit(126U);
         }
@@ -182,10 +183,11 @@ static _Noreturn void terminal_child(int master, int slave) {
         if (slave > USER_STDERR_FILENO) {
                 (void)rose_close(slave);
         }
-        char *arguments[] = {"/bin/sh", NULL};
+        if (program == NULL || program[0] == '\0') program = "/bin/sh";
+        char *arguments[] = {(char *)program, NULL};
         char *environment[] = {"HOME=/", "PATH=/bin:/sbin", "TERM=xterm",
                                NULL};
-        (void)rose_execve("/bin/sh", arguments, environment);
+        (void)rose_execve(program, arguments, environment);
         rose_exit(127U);
 }
 
@@ -257,7 +259,8 @@ static void terminal_event(struct rose_gui_context *gui,
 
 int rose_gui_terminal_main(int argc, char **argv) {
         struct rose_gui_context gui;
-        if (argc != 2 || !rose_gui_connect(argv[1], &gui)) return 1;
+        if ((argc != 2 && argc != 3) || !rose_gui_connect(argv[1], &gui))
+                return 1;
         struct rose_gui_theme theme;
         (void)rose_gui_theme_load(&theme, "/share/gui/theme.conf");
         terminal_apply_theme(&theme);
@@ -310,7 +313,9 @@ int rose_gui_terminal_main(int argc, char **argv) {
         }
 
         long shell_pid = rose_fork();
-        if (shell_pid == 0) terminal_child(terminals[0], terminals[1]);
+        if (shell_pid == 0)
+                terminal_child(terminals[0], terminals[1],
+                               argc == 3 ? argv[2] : NULL);
         if (shell_pid < 0) {
                 (void)rose_close(terminals[0]);
                 (void)rose_close(terminals[1]);
@@ -327,6 +332,8 @@ int rose_gui_terminal_main(int argc, char **argv) {
         static const char banner[] = "ROSE GRAPHICAL TERMINAL\r\n";
         terminal_feed_output(&terminal, banner, sizeof(banner) - 1U);
         bool focused = gui.surface->focused != 0U;
+        bool child_exited = false;
+        bool one_shot = argc == 3;
         struct terminal_input input = {.master = terminals[0]};
         terminal_render(&gui, &terminal, focused);
 
@@ -361,9 +368,23 @@ int rose_gui_terminal_main(int argc, char **argv) {
                 terminal_render(&gui, &terminal, focused);
 
                 int status;
-                long waited = rose_waitpid(shell_pid, &status,
-                                            USER_WAIT_NO_HANG);
-                if (waited == shell_pid) break;
+                long waited = child_exited
+                                  ? 0
+                                  : rose_waitpid(shell_pid, &status,
+                                                 USER_WAIT_NO_HANG);
+                if (waited == shell_pid) {
+                        child_exited = true;
+                        if (!one_shot) break;
+                        static const char finished[] =
+                            "\r\nPROGRAM FINISHED - CLOSE THIS WINDOW\r\n";
+                        terminal_feed_output(&terminal, finished,
+                                             sizeof(finished) - 1U);
+                        terminal_render(&gui, &terminal, focused);
+                }
+                if (child_exited) {
+                        if (rose_gui_wait(&gui, -1) < 0) break;
+                        continue;
+                }
 
                 struct user_wait_item waits[6];
                 set_wait_item(&waits[0], USER_WAIT_OBJECT_DESCRIPTOR,
@@ -393,9 +414,11 @@ int rose_gui_terminal_main(int argc, char **argv) {
                 if (rose_wait_events(waits, 6U, -1) < 0) break;
         }
 
-        (void)rose_kill(shell_pid, USER_SIGNAL_TERMINATE);
-        int status;
-        (void)rose_waitpid(shell_pid, &status, 0U);
+        if (!child_exited) {
+                (void)rose_kill(shell_pid, USER_SIGNAL_TERMINATE);
+                int status;
+                (void)rose_waitpid(shell_pid, &status, 0U);
+        }
         (void)rose_close(terminals[0]);
         (void)rose_munmap((uintptr_t)scrollback_address, scrollback_size);
         rose_gui_disconnect(&gui);

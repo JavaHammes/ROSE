@@ -37,6 +37,7 @@ int rose_desktop_main(int argc, char **argv);
 int rose_gui_terminal_main(int argc, char **argv);
 int rose_gui_files_main(int argc, char **argv);
 int rose_gui_monitor_main(int argc, char **argv);
+int rose_gui_editor_main(int argc, char **argv);
 int rose_cp_main(int argc, char **argv);
 int rose_mv_main(int argc, char **argv);
 int rose_touch_main(int argc, char **argv);
@@ -1705,9 +1706,38 @@ static int run_filesystem_test(void) {
 
         descriptor =
             rose_open("/tmp/state", USER_OPEN_WRITE | USER_OPEN_TRUNCATE);
+        uint32_t renamed_inode = status.inode;
         if (descriptor < 0 || rose_stat("/tmp/state", &status) != 0 ||
             status.size != 0U || rose_close((int)descriptor) != 0) {
                 return 45;
+        }
+
+        descriptor = rose_open("/tmp/state", USER_OPEN_READ);
+        long replacement = rose_open("/tmp/replacement",
+                                     USER_OPEN_WRITE | USER_OPEN_CREATE);
+        if (descriptor < 0 || replacement < 0 ||
+            rose_close((int)replacement) != 0 ||
+            rose_rename("/tmp/state", "/tmp/renamed") != 0 ||
+            rose_stat("/tmp/state", &status) != -USER_ERROR_NO_ENTRY ||
+            rose_stat("/tmp/renamed", &status) != 0 ||
+            status.inode != renamed_inode ||
+            rose_fstat((int)descriptor, &status) != 0 ||
+            status.inode != renamed_inode || rose_close((int)descriptor) != 0 ||
+            rose_rename("/tmp/renamed", "/tmp/replacement") != 0 ||
+            rose_stat("/tmp/renamed", &status) != -USER_ERROR_NO_ENTRY ||
+            rose_stat("/tmp/replacement", &status) != 0 ||
+            status.inode != renamed_inode ||
+            rose_rename("/tmp/replacement", "/tmp/replacement") != 0 ||
+            rose_mkdir("/tmp/source") != 0 ||
+            rose_mkdir("/tmp/parent") != 0 ||
+            rose_rename("/tmp/source", "/tmp/parent/source") != 0 ||
+            rose_stat("/tmp/parent/source", &status) != 0 ||
+            status.type != USER_FILE_DIRECTORY ||
+            rose_rename("/tmp/parent", "/tmp/parent/source/parent") !=
+                -USER_ERROR_INVALID_ARGUMENT ||
+            rose_unlink("/tmp/parent/source") != 0 ||
+            rose_unlink("/tmp/parent") != 0) {
+                return 47;
         }
 
         descriptor = rose_open("/tmp", USER_OPEN_READ | USER_OPEN_DIRECTORY);
@@ -1716,14 +1746,15 @@ static int run_filesystem_test(void) {
         long directory_result;
         while ((directory_result =
                     rose_read_directory((int)descriptor, &entry)) > 0) {
-                if (strings_equal(entry.name, "state")) {
+                if (strings_equal(entry.name, "replacement")) {
                         found = true;
                 }
         }
         if (descriptor < 0 || directory_result != 0 || !found ||
             rose_close((int)descriptor) != 0 ||
             rose_unlink("/tmp") != -USER_ERROR_NOT_EMPTY ||
-            rose_unlink("/tmp/state") != 0 || rose_unlink("/tmp") != 0) {
+            rose_unlink("/tmp/replacement") != 0 ||
+            rose_unlink("/tmp") != 0) {
                 return 22;
         }
 
@@ -1980,6 +2011,9 @@ int user_main(int argc, char **argv,
 
         case USER_PROGRAM_GUI_SYSTEM_MONITOR:
                 return rose_gui_monitor_main(argc, argv);
+
+        case USER_PROGRAM_GUI_EDITOR:
+                return rose_gui_editor_main(argc, argv);
 
         case USER_PROGRAM_CP:
                 return rose_cp_main(argc, argv);

@@ -3252,6 +3252,17 @@ static uint64_t syscall_path_operation(uintptr_t user_path,
         return (uint64_t)(int64_t)result;
 }
 
+static uint64_t syscall_rename(uintptr_t user_old_path,
+                               uintptr_t user_new_path) {
+        char old_path[USER_PATH_MAX];
+        char new_path[USER_PATH_MAX];
+        uint64_t result = user_copy_path(user_old_path, old_path);
+        if (result != 0U) return result;
+        result = user_copy_path(user_new_path, new_path);
+        if (result != 0U) return result;
+        return (uint64_t)(int64_t)vfs_rename(old_path, new_path);
+}
+
 static uint64_t syscall_chdir(uintptr_t user_path) {
         char path[USER_PATH_MAX];
         uint64_t copy_result = user_copy_path(user_path, path);
@@ -4176,6 +4187,39 @@ static uint64_t syscall_process_list(uintptr_t user_processes,
                 information.pid = process->pid;
                 information.parent_pid = process->parent_pid;
                 information.process_group = process->process_group;
+                information.session_id = process->session_id;
+                information.resident_pages =
+                    process->loaded_image.page_count +
+                    (process->stack_page != NULL ? 1U : 0U);
+                if (process->heap_break > process->heap_start) {
+                        information.resident_pages +=
+                            (align_up_to_page(process->heap_break) -
+                             process->heap_start) /
+                            PAGE_SIZE;
+                }
+                for (size_t mapping_index = 0U;
+                     mapping_index < PROCESS_ANONYMOUS_MAPPING_LIMIT;
+                     mapping_index++) {
+                        const struct process_anonymous_mapping *mapping =
+                            &process->anonymous_mappings[mapping_index];
+                        if (!mapping->used) continue;
+                        for (uintptr_t address = mapping->start;
+                             address < mapping->end; address += PAGE_SIZE) {
+                                uintptr_t physical_address;
+                                if (page_table_translate(process->address_space,
+                                                         address,
+                                                         &physical_address,
+                                                         NULL)) {
+                                        information.resident_pages++;
+                                }
+                        }
+                }
+                for (size_t descriptor = 0U;
+                     descriptor < PROCESS_DESCRIPTOR_LIMIT; descriptor++) {
+                        if (process->descriptors[descriptor].open_file != NULL)
+                                information.open_descriptors++;
+                }
+                information.pending_signals = process->pending_signals;
                 switch (process->state) {
                 case PROCESS_READY:
                         information.state = USER_PROCESS_READY;
@@ -5474,6 +5518,12 @@ void user_process_handle_syscall(struct trap_frame *frame) {
 
         case USER_SYSCALL_UNLINK:
                 frame->a0 = syscall_path_operation((uintptr_t)frame->a0, false);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_RENAME:
+                frame->a0 = syscall_rename((uintptr_t)frame->a0,
+                                           (uintptr_t)frame->a1);
                 frame->sepc += 4U;
                 return;
 
