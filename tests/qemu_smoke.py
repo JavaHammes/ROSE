@@ -226,6 +226,10 @@ def run_smoke_test(
                 "Graphics userspace test passed",
             )
             require(
+                session.command("desktop --test-controls", timeout=15.0),
+                "Window control test passed",
+            )
+            require(
                 session.command("desktop --stress", timeout=45.0),
                 "GUI capacity stress passed",
             )

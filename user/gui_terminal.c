@@ -23,25 +23,36 @@ enum {
 };
 
 /* ANSI's logical palette is mapped onto legible colors for the ROSE theme. */
-static const uint32_t terminal_palette[16] = {
-    UINT32_C(0x00101624), UINT32_C(0x00aa3333),
-    UINT32_C(0x0033aa66), UINT32_C(0x00aa8833),
-    UINT32_C(0x004d72cc), UINT32_C(0x00aa55aa),
-    UINT32_C(0x0033aaaa), UINT32_C(0x00d9e7f2),
-    UINT32_C(0x005f7189), UINT32_C(0x00ff6666),
-    UINT32_C(0x0066dd88), UINT32_C(0x00ffcc66),
-    UINT32_C(0x007b9cff), UINT32_C(0x00ee77dd),
-    UINT32_C(0x0066dddd), UINT32_C(0x00ffffff),
-};
-
-#define TERMINAL_CURSOR_ACTIVE UINT32_C(0x004de2b4)
-#define TERMINAL_CURSOR_INACTIVE UINT32_C(0x005f7189)
+static uint32_t terminal_palette[16];
+static uint32_t terminal_cursor_active;
+static uint32_t terminal_cursor_inactive;
 
 /* Screen and scrollback storage live in BSS, leaving the small userspace stack
  * available for syscall and renderer frames. Each terminal process owns one
  * independent emulator instance. */
 static struct rose_terminal terminal;
 static bool terminal_output_carriage_return;
+
+static void terminal_apply_theme(const struct rose_gui_theme *theme) {
+        terminal_palette[0] = theme->background;
+        terminal_palette[1] = theme->error;
+        terminal_palette[2] = theme->success;
+        terminal_palette[3] = theme->warning;
+        terminal_palette[4] = theme->accent;
+        terminal_palette[5] = UINT32_C(0x00aa55aa);
+        terminal_palette[6] = UINT32_C(0x0033aaaa);
+        terminal_palette[7] = theme->text;
+        terminal_palette[8] = theme->muted;
+        terminal_palette[9] = UINT32_C(0x00ff777f);
+        terminal_palette[10] = UINT32_C(0x0066dd88);
+        terminal_palette[11] = UINT32_C(0x00ffcc66);
+        terminal_palette[12] = theme->accent_hover;
+        terminal_palette[13] = UINT32_C(0x00ee77dd);
+        terminal_palette[14] = UINT32_C(0x0066dddd);
+        terminal_palette[15] = theme->on_accent;
+        terminal_cursor_active = theme->focus;
+        terminal_cursor_inactive = theme->muted;
+}
 
 static size_t terminal_columns_for_width(uint32_t width) {
         size_t columns = width / TERMINAL_CELL_WIDTH;
@@ -82,7 +93,7 @@ static void render_glyph(struct rose_gui_context *gui, size_t row,
 
         if (cursor && focused) {
                 rose_gui_fill(gui, x, y, TERMINAL_CELL_WIDTH,
-                              TERMINAL_CELL_HEIGHT, TERMINAL_CURSOR_ACTIVE);
+                              TERMINAL_CELL_HEIGHT, terminal_cursor_active);
                 rose_gui_text(gui, x, y + 1, text, background_color, 1U);
                 return;
         }
@@ -92,15 +103,15 @@ static void render_glyph(struct rose_gui_context *gui, size_t row,
         rose_gui_text(gui, x, y + 1, text, foreground_color, 1U);
         if (cursor) {
                 rose_gui_fill(gui, x, y, TERMINAL_CELL_WIDTH, 1,
-                              TERMINAL_CURSOR_INACTIVE);
+                              terminal_cursor_inactive);
                 rose_gui_fill(gui, x, y + TERMINAL_CELL_HEIGHT - 1,
                               TERMINAL_CELL_WIDTH, 1,
-                              TERMINAL_CURSOR_INACTIVE);
+                              terminal_cursor_inactive);
                 rose_gui_fill(gui, x, y, 1, TERMINAL_CELL_HEIGHT,
-                              TERMINAL_CURSOR_INACTIVE);
+                              terminal_cursor_inactive);
                 rose_gui_fill(gui, x + TERMINAL_CELL_WIDTH - 1, y, 1,
                               TERMINAL_CELL_HEIGHT,
-                              TERMINAL_CURSOR_INACTIVE);
+                              terminal_cursor_inactive);
         }
 }
 
@@ -232,9 +243,24 @@ static void handle_key(struct rose_gui_context *gui, int master,
         }
 }
 
+struct terminal_input {
+        int master;
+};
+
+static void terminal_event(struct rose_gui_context *gui,
+                           const struct user_input_event *event,
+                           void *user_data) {
+        struct terminal_input *input = user_data;
+        if (event->type == USER_INPUT_EVENT_KEY)
+                handle_key(gui, input->master, event);
+}
+
 int rose_gui_terminal_main(int argc, char **argv) {
         struct rose_gui_context gui;
         if (argc != 2 || !rose_gui_connect(argv[1], &gui)) return 1;
+        struct rose_gui_theme theme;
+        (void)rose_gui_theme_load(&theme, "/share/gui/theme.conf");
+        terminal_apply_theme(&theme);
 
         rose_terminal_initialize(&terminal,
                                  terminal_columns_for_width(gui.width),
@@ -301,13 +327,14 @@ int rose_gui_terminal_main(int argc, char **argv) {
         static const char banner[] = "ROSE GRAPHICAL TERMINAL\r\n";
         terminal_feed_output(&terminal, banner, sizeof(banner) - 1U);
         bool focused = gui.surface->focused != 0U;
-        uint32_t resize_sequence = gui.surface->resize_sequence;
+        struct terminal_input input = {.master = terminals[0]};
         terminal_render(&gui, &terminal, focused);
 
         while (gui.surface->close_requested == 0U) {
-                if (resize_sequence != gui.surface->resize_sequence) {
-                        resize_sequence = gui.surface->resize_sequence;
-                        if (!rose_gui_refresh_size(&gui)) break;
+                uint32_t gui_events = rose_gui_event_loop_poll(
+                    &gui, NULL, terminal_event, &input);
+                if ((gui_events & ROSE_GUI_LOOP_CLOSE) != 0U) break;
+                if ((gui_events & ROSE_GUI_LOOP_RESIZED) != 0U) {
                         rose_terminal_resize(
                             &terminal, terminal_columns_for_width(gui.width),
                             terminal_rows_for_height(gui.height));
@@ -331,11 +358,6 @@ int rose_gui_terminal_main(int argc, char **argv) {
                         }
                 } while (count > 0);
 
-                struct user_input_event event;
-                while (rose_gui_poll_event(&gui, &event)) {
-                        if (event.type == USER_INPUT_EVENT_KEY)
-                                handle_key(&gui, terminals[0], &event);
-                }
                 terminal_render(&gui, &terminal, focused);
 
                 int status;
@@ -367,7 +389,7 @@ int rose_gui_terminal_main(int argc, char **argv) {
                     &waits[5], USER_WAIT_OBJECT_SHARED_WORD,
                     USER_WAIT_EVENT_CHANGED,
                     (int64_t)(uintptr_t)&gui.surface->resize_sequence,
-                    resize_sequence);
+                    gui.observed_resize_sequence);
                 if (rose_wait_events(waits, 6U, -1) < 0) break;
         }
 

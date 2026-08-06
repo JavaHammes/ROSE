@@ -6,19 +6,20 @@
 #include "rose/syscall.h"
 #include "user_abi.h"
 
-enum { FILE_LIMIT = 24, PATH_LIMIT = 64, FILE_ROW_HEIGHT = 24 };
-
-#define FILE_BACKGROUND UINT32_C(0x00f4f7fb)
-#define FILE_TEXT UINT32_C(0x001b2940)
-#define FILE_MUTED UINT32_C(0x0065798f)
-#define FILE_ACCENT UINT32_C(0x005a6ff0)
-#define FILE_DIRECTORY UINT32_C(0x00f0b84f)
-#define FILE_ROW UINT32_C(0x00e8edf5)
+enum { FILE_LIMIT = 24, PATH_LIMIT = 64 };
 
 struct files_state {
         char path[PATH_LIMIT];
         struct user_directory_entry entries[FILE_LIMIT];
+        const char *items[FILE_LIMIT];
         size_t count;
+        char status[32];
+        struct rose_gui_widget root;
+        struct rose_gui_widget header;
+        struct rose_gui_widget body;
+        struct rose_gui_widget path_bar;
+        struct rose_gui_widget list;
+        struct rose_gui_widget status_bar;
 };
 
 static size_t string_length(const char *text) {
@@ -36,6 +37,23 @@ static void string_copy(char *destination, const char *source, size_t limit) {
         destination[index] = '\0';
 }
 
+static void update_status(struct files_state *state) {
+        char number[16];
+        rose_gui_unsigned(number, sizeof(number), state->count);
+        size_t output = 0U;
+        while (number[output] != '\0' && output + 1U < sizeof(state->status)) {
+                state->status[output] = number[output];
+                output++;
+        }
+        const char suffix[] = " ITEMS  |  ARROWS SELECT, ENTER OPEN";
+        for (size_t index = 0U; suffix[index] != '\0' &&
+                                output + 1U < sizeof(state->status);
+             index++) {
+                state->status[output++] = suffix[index];
+        }
+        state->status[output] = '\0';
+}
+
 static bool files_load(struct files_state *state) {
         long descriptor = rose_open(state->path,
                                     USER_OPEN_READ | USER_OPEN_DIRECTORY);
@@ -45,38 +63,16 @@ static bool files_load(struct files_state *state) {
                 long result = rose_read_directory(
                     (int)descriptor, &state->entries[state->count]);
                 if (result <= 0) break;
+                state->items[state->count] = state->entries[state->count].name;
                 state->count++;
         }
         (void)rose_close((int)descriptor);
+        state->list.items = state->items;
+        state->list.item_count = state->count;
+        if (state->list.selected_index >= state->count)
+                state->list.selected_index = 0U;
+        update_status(state);
         return true;
-}
-
-static void files_render(struct rose_gui_context *gui,
-                         const struct files_state *state) {
-        rose_gui_fill(gui, 0, 0, (int32_t)gui->width, (int32_t)gui->height,
-                      FILE_BACKGROUND);
-        rose_gui_fill(gui, 0, 0, (int32_t)gui->width, 46, FILE_ACCENT);
-        rose_gui_text(gui, 16, 12, "FILES", UINT32_C(0x00ffffff), 2U);
-        rose_gui_fill(gui, 14, 58, (int32_t)gui->width - 28, 30, FILE_ROW);
-        rose_gui_text(gui, 24, 68, state->path, FILE_TEXT, 1U);
-        for (size_t index = 0U; index < state->count; index++) {
-                int32_t y = 102 + (int32_t)index * FILE_ROW_HEIGHT;
-                if (y + FILE_ROW_HEIGHT > (int32_t)gui->height) break;
-                if ((index & 1U) != 0U) {
-                        rose_gui_fill(gui, 14, y - 4,
-                                      (int32_t)gui->width - 28,
-                                      FILE_ROW_HEIGHT, FILE_ROW);
-                }
-                uint32_t color = state->entries[index].type ==
-                                         USER_FILE_DIRECTORY
-                                     ? FILE_DIRECTORY
-                                     : FILE_MUTED;
-                rose_gui_fill(gui, 24, y, 12, 12, color);
-                rose_gui_text(gui, 48, y + 2, state->entries[index].name,
-                              FILE_TEXT, 1U);
-        }
-        rose_gui_present(gui, 0, 0, (int32_t)gui->width,
-                         (int32_t)gui->height);
 }
 
 static void files_open_row(struct files_state *state, size_t row) {
@@ -106,35 +102,60 @@ static void files_open_row(struct files_state *state, size_t row) {
         (void)files_load(state);
 }
 
+static void list_action(struct rose_gui_widget *widget,
+                        enum rose_gui_widget_action action, void *user_data) {
+        struct files_state *state = user_data;
+        if (action == ROSE_GUI_ACTION_SELECT)
+                files_open_row(state, widget->selected_index);
+}
+
+static void files_build_ui(struct files_state *state) {
+        rose_gui_widget_initialize(&state->root, ROSE_GUI_WIDGET_ROOT, NULL);
+        state->root.padding = 0U;
+        state->root.gap = 0U;
+
+        rose_gui_widget_initialize(&state->header, ROSE_GUI_WIDGET_STATUS_BAR,
+                                   "FILES");
+        rose_gui_widget_set_minimum(&state->header, 0, 42);
+
+        rose_gui_widget_initialize(&state->body, ROSE_GUI_WIDGET_COLUMN, NULL);
+        state->body.padding = 14U;
+        state->body.gap = 10U;
+        rose_gui_widget_set_flex(&state->body, 1U);
+
+        rose_gui_widget_initialize(&state->path_bar,
+                                   ROSE_GUI_WIDGET_STATUS_BAR, state->path);
+        rose_gui_widget_set_minimum(&state->path_bar, 0, 28);
+
+        rose_gui_items_initialize(&state->list, ROSE_GUI_WIDGET_LIST,
+                                  state->items, state->count);
+        rose_gui_widget_set_flex(&state->list, 1U);
+        state->list.callback = list_action;
+        state->list.user_data = state;
+
+        rose_gui_widget_initialize(&state->status_bar,
+                                   ROSE_GUI_WIDGET_STATUS_BAR, state->status);
+        rose_gui_widget_set_minimum(&state->status_bar, 0, 24);
+
+        rose_gui_widget_add(&state->root, &state->header);
+        rose_gui_widget_add(&state->root, &state->body);
+        rose_gui_widget_add(&state->body, &state->path_bar);
+        rose_gui_widget_add(&state->body, &state->list);
+        rose_gui_widget_add(&state->body, &state->status_bar);
+}
+
 int rose_gui_files_main(int argc, char **argv) {
-        struct rose_gui_context gui;
-        if (argc != 2 || !rose_gui_connect(argv[1], &gui)) return 1;
-        struct files_state state;
+        static struct files_state state;
+        static struct rose_gui_application app;
+        if (argc != 2) return 1;
         string_copy(state.path, "/", sizeof(state.path));
         state.count = 0U;
-        (void)files_load(&state);
-        files_render(&gui, &state);
-
-        bool pressed = false;
-        while (gui.surface->close_requested == 0U) {
-                struct user_input_event event;
-                while (rose_gui_poll_event(&gui, &event)) {
-                        if (event.type != USER_INPUT_EVENT_POINTER) continue;
-                        bool now =
-                            (event.buttons & USER_POINTER_BUTTON_LEFT) != 0U;
-                        if (!pressed && now && event.y >= 98) {
-                                size_t row =
-                                    (size_t)(event.y - 98) / FILE_ROW_HEIGHT;
-                                files_open_row(&state, row);
-                                files_render(&gui, &state);
-                        }
-                        pressed = now;
-                }
-                if (rose_gui_wait(&gui, -1) < 0) {
-                        rose_gui_disconnect(&gui);
-                        return 2;
-                }
+        update_status(&state);
+        files_build_ui(&state);
+        if (!files_load(&state) ||
+            !rose_gui_application_initialize(&app, argv[1], &state.root)) {
+                return 1;
         }
-        rose_gui_disconnect(&gui);
-        return 0;
+        rose_gui_ui_focus(&app.ui, &state.list);
+        return rose_gui_application_run(&app);
 }

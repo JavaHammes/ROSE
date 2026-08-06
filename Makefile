@@ -99,10 +99,11 @@ USER_FALLBACK_ELFS := $(foreach program,$(USER_FALLBACK_PROGRAMS),$(BUILD_DIR)/u
 USER_IMAGE_OBJECT := $(BUILD_DIR)/kernel/arch/riscv64/user_image.o
 
 USER_EXTRA_OBJECTS_sh := $(BUILD_DIR)/user/sh.o
-USER_EXTRA_OBJECTS_desktop := $(BUILD_DIR)/user/desktop.o $(BUILD_DIR)/user/font.o
-USER_EXTRA_OBJECTS_gui_terminal := $(BUILD_DIR)/user/gui_terminal.o $(BUILD_DIR)/user/terminal.o $(BUILD_DIR)/user/gui.o $(BUILD_DIR)/user/font.o
-USER_EXTRA_OBJECTS_gui_files := $(BUILD_DIR)/user/gui_files.o $(BUILD_DIR)/user/gui.o $(BUILD_DIR)/user/font.o
-USER_EXTRA_OBJECTS_gui_monitor := $(BUILD_DIR)/user/gui_monitor.o $(BUILD_DIR)/user/gui.o $(BUILD_DIR)/user/font.o
+USER_GUI_OBJECTS := $(BUILD_DIR)/user/gui.o $(BUILD_DIR)/user/gui_draw.o $(BUILD_DIR)/user/gui_resources.o $(BUILD_DIR)/user/gui_widgets.o $(BUILD_DIR)/user/font.o
+USER_EXTRA_OBJECTS_desktop := $(BUILD_DIR)/user/desktop.o $(USER_GUI_OBJECTS)
+USER_EXTRA_OBJECTS_gui_terminal := $(BUILD_DIR)/user/gui_terminal.o $(BUILD_DIR)/user/terminal.o $(USER_GUI_OBJECTS)
+USER_EXTRA_OBJECTS_gui_files := $(BUILD_DIR)/user/gui_files.o $(USER_GUI_OBJECTS)
+USER_EXTRA_OBJECTS_gui_monitor := $(BUILD_DIR)/user/gui_monitor.o $(USER_GUI_OBJECTS)
 USER_UTILITY_OBJECTS := $(BUILD_DIR)/user/utilities.o $(BUILD_DIR)/user/runtime.o
 USER_EXTRA_OBJECTS_cp := $(USER_UTILITY_OBJECTS)
 USER_EXTRA_OBJECTS_mv := $(USER_UTILITY_OBJECTS)
@@ -122,6 +123,9 @@ DEPS := \
 	$(BUILD_DIR)/user/desktop.d \
 	$(BUILD_DIR)/user/font.d \
 	$(BUILD_DIR)/user/gui.d \
+	$(BUILD_DIR)/user/gui_draw.d \
+	$(BUILD_DIR)/user/gui_resources.d \
+	$(BUILD_DIR)/user/gui_widgets.d \
 	$(BUILD_DIR)/user/terminal.d \
 	$(BUILD_DIR)/user/gui_terminal.d \
 	$(BUILD_DIR)/user/gui_files.d \
@@ -214,7 +218,7 @@ QEMU_GUI_FLAGS := \
 all: $(KERNEL) $(ROOT_IMAGE)
 
 
-$(ROOT_IMAGE): tools/mkrosefs.py assets/font5x7.hex assets/roserc $(USER_LOAD_ELFS) Makefile
+$(ROOT_IMAGE): tools/mkrosefs.py assets/font5x7.hex assets/gui-theme.conf assets/gui-icons.txt assets/gui-apps.conf assets/roserc $(USER_LOAD_ELFS) Makefile
 	@mkdir -p $(dir $@)
 	$(PYTHON) tools/mkrosefs.py $@ \
 		--file /bin/hello=$(BUILD_DIR)/user/hello/program.load.elf \
@@ -254,6 +258,9 @@ $(ROOT_IMAGE): tools/mkrosefs.py assets/font5x7.hex assets/roserc $(USER_LOAD_EL
 		--file /bin/ps=$(BUILD_DIR)/user/ps/program.load.elf \
 		--file /etc/roserc=assets/roserc \
 		--file /share/font5x7.hex=assets/font5x7.hex \
+		--file /share/gui/theme.conf=assets/gui-theme.conf \
+		--file /share/gui/icons.txt=assets/gui-icons.txt \
+		--file /share/gui/apps.conf=assets/gui-apps.conf \
 		--file /sbin/init=$(BUILD_DIR)/user/init/program.load.elf
 
 
@@ -408,6 +415,7 @@ test-graphics: $(KERNEL) $(ROOT_IMAGE)
 test-host:
 	$(MAKE) test-terminal-model
 	$(MAKE) test-shell-parser
+	$(MAKE) test-gui-toolkit
 	$(PYTHON) -m unittest discover -s tests -t . -p 'test_*.py'
 	$(PYTHON) -m py_compile tests/qemu_smoke.py tools/mkrosefs.py
 
@@ -429,6 +437,16 @@ test-shell-parser:
 		user/sh.c tests/shell_parser_test.c $(HOST_GC_SECTIONS) \
 		-o $(BUILD_DIR)/tests/shell_parser_test
 	$(BUILD_DIR)/tests/shell_parser_test
+
+
+.PHONY: test-gui-toolkit
+test-gui-toolkit:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Iuser/include -Ikernel/include \
+		user/gui_draw.c user/gui_resources.c user/gui_widgets.c \
+		tests/gui_toolkit_test.c \
+		-o $(BUILD_DIR)/tests/gui_toolkit_test
+	$(BUILD_DIR)/tests/gui_toolkit_test
 
 
 .PHONY: check

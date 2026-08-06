@@ -1,0 +1,7 @@
+# Eight rows of MSB-first 8-bit pixels per named icon.
+rose=183c7edbff7e3c18
+terminal=7e425a5a424a7e00
+files=3c427e4242427e00
+monitor=7e424a5a52627e00
+close=8142241818244281
+check=0001028448301000

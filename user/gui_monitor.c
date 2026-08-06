@@ -1,90 +1,146 @@
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "rose/gui.h"
 #include "rose/syscall.h"
 
-#define MONITOR_BACKGROUND UINT32_C(0x00151d2e)
-#define MONITOR_CARD UINT32_C(0x00212d43)
-#define MONITOR_TEXT UINT32_C(0x00ecf3ff)
-#define MONITOR_MUTED UINT32_C(0x00899ab5)
-#define MONITOR_GREEN UINT32_C(0x0047d7a1)
-#define MONITOR_BLUE UINT32_C(0x005f7cff)
+enum { MONITOR_METRIC_COUNT = 6 };
 
-static void draw_metric(struct rose_gui_context *gui, int32_t y,
-                        const char *label, uint64_t value, uint32_t color,
-                        uint32_t width) {
-        char number[24];
-        rose_gui_unsigned(number, sizeof(number), value);
-        rose_gui_text(gui, 24, y, label, MONITOR_MUTED, 1U);
-        rose_gui_text(gui, (int32_t)gui->width - 150, y, number, MONITOR_TEXT,
-                      1U);
-        rose_gui_fill(gui, 24, y + 17, (int32_t)gui->width - 48, 8,
-                      UINT32_C(0x0034415a));
-        rose_gui_fill(gui, 24, y + 17, (int32_t)width, 8, color);
+struct monitor_metric {
+        struct rose_gui_widget widget;
+        const char *label;
+        char value_text[24];
+        uint64_t value;
+        uint64_t maximum;
+        bool alternate;
+};
+
+struct monitor_state {
+        struct rose_gui_widget root;
+        struct rose_gui_widget header;
+        struct rose_gui_widget body;
+        struct rose_gui_widget subtitle;
+        struct monitor_metric metrics[MONITOR_METRIC_COUNT];
+        struct rose_gui_widget status;
+};
+
+static void metric_draw(struct rose_gui_widget *widget,
+                        struct rose_gui_canvas *canvas,
+                        const struct rose_gui_theme *theme, void *user_data) {
+        struct monitor_metric *metric = user_data;
+        int32_t text_y = widget->bounds.y + 5;
+        rose_gui_canvas_text(canvas, widget->bounds.x + 8, text_y,
+                             metric->label, theme->muted, 1U);
+        int32_t value_width = rose_gui_text_width(metric->value_text, 1U);
+        rose_gui_canvas_text(canvas,
+                             widget->bounds.x + widget->bounds.width -
+                                 value_width - 8,
+                             text_y, metric->value_text, theme->text, 1U);
+        int32_t bar_x = widget->bounds.x + 8;
+        int32_t bar_y = widget->bounds.y + widget->bounds.height - 13;
+        int32_t bar_width = widget->bounds.width - 16;
+        rose_gui_canvas_rounded_rectangle(
+            canvas, (struct rose_gui_rectangle){bar_x, bar_y, bar_width, 7},
+            3, theme->surface_alternate);
+        uint64_t maximum = metric->maximum == 0U ? 1U : metric->maximum;
+        int32_t used = (int32_t)(metric->value * (uint64_t)bar_width / maximum);
+        if (used < 0) used = 0;
+        if (used > bar_width) used = bar_width;
+        if (used != 0) {
+                rose_gui_canvas_rounded_rectangle(
+                    canvas,
+                    (struct rose_gui_rectangle){bar_x, bar_y, used, 7}, 3,
+                    metric->alternate ? theme->accent : theme->success);
+        }
 }
 
-static void monitor_render(struct rose_gui_context *gui,
-                           const struct user_system_info *info) {
-        rose_gui_fill(gui, 0, 0, (int32_t)gui->width, (int32_t)gui->height,
-                      MONITOR_BACKGROUND);
-        rose_gui_text(gui, 22, 20, "SYSTEM MONITOR", MONITOR_TEXT, 2U);
-        rose_gui_text(gui, 24, 48, "LIVE KERNEL TELEMETRY", MONITOR_MUTED,
-                      1U);
-        rose_gui_fill(gui, 16, 72, (int32_t)gui->width - 32,
-                      (int32_t)gui->height - 88, MONITOR_CARD);
+static void set_metric(struct monitor_metric *metric, uint64_t value,
+                       uint64_t maximum) {
+        metric->value = value;
+        if (maximum != 0U) {
+                metric->maximum = maximum;
+        } else if (value >= metric->maximum) {
+                metric->maximum = value + value / 4U + 1U;
+        }
+        rose_gui_unsigned(metric->value_text, sizeof(metric->value_text),
+                          value);
+}
 
-        uint32_t available = gui->width > 64U ? gui->width - 64U : 1U;
-        uint32_t memory_width = info->total_pages == 0U
-                                    ? 0U
-                                    : (uint32_t)(info->used_pages * available /
-                                                 info->total_pages);
-        draw_metric(gui, 94, "MEMORY PAGES", info->used_pages, MONITOR_GREEN,
-                    memory_width);
-        draw_metric(gui, 146, "PROCESSES", info->process_count, MONITOR_BLUE,
-                    info->process_count * 18U % available);
-        draw_metric(gui, 198, "CONTEXT SWITCHES", info->context_switches,
-                    MONITOR_GREEN,
-                    (uint32_t)(info->context_switches % available));
-        draw_metric(gui, 250, "PREEMPTIONS", info->scheduler_preemptions,
-                    MONITOR_BLUE,
-                    (uint32_t)(info->scheduler_preemptions % available));
-        draw_metric(gui, 302, "BLOCKS", info->scheduler_blocks, MONITOR_GREEN,
-                    (uint32_t)(info->scheduler_blocks % available));
-        draw_metric(gui, 354, "COW COPIES", info->copy_on_write_copies,
-                    MONITOR_BLUE,
-                    (uint32_t)(info->copy_on_write_copies % available));
-        rose_gui_present(gui, 0, 0, (int32_t)gui->width,
-                         (int32_t)gui->height);
+static bool monitor_update(struct rose_gui_application *app, uint64_t now,
+                           void *user_data) {
+        (void)app;
+        (void)now;
+        struct monitor_state *state = user_data;
+        struct user_system_info information;
+        if (rose_system_info(&information) != 0) return false;
+        set_metric(&state->metrics[0], information.used_pages,
+                   information.total_pages);
+        set_metric(&state->metrics[1], information.process_count,
+                   USER_PROCESS_INFO_LIMIT);
+        set_metric(&state->metrics[2], information.context_switches, 0U);
+        set_metric(&state->metrics[3], information.scheduler_preemptions, 0U);
+        set_metric(&state->metrics[4], information.scheduler_blocks, 0U);
+        set_metric(&state->metrics[5], information.copy_on_write_copies, 0U);
+        return true;
+}
+
+static void monitor_build_ui(struct monitor_state *state) {
+        static const char *const labels[MONITOR_METRIC_COUNT] = {
+            "MEMORY PAGES", "PROCESSES", "CONTEXT SWITCHES", "PREEMPTIONS",
+            "SCHEDULER BLOCKS", "COPY-ON-WRITE COPIES"};
+        rose_gui_widget_initialize(&state->root, ROSE_GUI_WIDGET_ROOT, NULL);
+        state->root.padding = 0U;
+        state->root.gap = 0U;
+
+        rose_gui_widget_initialize(&state->header, ROSE_GUI_WIDGET_STATUS_BAR,
+                                   "SYSTEM MONITOR");
+        rose_gui_widget_set_minimum(&state->header, 0, 42);
+
+        rose_gui_widget_initialize(&state->body, ROSE_GUI_WIDGET_COLUMN, NULL);
+        state->body.padding = 16U;
+        state->body.gap = 7U;
+        state->body.flags |= ROSE_GUI_WIDGET_SURFACE;
+        rose_gui_widget_set_flex(&state->body, 1U);
+
+        rose_gui_widget_initialize(&state->subtitle, ROSE_GUI_WIDGET_LABEL,
+                                   "LIVE KERNEL TELEMETRY");
+        rose_gui_widget_set_minimum(&state->subtitle, 0, 18);
+        rose_gui_widget_add(&state->root, &state->header);
+        rose_gui_widget_add(&state->root, &state->body);
+        rose_gui_widget_add(&state->body, &state->subtitle);
+
+        for (size_t index = 0U; index < MONITOR_METRIC_COUNT; index++) {
+                struct monitor_metric *metric = &state->metrics[index];
+                metric->label = labels[index];
+                metric->alternate = (index & 1U) != 0U;
+                metric->maximum = 1U;
+                metric->value_text[0] = '0';
+                metric->value_text[1] = '\0';
+                rose_gui_widget_initialize(&metric->widget,
+                                           ROSE_GUI_WIDGET_CUSTOM, NULL);
+                rose_gui_widget_set_minimum(&metric->widget, 0, 36);
+                rose_gui_widget_set_flex(&metric->widget, 1U);
+                metric->widget.custom_draw = metric_draw;
+                metric->widget.user_data = metric;
+                rose_gui_widget_add(&state->body, &metric->widget);
+        }
+
+        rose_gui_widget_initialize(&state->status, ROSE_GUI_WIDGET_STATUS_BAR,
+                                   "UPDATES EVERY 500 MS");
+        rose_gui_widget_set_minimum(&state->status, 0, 24);
+        rose_gui_widget_add(&state->body, &state->status);
 }
 
 int rose_gui_monitor_main(int argc, char **argv) {
-        const uint64_t update_interval = UINT64_C(500000000);
-        struct rose_gui_context gui;
-        if (argc != 2 || !rose_gui_connect(argv[1], &gui)) return 1;
-        uint64_t next_update = rose_monotonic_time();
-        while (gui.surface->close_requested == 0U) {
-                uint64_t now = rose_monotonic_time();
-                if (now >= next_update) {
-                        struct user_system_info information;
-                        if (rose_system_info(&information) == 0) {
-                                monitor_render(&gui, &information);
-                        }
-                        now = rose_monotonic_time();
-                        do {
-                                next_update += update_interval;
-                        } while (next_update <= now);
-                }
-                now = rose_monotonic_time();
-                int64_t timeout = next_update > now
-                                      ? (int64_t)(next_update - now)
-                                      : 0;
-                long result = rose_gui_wait(&gui, timeout);
-                if (result < 0 && result != -USER_ERROR_INTERRUPTED) {
-                        rose_gui_disconnect(&gui);
-                        return 2;
-                }
-        }
-        rose_gui_disconnect(&gui);
-        return 0;
+        static struct monitor_state state;
+        static struct rose_gui_application app;
+        if (argc != 2) return 1;
+        monitor_build_ui(&state);
+        if (!rose_gui_application_initialize(&app, argv[1], &state.root))
+                return 1;
+        app.update_interval = UINT64_C(500000000);
+        app.update = monitor_update;
+        app.user_data = &state;
+        return rose_gui_application_run(&app);
 }

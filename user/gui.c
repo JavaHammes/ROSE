@@ -69,6 +69,12 @@ bool rose_gui_connect(const char *identifier_text,
         context->pixel_stride = context->surface->stride / sizeof(uint32_t);
         context->pixels = (uint32_t *)(context->mapping.address +
                                       ROSE_GUI_SURFACE_PIXEL_OFFSET);
+        rose_gui_canvas_initialize(&context->canvas, context->pixels,
+                                   context->width, context->height,
+                                   context->pixel_stride);
+        context->observed_resize_sequence =
+            context->surface->resize_sequence;
+        context->observed_focus = context->surface->focused;
         context->surface->client_ready = 1U;
         rose_gui_present(context, 0, 0, (int32_t)context->width,
                          (int32_t)context->height);
@@ -89,6 +95,9 @@ bool rose_gui_refresh_size(struct rose_gui_context *context) {
         context->width = context->surface->width;
         context->height = context->surface->height;
         context->pixel_stride = context->surface->stride / sizeof(uint32_t);
+        rose_gui_canvas_initialize(&context->canvas, context->pixels,
+                                   context->width, context->height,
+                                   context->pixel_stride);
         return true;
 }
 
@@ -101,63 +110,6 @@ void rose_gui_disconnect(struct rose_gui_context *context) {
         (void)rose_event_notify(&context->surface->client_closed);
         (void)rose_shared_memory_unmap(context->identifier);
         bytes_zero(context, sizeof(*context));
-}
-
-void rose_gui_fill(struct rose_gui_context *context, int32_t x, int32_t y,
-                   int32_t width, int32_t height, uint32_t color) {
-        if (context == NULL || context->pixels == NULL) {
-                return;
-        }
-        if (x < 0) {
-                width += x;
-                x = 0;
-        }
-        if (y < 0) {
-                height += y;
-                y = 0;
-        }
-        if (x + width > (int32_t)context->width) {
-                width = (int32_t)context->width - x;
-        }
-        if (y + height > (int32_t)context->height) {
-                height = (int32_t)context->height - y;
-        }
-        if (width <= 0 || height <= 0) {
-                return;
-        }
-        for (int32_t row = y; row < y + height; row++) {
-                for (int32_t column = x; column < x + width; column++) {
-                        context->pixels[(size_t)row * context->pixel_stride +
-                                        (size_t)column] = color;
-                }
-        }
-}
-
-void rose_gui_text(struct rose_gui_context *context, int32_t x, int32_t y,
-                   const char *text, uint32_t color, uint32_t scale) {
-        if (scale == 0U) {
-                return;
-        }
-        while (text != NULL && *text != '\0') {
-                char character = *text++;
-                const uint8_t *glyph = rose_font_glyph(character);
-                if (glyph == NULL) return;
-                for (int32_t glyph_x = 0; glyph_x < ROSE_GUI_FONT_WIDTH;
-                     glyph_x++) {
-                        for (int32_t glyph_y = 0; glyph_y < ROSE_GUI_FONT_HEIGHT;
-                             glyph_y++) {
-                                if ((glyph[glyph_x] & (1U << glyph_y)) != 0U) {
-                                        rose_gui_fill(
-                                            context,
-                                            x + glyph_x * (int32_t)scale,
-                                            y + glyph_y * (int32_t)scale,
-                                            (int32_t)scale, (int32_t)scale,
-                                            color);
-                                }
-                        }
-                }
-                x += (ROSE_GUI_FONT_WIDTH + 1) * (int32_t)scale;
-        }
 }
 
 void rose_gui_present(struct rose_gui_context *context, int32_t x, int32_t y,
@@ -313,6 +265,119 @@ char rose_gui_key_character(struct rose_gui_context *context,
         case 57: return ' ';
         default: return 0;
         }
+}
+
+uint32_t rose_gui_event_loop_poll(struct rose_gui_context *context,
+                                  struct rose_gui_ui *ui,
+                                  rose_gui_event_callback callback,
+                                  void *user_data) {
+        if (context == NULL || context->surface == NULL)
+                return ROSE_GUI_LOOP_CLOSE;
+        uint32_t result = 0U;
+        if (context->surface->close_requested != 0U)
+                result |= ROSE_GUI_LOOP_CLOSE;
+        if (context->observed_resize_sequence !=
+            context->surface->resize_sequence) {
+                context->observed_resize_sequence =
+                    context->surface->resize_sequence;
+                if (!rose_gui_refresh_size(context)) {
+                        return result | ROSE_GUI_LOOP_CLOSE;
+                }
+                if (ui != NULL) {
+                        ui->canvas = &context->canvas;
+                        rose_gui_ui_layout(
+                            ui, (struct rose_gui_rectangle){
+                                    0, 0, (int32_t)context->width,
+                                    (int32_t)context->height});
+                }
+                result |= ROSE_GUI_LOOP_RESIZED;
+        }
+        if (context->observed_focus != context->surface->focused) {
+                context->observed_focus = context->surface->focused;
+                if (context->observed_focus == 0U) {
+                        context->shift = false;
+                        context->control = false;
+                }
+                if (ui != NULL) rose_gui_ui_invalidate(ui);
+                result |= ROSE_GUI_LOOP_FOCUS_CHANGED;
+        }
+
+        struct user_input_event event;
+        while (rose_gui_poll_event(context, &event)) {
+                result |= ROSE_GUI_LOOP_EVENT;
+                if (ui != NULL)
+                        (void)rose_gui_ui_handle_event(ui, context, &event);
+                if (callback != NULL) callback(context, &event, user_data);
+        }
+        return result;
+}
+
+bool rose_gui_application_initialize(struct rose_gui_application *app,
+                                     const char *identifier,
+                                     struct rose_gui_widget *root) {
+        if (app == NULL || root == NULL) return false;
+        bytes_zero(app, sizeof(*app));
+        if (!rose_gui_connect(identifier, &app->context)) return false;
+        (void)rose_gui_theme_load(&app->theme, "/share/gui/theme.conf");
+        app->root = root;
+        rose_gui_ui_initialize(&app->ui, &app->context.canvas, &app->theme,
+                               root);
+        rose_gui_ui_layout(&app->ui,
+                           (struct rose_gui_rectangle){
+                               0, 0, (int32_t)app->context.width,
+                               (int32_t)app->context.height});
+        return true;
+}
+
+void rose_gui_application_render(struct rose_gui_application *app) {
+        if (app == NULL || !app->ui.dirty) return;
+        rose_gui_ui_draw(&app->ui);
+        rose_gui_present(&app->context, 0, 0, (int32_t)app->context.width,
+                         (int32_t)app->context.height);
+}
+
+int rose_gui_application_run(struct rose_gui_application *app) {
+        if (app == NULL || app->context.surface == NULL) return 1;
+        uint64_t next_update = rose_monotonic_time();
+        if (app->update != NULL &&
+            app->update(app, next_update, app->user_data)) {
+                rose_gui_ui_invalidate(&app->ui);
+        }
+        if (app->update_interval != 0U)
+                next_update += app->update_interval;
+        rose_gui_application_render(app);
+
+        while (app->context.surface->close_requested == 0U) {
+                uint32_t events = rose_gui_event_loop_poll(
+                    &app->context, &app->ui, NULL, NULL);
+                if ((events & ROSE_GUI_LOOP_CLOSE) != 0U) break;
+
+                uint64_t now = rose_monotonic_time();
+                if (app->update != NULL && app->update_interval != 0U &&
+                    now >= next_update) {
+                        if (app->update(app, now, app->user_data))
+                                rose_gui_ui_invalidate(&app->ui);
+                        do {
+                                next_update += app->update_interval;
+                        } while (next_update <= now);
+                }
+                rose_gui_application_render(app);
+
+                now = rose_monotonic_time();
+                int64_t timeout = -1;
+                if (app->update != NULL && app->update_interval != 0U) {
+                        timeout = next_update > now
+                                      ? (int64_t)(next_update - now)
+                                      : 0;
+                }
+                long waited = rose_gui_wait(&app->context, timeout);
+                if (waited < 0 && waited != -USER_ERROR_INTERRUPTED) {
+                        rose_gui_disconnect(&app->context);
+                        return 2;
+                }
+        }
+        rose_gui_disconnect(&app->context);
+        return 0;
 }
 
 void rose_gui_unsigned(char *buffer, size_t size, uint64_t value) {

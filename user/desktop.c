@@ -9,8 +9,6 @@
 #include "user_abi.h"
 
 enum {
-        FONT_WIDTH = ROSE_FONT_WIDTH,
-        FONT_HEIGHT = ROSE_FONT_HEIGHT,
         WINDOW_LIMIT = 12,
         CAPACITY_STRESS_CYCLES = 3,
         PANEL_HEIGHT = 54,
@@ -20,25 +18,25 @@ enum {
         WINDOW_SHADOW_Y = 11,
         POINTER_SIZE = 22,
         KEY_ESCAPE = 1,
+        KEY_TAB = 15,
+        KEY_Q = 16,
         KEY_T = 20,
+        KEY_L = 38,
         KEY_LEFT_CONTROL = 29,
         KEY_LEFT_ALT = 56,
+        KEY_F4 = 62,
+        KEY_F6 = 64,
+        KEY_F7 = 65,
+        KEY_F8 = 66,
+        KEY_F9 = 67,
+        KEY_F10 = 68,
         KEY_RIGHT_CONTROL = 97,
         KEY_RIGHT_ALT = 100,
+        KEY_UP = 103,
+        KEY_LEFT = 105,
+        KEY_RIGHT = 106,
+        KEY_DOWN = 108,
 };
-
-#define COLOR_PANEL UINT32_C(0x0010192a)
-#define COLOR_TITLE UINT32_C(0x001c2940)
-#define COLOR_TITLE_FOCUSED UINT32_C(0x00253652)
-#define COLOR_BORDER UINT32_C(0x00425874)
-#define COLOR_TEXT UINT32_C(0x00dce8f7)
-#define COLOR_MUTED UINT32_C(0x008da0bb)
-#define COLOR_ACCENT UINT32_C(0x005f7cff)
-#define COLOR_GREEN UINT32_C(0x0048d5a2)
-#define COLOR_YELLOW UINT32_C(0x00f2bb4b)
-#define COLOR_RED UINT32_C(0x00ef6575)
-#define COLOR_SHADOW UINT32_C(0x00101828)
-#define COLOR_WHITE UINT32_C(0x00ffffff)
 
 struct rectangle {
         int32_t x;
@@ -56,6 +54,13 @@ struct desktop_window {
         uint32_t height;
         uint32_t capacity_width;
         uint32_t capacity_height;
+        int32_t restore_x;
+        int32_t restore_y;
+        uint32_t restore_width;
+        uint32_t restore_height;
+        bool minimized;
+        bool fullscreen;
+        bool restore_valid;
         long pid;
         struct user_shared_memory_info mapping;
         struct rose_gui_surface *surface;
@@ -67,6 +72,20 @@ struct desktop {
         struct user_graphics_info graphics;
         uint32_t *pixels;
         uint32_t pixel_stride;
+        struct rose_gui_canvas canvas;
+        struct rose_gui_theme theme;
+        struct rose_gui_app_catalog catalog;
+        const char *menu_items[ROSE_GUI_APP_LIMIT];
+        struct rose_gui_context input_context;
+        struct rose_gui_ui ui;
+        struct rose_gui_widget ui_root;
+        struct rose_gui_widget panel;
+        struct rose_gui_widget launcher;
+        struct rose_gui_widget panel_exit;
+        struct rose_gui_widget menu;
+        struct rose_gui_widget exit_dialog;
+        struct rose_gui_widget exit_yes;
+        struct rose_gui_widget exit_no;
         struct desktop_window windows[WINDOW_LIMIT];
         size_t window_count;
         int32_t pointer_x;
@@ -76,11 +95,14 @@ struct desktop {
         bool resizing;
         bool control;
         bool alt;
+        bool ui_keyboard_active;
+        uint8_t keyboard_window_mode;
         int32_t drag_offset_x;
         int32_t drag_offset_y;
         struct rectangle dirty;
         bool has_dirty;
         bool exiting;
+        bool compact_surfaces;
 };
 
 static size_t string_length(const char *text) {
@@ -111,8 +133,10 @@ static struct rectangle window_rectangle(const struct desktop_window *window) {
             .x = window->x,
             .y = window->y,
             .width = (int32_t)window->width + WINDOW_BORDER * 2,
-            .height = (int32_t)window->height + WINDOW_TITLE_HEIGHT +
-                      WINDOW_BORDER,
+            .height = window->minimized
+                          ? WINDOW_TITLE_HEIGHT
+                          : (int32_t)window->height + WINDOW_TITLE_HEIGHT +
+                                WINDOW_BORDER,
         };
 }
 
@@ -169,85 +193,25 @@ static bool point_in_rectangle(int32_t x, int32_t y,
                y < rectangle.y + rectangle.height;
 }
 
-static void put_pixel(struct desktop *desktop, int32_t x, int32_t y,
-                      uint32_t color) {
-        if (!desktop->has_dirty || x < desktop->dirty.x ||
-            y < desktop->dirty.y ||
-            x >= desktop->dirty.x + desktop->dirty.width ||
-            y >= desktop->dirty.y + desktop->dirty.height || x < 0 || y < 0 ||
-            x >= (int32_t)desktop->graphics.width ||
-            y >= (int32_t)desktop->graphics.height) {
-                return;
-        }
-        desktop->pixels[(size_t)y * desktop->pixel_stride + (size_t)x] = color;
-}
-
 static void fill_rectangle(struct desktop *desktop, int32_t x, int32_t y,
                            int32_t width, int32_t height, uint32_t color) {
-        if (!desktop->has_dirty) return;
-        int32_t left = x > desktop->dirty.x ? x : desktop->dirty.x;
-        int32_t top = y > desktop->dirty.y ? y : desktop->dirty.y;
-        int32_t right = x + width;
-        int32_t bottom = y + height;
-        int32_t dirty_right = desktop->dirty.x + desktop->dirty.width;
-        int32_t dirty_bottom = desktop->dirty.y + desktop->dirty.height;
-        if (right > dirty_right) right = dirty_right;
-        if (bottom > dirty_bottom) bottom = dirty_bottom;
-        if (left < 0) left = 0;
-        if (top < 0) top = 0;
-        if (right > (int32_t)desktop->graphics.width)
-                right = (int32_t)desktop->graphics.width;
-        if (bottom > (int32_t)desktop->graphics.height)
-                bottom = (int32_t)desktop->graphics.height;
-        for (int32_t row = top; row < bottom; row++) {
-                for (int32_t column = left; column < right; column++) {
-                        desktop->pixels[(size_t)row * desktop->pixel_stride +
-                                        (size_t)column] = color;
-                }
-        }
+        rose_gui_canvas_fill(&desktop->canvas, x, y, width, height, color);
 }
 
 static void draw_text(struct desktop *desktop, int32_t x, int32_t y,
                       const char *text, uint32_t color, uint32_t scale) {
-        while (*text != '\0') {
-                char character = *text++;
-                const uint8_t *glyph = rose_font_glyph(character);
-                if (glyph == NULL) return;
-                for (int32_t glyph_x = 0; glyph_x < FONT_WIDTH; glyph_x++) {
-                        for (int32_t glyph_y = 0; glyph_y < FONT_HEIGHT;
-                             glyph_y++) {
-                                if ((glyph[glyph_x] & (1U << glyph_y)) != 0U) {
-                                        fill_rectangle(
-                                            desktop,
-                                            x + glyph_x * (int32_t)scale,
-                                            y + glyph_y * (int32_t)scale,
-                                            (int32_t)scale, (int32_t)scale,
-                                            color);
-                                }
-                        }
-                }
-                x += (FONT_WIDTH + 1) * (int32_t)scale;
-        }
+        rose_gui_canvas_text(&desktop->canvas, x, y, text, color, scale);
 }
 
 static void draw_background(struct desktop *desktop) {
-        int32_t start = desktop->dirty.y;
-        int32_t end = start + desktop->dirty.height;
-        for (int32_t y = start; y < end; y++) {
-                uint32_t blue = 0x38U + ((uint32_t)y >> 5U);
-                uint32_t green = 0x26U + ((uint32_t)y >> 6U);
-                uint32_t color = UINT32_C(0x00170000) | (green << 8U) | blue;
-                fill_rectangle(desktop, desktop->dirty.x, y,
-                               desktop->dirty.width, 1, color);
-        }
         fill_rectangle(desktop, 0, 0, (int32_t)desktop->graphics.width,
-                       PANEL_HEIGHT, COLOR_PANEL);
-        fill_rectangle(desktop, 18, 14, 26, 26, COLOR_ACCENT);
-        fill_rectangle(desktop, 23, 19, 16, 16, COLOR_GREEN);
-        draw_text(desktop, 58, 17, "ROSE", COLOR_WHITE, 2U);
-        draw_text(desktop, 142, 21, "MULTI-PROCESS DESKTOP", COLOR_MUTED, 1U);
-        draw_text(desktop, (int32_t)desktop->graphics.width - 282, 21,
-                  "CTRL+ALT+T NEW TERMINAL", COLOR_MUTED, 1U);
+                       (int32_t)desktop->graphics.height,
+                       desktop->theme.background);
+        rose_gui_canvas_blend(
+            &desktop->canvas, 0, PANEL_HEIGHT,
+            (int32_t)desktop->graphics.width,
+            (int32_t)desktop->graphics.height - PANEL_HEIGHT,
+            UINT32_C(0x10005f7c));
 }
 
 static void draw_window(struct desktop *desktop,
@@ -255,78 +219,129 @@ static void draw_window(struct desktop *desktop,
         struct rectangle bounds = window_rectangle(window);
         fill_rectangle(desktop, bounds.x + WINDOW_SHADOW_X,
                        bounds.y + WINDOW_SHADOW_Y, bounds.width, bounds.height,
-                       COLOR_SHADOW);
+                       desktop->theme.shadow);
         fill_rectangle(desktop, bounds.x, bounds.y, bounds.width, bounds.height,
-                       COLOR_BORDER);
+                       desktop->theme.border);
         fill_rectangle(desktop, bounds.x + WINDOW_BORDER,
                        bounds.y + WINDOW_BORDER,
                        (int32_t)window->width, WINDOW_TITLE_HEIGHT - 2,
-                       focused ? COLOR_TITLE_FOCUSED : COLOR_TITLE);
-        fill_rectangle(desktop, bounds.x + 12, bounds.y + 11, 10, 10,
-                       COLOR_RED);
-        fill_rectangle(desktop, bounds.x + 30, bounds.y + 11, 10, 10,
-                       COLOR_YELLOW);
-        fill_rectangle(desktop, bounds.x + 48, bounds.y + 11, 10, 10,
-                       COLOR_GREEN);
+                       focused ? desktop->theme.surface_alternate
+                               : desktop->theme.surface);
+        uint32_t close_color = desktop->theme.error;
+        uint32_t minimize_color = window->minimized ? desktop->theme.accent
+                                                    : desktop->theme.warning;
+        uint32_t fullscreen_color = window->fullscreen
+                                        ? desktop->theme.accent
+                                        : desktop->theme.success;
+        bool close_hovered =
+            desktop->pointer_x >= bounds.x + 7 &&
+            desktop->pointer_x < bounds.x + 27 &&
+            desktop->pointer_y >= bounds.y + 5 &&
+            desktop->pointer_y < bounds.y + 25;
+        bool minimize_hovered =
+            desktop->pointer_x >= bounds.x + 25 &&
+            desktop->pointer_x < bounds.x + 45 &&
+            desktop->pointer_y >= bounds.y + 5 &&
+            desktop->pointer_y < bounds.y + 25;
+        bool fullscreen_hovered =
+            desktop->pointer_x >= bounds.x + 43 &&
+            desktop->pointer_x < bounds.x + 63 &&
+            desktop->pointer_y >= bounds.y + 5 &&
+            desktop->pointer_y < bounds.y + 25;
+        if (close_hovered &&
+            (desktop->pointer_buttons & USER_POINTER_BUTTON_LEFT) != 0U) {
+                close_color = desktop->theme.accent_pressed;
+        } else if (close_hovered) {
+                close_color = desktop->theme.accent_hover;
+        }
+        if (minimize_hovered &&
+            (desktop->pointer_buttons & USER_POINTER_BUTTON_LEFT) != 0U) {
+                minimize_color = desktop->theme.accent_pressed;
+        } else if (minimize_hovered) {
+                minimize_color = desktop->theme.accent_hover;
+        }
+        if (fullscreen_hovered &&
+            (desktop->pointer_buttons & USER_POINTER_BUTTON_LEFT) != 0U) {
+                fullscreen_color = desktop->theme.accent_pressed;
+        } else if (fullscreen_hovered) {
+                fullscreen_color = desktop->theme.accent_hover;
+        }
+        rose_gui_canvas_rounded_rectangle(
+            &desktop->canvas,
+            (struct rose_gui_rectangle){bounds.x + 12, bounds.y + 11, 10, 10},
+            5, close_color);
+        rose_gui_canvas_rounded_rectangle(
+            &desktop->canvas,
+            (struct rose_gui_rectangle){bounds.x + 30, bounds.y + 11, 10, 10},
+            5, minimize_color);
+        rose_gui_canvas_rounded_rectangle(
+            &desktop->canvas,
+            (struct rose_gui_rectangle){bounds.x + 48, bounds.y + 11, 10, 10},
+            5, fullscreen_color);
         draw_text(desktop, bounds.x + 72, bounds.y + 11, window->title,
-                  focused ? COLOR_WHITE : COLOR_MUTED, 1U);
+                  focused ? desktop->theme.text : desktop->theme.muted, 1U);
         if (focused) {
                 fill_rectangle(desktop, bounds.x + WINDOW_BORDER,
                                bounds.y + WINDOW_TITLE_HEIGHT - 2,
-                               (int32_t)window->width, 2, COLOR_ACCENT);
+                               (int32_t)window->width, 2,
+                               desktop->theme.accent);
         }
+
+        if (window->minimized) return;
 
         int32_t content_x = bounds.x + WINDOW_BORDER;
         int32_t content_y = bounds.y + WINDOW_TITLE_HEIGHT;
-        int32_t left = content_x > desktop->dirty.x ? content_x
-                                                    : desktop->dirty.x;
-        int32_t top = content_y > desktop->dirty.y ? content_y
-                                                   : desktop->dirty.y;
-        int32_t right = content_x + (int32_t)window->width;
-        int32_t bottom = content_y + (int32_t)window->height;
-        int32_t dirty_right = desktop->dirty.x + desktop->dirty.width;
-        int32_t dirty_bottom = desktop->dirty.y + desktop->dirty.height;
-        if (right > dirty_right) right = dirty_right;
-        if (bottom > dirty_bottom) bottom = dirty_bottom;
-        for (int32_t y = top; y < bottom; y++) {
-                for (int32_t x = left; x < right; x++) {
-                        size_t source_y = (size_t)(y - content_y);
-                        size_t source_x = (size_t)(x - content_x);
-                        size_t source_stride =
-                            window->surface->stride / sizeof(uint32_t);
-                        put_pixel(desktop, x, y,
-                                  window->pixels[source_y * source_stride +
-                                                 source_x]);
-                }
-        }
+        struct rose_gui_rectangle previous = rose_gui_canvas_set_clip(
+            &desktop->canvas,
+            (struct rose_gui_rectangle){content_x, content_y,
+                                        (int32_t)window->width,
+                                        (int32_t)window->height});
+        struct rose_gui_image image = {
+            .pixels = window->pixels,
+            .width = window->width,
+            .height = window->height,
+            .pixel_stride =
+                window->surface->stride / sizeof(uint32_t),
+            .alpha = false,
+        };
+        rose_gui_canvas_image(&desktop->canvas, content_x, content_y, &image);
+        rose_gui_canvas_restore_clip(&desktop->canvas, previous);
         if (strings_equal(window->program, "/bin/gui-terminal")) {
                 fill_rectangle(desktop, content_x + (int32_t)window->width - 10,
                                content_y + (int32_t)window->height,
-                               12, WINDOW_BORDER, COLOR_ACCENT);
+                               12, WINDOW_BORDER, desktop->theme.accent);
                 fill_rectangle(desktop, content_x + (int32_t)window->width,
                                content_y + (int32_t)window->height - 10,
-                               WINDOW_BORDER, 12, COLOR_ACCENT);
+                               WINDOW_BORDER, 12, desktop->theme.accent);
         }
 }
 
 static void draw_pointer(struct desktop *desktop) {
         for (int32_t offset = 0; offset < 18; offset++) {
                 fill_rectangle(desktop, desktop->pointer_x + offset / 2,
-                               desktop->pointer_y + offset, 3, 3, COLOR_WHITE);
+                               desktop->pointer_y + offset, 3, 3,
+                               desktop->theme.text);
         }
         fill_rectangle(desktop, desktop->pointer_x + 8,
-                       desktop->pointer_y + 15, 7, 7, COLOR_PANEL);
+                       desktop->pointer_y + 15, 7, 7,
+                       desktop->theme.background);
 }
 
 static bool render(struct desktop *desktop) {
         if (!desktop->has_dirty) return true;
         struct rectangle dirty = desktop->dirty;
+        struct rose_gui_rectangle previous = rose_gui_canvas_set_clip(
+            &desktop->canvas,
+            (struct rose_gui_rectangle){dirty.x, dirty.y, dirty.width,
+                                        dirty.height});
         draw_background(desktop);
         for (size_t index = 0U; index < desktop->window_count; index++) {
                 draw_window(desktop, &desktop->windows[index],
                             index + 1U == desktop->window_count);
         }
+        rose_gui_ui_draw(&desktop->ui);
         draw_pointer(desktop);
+        rose_gui_canvas_restore_clip(&desktop->canvas, previous);
         desktop->has_dirty = false;
         return rose_graphics_flush((uint32_t)dirty.x, (uint32_t)dirty.y,
                                    (uint32_t)dirty.width,
@@ -348,12 +363,25 @@ static void format_identifier(uint32_t identifier, char text[11]) {
 static bool create_window(struct desktop *desktop, const char *title,
                           const char *program, int32_t x, int32_t y,
                           uint32_t width, uint32_t height) {
-        if (desktop->window_count == WINDOW_LIMIT ||
-            width > UINT32_MAX / sizeof(uint32_t)) {
+        uint32_t capacity_width = width;
+        uint32_t capacity_height = height;
+        if (!desktop->compact_surfaces) {
+                capacity_width = desktop->graphics.width - WINDOW_BORDER * 2U;
+                capacity_height = desktop->graphics.height - PANEL_HEIGHT -
+                                  WINDOW_TITLE_HEIGHT - WINDOW_BORDER;
+        }
+        if (desktop->window_count == WINDOW_LIMIT || width > capacity_width ||
+            height > capacity_height ||
+            capacity_width > UINT32_MAX / sizeof(uint32_t) ||
+            capacity_height > SIZE_MAX / capacity_width ||
+            capacity_width * (size_t)capacity_height >
+                (SIZE_MAX - ROSE_GUI_SURFACE_PIXEL_OFFSET) /
+                    sizeof(uint32_t)) {
                 return false;
         }
         size_t size = ROSE_GUI_SURFACE_PIXEL_OFFSET +
-                      (size_t)width * height * sizeof(uint32_t);
+                      (size_t)capacity_width * capacity_height *
+                          sizeof(uint32_t);
         struct desktop_window *window =
             &desktop->windows[desktop->window_count];
         zero_bytes(window, sizeof(*window));
@@ -366,8 +394,8 @@ static bool create_window(struct desktop *desktop, const char *title,
         window->y = y;
         window->width = width;
         window->height = height;
-        window->capacity_width = width;
-        window->capacity_height = height;
+        window->capacity_width = capacity_width;
+        window->capacity_height = capacity_height;
         window->surface = (struct rose_gui_surface *)window->mapping.address;
         window->pixels = (uint32_t *)(window->mapping.address +
                                       ROSE_GUI_SURFACE_PIXEL_OFFSET);
@@ -375,8 +403,9 @@ static bool create_window(struct desktop *desktop, const char *title,
         window->surface->version = ROSE_GUI_SURFACE_VERSION;
         window->surface->width = width;
         window->surface->height = height;
-        window->surface->stride = width * sizeof(uint32_t);
-        for (size_t pixel = 0U; pixel < (size_t)width * height; pixel++) {
+        window->surface->stride = capacity_width * sizeof(uint32_t);
+        for (size_t pixel = 0U;
+             pixel < (size_t)capacity_width * capacity_height; pixel++) {
                 window->pixels[pixel] = UINT32_C(0x00101826);
         }
 
@@ -394,8 +423,14 @@ static bool create_window(struct desktop *desktop, const char *title,
         desktop->window_count++;
         window->surface->focused = 1U;
         if (desktop->window_count > 1U) {
-                desktop->windows[desktop->window_count - 2U]
-                    .surface->focused = 0U;
+                struct rose_gui_surface *previous =
+                    desktop->windows[desktop->window_count - 2U].surface;
+                previous->focused = 0U;
+                (void)rose_event_notify(&previous->focused);
+                dirty_add(
+                    desktop,
+                    window_damage_rectangle(
+                        &desktop->windows[desktop->window_count - 2U]));
         }
         dirty_add(desktop, window_damage_rectangle(window));
         return true;
@@ -428,8 +463,58 @@ static void focus_window(struct desktop *desktop, size_t index) {
             &desktop->windows[desktop->window_count - 1U].surface->focused);
         dirty_add(
             desktop,
-            window_damage_rectangle(
-                &desktop->windows[desktop->window_count - 1U]));
+                window_damage_rectangle(
+                    &desktop->windows[desktop->window_count - 1U]));
+}
+
+static void resize_window(struct desktop_window *window, uint32_t width,
+                          uint32_t height) {
+        if (width == window->width && height == window->height) return;
+        window->width = width;
+        window->height = height;
+        window->surface->width = width;
+        window->surface->height = height;
+        __sync_synchronize();
+        window->surface->resize_sequence++;
+        (void)rose_event_notify(&window->surface->resize_sequence);
+}
+
+static void toggle_window_minimized(struct desktop *desktop,
+                                    struct desktop_window *window) {
+        dirty_add(desktop, window_damage_rectangle(window));
+        window->minimized = !window->minimized;
+        desktop->dragging = false;
+        desktop->resizing = false;
+        dirty_add(desktop, window_damage_rectangle(window));
+}
+
+static void toggle_window_fullscreen(struct desktop *desktop,
+                                     struct desktop_window *window) {
+        dirty_add(desktop, window_damage_rectangle(window));
+        window->minimized = false;
+        if (!window->fullscreen) {
+                window->restore_x = window->x;
+                window->restore_y = window->y;
+                window->restore_width = window->width;
+                window->restore_height = window->height;
+                window->restore_valid = true;
+                window->x = 0;
+                window->y = PANEL_HEIGHT;
+                resize_window(
+                    window, desktop->graphics.width - WINDOW_BORDER * 2U,
+                    desktop->graphics.height - PANEL_HEIGHT -
+                        WINDOW_TITLE_HEIGHT - WINDOW_BORDER);
+                window->fullscreen = true;
+        } else if (window->restore_valid) {
+                window->x = window->restore_x;
+                window->y = window->restore_y;
+                resize_window(window, window->restore_width,
+                              window->restore_height);
+                window->fullscreen = false;
+        }
+        desktop->dragging = false;
+        desktop->resizing = false;
+        dirty_add(desktop, window_damage_rectangle(window));
 }
 
 static void send_event(struct desktop_window *window,
@@ -457,7 +542,8 @@ static void send_event(struct desktop_window *window,
 }
 
 static void process_pointer(struct desktop *desktop,
-                            const struct user_input_event *event) {
+                            const struct user_input_event *event,
+                            bool route_windows) {
         bool was_pressed =
             (desktop->pointer_buttons & USER_POINTER_BUTTON_LEFT) != 0U;
         bool is_pressed =
@@ -471,7 +557,17 @@ static void process_pointer(struct desktop *desktop,
                                               desktop->pointer_y, POINTER_SIZE,
                                               POINTER_SIZE});
 
+        if (!route_windows) {
+                if (!is_pressed) {
+                        desktop->dragging = false;
+                        desktop->resizing = false;
+                }
+                desktop->pointer_buttons = event->buttons;
+                return;
+        }
+
         if (!was_pressed && is_pressed) {
+                desktop->ui_keyboard_active = false;
                 for (size_t reverse = desktop->window_count; reverse != 0U;
                      reverse--) {
                         size_t index = reverse - 1U;
@@ -484,6 +580,7 @@ static void process_pointer(struct desktop *desktop,
                         focus_window(desktop, index);
                         window = &desktop->windows[desktop->window_count - 1U];
                         bool resize_handle =
+                            !window->minimized && !window->fullscreen &&
                             strings_equal(window->program,
                                           "/bin/gui-terminal") &&
                             event->x >= window->x + WINDOW_BORDER +
@@ -500,7 +597,15 @@ static void process_pointer(struct desktop *desktop,
                                         window->surface->close_requested = 1U;
                                         (void)rose_event_notify(
                                             &window->surface->close_requested);
-                                } else {
+                                } else if (event->x >= window->x + 25 &&
+                                           event->x < window->x + 45) {
+                                        toggle_window_minimized(desktop,
+                                                                window);
+                                } else if (event->x >= window->x + 43 &&
+                                           event->x < window->x + 63) {
+                                        toggle_window_fullscreen(desktop,
+                                                                 window);
+                                } else if (!window->fullscreen) {
                                         desktop->dragging = true;
                                         desktop->drag_offset_x =
                                             event->x - window->x;
@@ -532,14 +637,7 @@ static void process_pointer(struct desktop *desktop,
                         height = window->capacity_height;
                 if (width != window->width || height != window->height) {
                         dirty_add(desktop, window_damage_rectangle(window));
-                        window->width = width;
-                        window->height = height;
-                        window->surface->width = width;
-                        window->surface->height = height;
-                        __sync_synchronize();
-                        window->surface->resize_sequence++;
-                        (void)rose_event_notify(
-                            &window->surface->resize_sequence);
+                        resize_window(window, width, height);
                         dirty_add(desktop, window_damage_rectangle(window));
                 }
         }
@@ -572,15 +670,9 @@ static void process_pointer(struct desktop *desktop,
             desktop->window_count != 0U) {
                 struct desktop_window *focused =
                     &desktop->windows[desktop->window_count - 1U];
-                struct rectangle content = {
-                    .x = focused->x + WINDOW_BORDER,
-                    .y = focused->y + WINDOW_TITLE_HEIGHT,
-                    .width = (int32_t)focused->width,
-                    .height = (int32_t)focused->height,
-                };
-                if (point_in_rectangle(event->x, event->y, content)) {
-                        send_event(focused, event, true);
-                }
+                /* Out-of-content coordinates deliberately reach the focused
+                 * client so retained hover/pressed states clear on leave. */
+                if (!focused->minimized) send_event(focused, event, true);
         }
 }
 
@@ -590,6 +682,11 @@ static void collect_damage(struct desktop *desktop) {
                 uint32_t sequence = window->surface->damage_sequence;
                 if (sequence == window->last_damage_sequence) continue;
                 __sync_synchronize();
+                if (window->minimized) {
+                        window->last_damage_sequence = sequence;
+                        window->surface->damage_consumed = sequence;
+                        continue;
+                }
                 struct rectangle damage = {
                     .x = window->x + WINDOW_BORDER + window->surface->damage_x,
                     .y = window->y + WINDOW_TITLE_HEIGHT +
@@ -820,21 +917,343 @@ static bool run_capacity_stress(struct desktop *desktop) {
         return true;
 }
 
+static void test_pointer_click(struct desktop *desktop, int32_t x, int32_t y) {
+        struct user_input_event event;
+        zero_bytes(&event, sizeof(event));
+        event.type = USER_INPUT_EVENT_POINTER;
+        event.x = x;
+        event.y = y;
+        event.buttons = USER_POINTER_BUTTON_LEFT;
+        process_pointer(desktop, &event, true);
+        event.buttons = 0U;
+        process_pointer(desktop, &event, true);
+}
+
+static bool run_window_control_test(struct desktop *desktop) {
+        const int32_t initial_x = 42;
+        const int32_t initial_y = 78;
+        const uint32_t initial_width = 500U;
+        const uint32_t initial_height = 350U;
+        if (!create_window(desktop, "FILES", "/bin/gui-files", initial_x,
+                           initial_y, initial_width, initial_height)) {
+                return false;
+        }
+        struct desktop_window *window = &desktop->windows[0];
+
+        test_pointer_click(desktop, initial_x + 35, initial_y + 15);
+        if (!window->minimized ||
+            window_rectangle(window).height != WINDOW_TITLE_HEIGHT) {
+                close_windows(desktop);
+                return false;
+        }
+        test_pointer_click(desktop, initial_x + 35, initial_y + 15);
+        if (window->minimized || window->width != initial_width ||
+            window->height != initial_height) {
+                close_windows(desktop);
+                return false;
+        }
+
+        test_pointer_click(desktop, initial_x + 53, initial_y + 15);
+        if (!window->fullscreen || window->minimized || window->x != 0 ||
+            window->y != PANEL_HEIGHT ||
+            window->width != desktop->graphics.width - WINDOW_BORDER * 2U ||
+            window->height != desktop->graphics.height - PANEL_HEIGHT -
+                                  WINDOW_TITLE_HEIGHT - WINDOW_BORDER) {
+                close_windows(desktop);
+                return false;
+        }
+        test_pointer_click(desktop, 53, PANEL_HEIGHT + 15);
+        if (window->fullscreen || window->x != initial_x ||
+            window->y != initial_y || window->width != initial_width ||
+            window->height != initial_height) {
+                close_windows(desktop);
+                return false;
+        }
+
+        close_windows(desktop);
+        return true;
+}
+
 static bool launch_terminal(struct desktop *desktop) {
+        const struct rose_gui_app_metadata *terminal =
+            rose_gui_app_find(&desktop->catalog, "terminal");
+        uint32_t width = terminal != NULL ? terminal->width : 570U;
+        uint32_t height = terminal != NULL ? terminal->height : 390U;
         int32_t x = 28 + (int32_t)desktop->window_count * 34;
         int32_t y = 74 + (int32_t)desktop->window_count * 22;
-        int32_t max_x = (int32_t)desktop->graphics.width - 574 - 10;
-        int32_t max_y = (int32_t)desktop->graphics.height - 390 -
+        int32_t max_x = (int32_t)desktop->graphics.width -
+                        (int32_t)width - WINDOW_BORDER * 2 - 10;
+        int32_t max_y = (int32_t)desktop->graphics.height -
+                        (int32_t)height -
                         WINDOW_TITLE_HEIGHT - WINDOW_BORDER - 10;
         if (x > max_x) x = max_x;
         if (y > max_y) y = max_y;
-        return create_window(desktop, "TERMINAL", "/bin/gui-terminal", x, y,
-                             570, 390);
+        return create_window(
+            desktop, terminal != NULL ? terminal->title : "TERMINAL",
+            terminal != NULL ? terminal->program : "/bin/gui-terminal", x, y,
+            width, height);
+}
+
+static void invalidate_desktop(struct desktop *desktop) {
+        dirty_add(desktop,
+                  (struct rectangle){0, 0,
+                                     (int32_t)desktop->graphics.width,
+                                     (int32_t)desktop->graphics.height});
+        rose_gui_ui_invalidate(&desktop->ui);
+}
+
+static bool launch_catalog_app(struct desktop *desktop, size_t index) {
+        if (index >= desktop->catalog.count) return false;
+        const struct rose_gui_app_metadata *app = &desktop->catalog.apps[index];
+        int32_t x = 42 + (int32_t)desktop->window_count * 36;
+        int32_t y = 78 + (int32_t)desktop->window_count * 24;
+        int32_t max_x = (int32_t)desktop->graphics.width -
+                        (int32_t)app->width - WINDOW_BORDER * 2 - 10;
+        int32_t max_y = (int32_t)desktop->graphics.height -
+                        (int32_t)app->height - WINDOW_TITLE_HEIGHT -
+                        WINDOW_BORDER - 10;
+        if (x > max_x) x = max_x;
+        if (y > max_y) y = max_y;
+        return create_window(desktop, app->title, app->program, x, y,
+                             app->width, app->height);
+}
+
+static void launcher_action(struct rose_gui_widget *widget,
+                            enum rose_gui_widget_action action,
+                            void *user_data) {
+        (void)widget;
+        if (action != ROSE_GUI_ACTION_ACTIVATE) return;
+        struct desktop *desktop = user_data;
+        desktop->menu.state ^= ROSE_GUI_STATE_HIDDEN;
+        if ((desktop->menu.state & ROSE_GUI_STATE_HIDDEN) == 0U) {
+                rose_gui_ui_focus(&desktop->ui, &desktop->menu);
+                desktop->ui_keyboard_active = true;
+        }
+        invalidate_desktop(desktop);
+}
+
+static void menu_action(struct rose_gui_widget *widget,
+                        enum rose_gui_widget_action action, void *user_data) {
+        if (action != ROSE_GUI_ACTION_SELECT) return;
+        struct desktop *desktop = user_data;
+        (void)launch_catalog_app(desktop, widget->selected_index);
+        widget->state |= ROSE_GUI_STATE_HIDDEN;
+        rose_gui_ui_focus(&desktop->ui, &desktop->launcher);
+        invalidate_desktop(desktop);
+}
+
+static void exit_button_action(struct rose_gui_widget *widget,
+                               enum rose_gui_widget_action action,
+                               void *user_data) {
+        if (action != ROSE_GUI_ACTION_ACTIVATE) return;
+        struct desktop *desktop = user_data;
+        if (widget == &desktop->exit_yes) {
+                desktop->exiting = true;
+        } else {
+                desktop->exit_dialog.state |= ROSE_GUI_STATE_HIDDEN;
+                rose_gui_ui_focus(&desktop->ui, &desktop->launcher);
+                invalidate_desktop(desktop);
+        }
+}
+
+static void show_exit_dialog(struct desktop *desktop) {
+        desktop->menu.state |= ROSE_GUI_STATE_HIDDEN;
+        desktop->exit_dialog.state &= ~ROSE_GUI_STATE_HIDDEN;
+        desktop->ui_keyboard_active = true;
+        rose_gui_ui_focus(&desktop->ui, &desktop->exit_no);
+        invalidate_desktop(desktop);
+}
+
+static void panel_exit_action(struct rose_gui_widget *widget,
+                              enum rose_gui_widget_action action,
+                              void *user_data) {
+        (void)widget;
+        if (action == ROSE_GUI_ACTION_ACTIVATE)
+                show_exit_dialog(user_data);
+}
+
+static void build_desktop_ui(struct desktop *desktop) {
+        rose_gui_widget_initialize(&desktop->ui_root, ROSE_GUI_WIDGET_ROOT,
+                                   NULL);
+        desktop->ui_root.flags |= ROSE_GUI_WIDGET_TRANSPARENT;
+        desktop->ui_root.padding = 0U;
+        desktop->ui_root.gap = 0U;
+
+        rose_gui_widget_initialize(&desktop->panel,
+                                   ROSE_GUI_WIDGET_STATUS_BAR, NULL);
+        desktop->panel.flags |= ROSE_GUI_WIDGET_ABSOLUTE;
+        desktop->panel.bounds = (struct rose_gui_rectangle){
+            0, 0, (int32_t)desktop->graphics.width, PANEL_HEIGHT};
+        rose_gui_widget_add(&desktop->ui_root, &desktop->panel);
+
+        rose_gui_widget_initialize(&desktop->launcher, ROSE_GUI_WIDGET_BUTTON,
+                                   "ROSE");
+        desktop->launcher.flags |= ROSE_GUI_WIDGET_ABSOLUTE;
+        desktop->launcher.bounds =
+            (struct rose_gui_rectangle){12, 12, 82, 30};
+        desktop->launcher.callback = launcher_action;
+        desktop->launcher.user_data = desktop;
+        rose_gui_widget_add(&desktop->ui_root, &desktop->launcher);
+
+        rose_gui_widget_initialize(&desktop->panel_exit,
+                                   ROSE_GUI_WIDGET_BUTTON, "EXIT");
+        desktop->panel_exit.flags |= ROSE_GUI_WIDGET_ABSOLUTE;
+        desktop->panel_exit.bounds = (struct rose_gui_rectangle){
+            (int32_t)desktop->graphics.width - 70, 12, 58, 30};
+        desktop->panel_exit.callback = panel_exit_action;
+        desktop->panel_exit.user_data = desktop;
+        rose_gui_widget_add(&desktop->ui_root, &desktop->panel_exit);
+
+        for (size_t index = 0U; index < desktop->catalog.count; index++) {
+                const struct rose_gui_app_metadata *app =
+                    &desktop->catalog.apps[index];
+                desktop->menu_items[index] = app->title;
+        }
+
+        rose_gui_items_initialize(&desktop->menu, ROSE_GUI_WIDGET_MENU,
+                                  desktop->menu_items,
+                                  desktop->catalog.count);
+        desktop->menu.flags |= ROSE_GUI_WIDGET_ABSOLUTE;
+        desktop->menu.bounds = (struct rose_gui_rectangle){
+            12, PANEL_HEIGHT + 4, 210,
+            10 + (int32_t)desktop->catalog.count * 22};
+        desktop->menu.state |= ROSE_GUI_STATE_HIDDEN;
+        desktop->menu.callback = menu_action;
+        desktop->menu.user_data = desktop;
+        rose_gui_widget_add(&desktop->ui_root, &desktop->menu);
+
+        rose_gui_widget_initialize(&desktop->exit_dialog,
+                                   ROSE_GUI_WIDGET_DIALOG,
+                                   "EXIT THE ROSE DESKTOP?");
+        desktop->exit_dialog.flags |= ROSE_GUI_WIDGET_ABSOLUTE;
+        desktop->exit_dialog.padding = 38U;
+        desktop->exit_dialog.gap = 10U;
+        desktop->exit_dialog.bounds = (struct rose_gui_rectangle){
+            ((int32_t)desktop->graphics.width - 280) / 2,
+            ((int32_t)desktop->graphics.height - 160) / 2, 280, 160};
+        desktop->exit_dialog.state |= ROSE_GUI_STATE_HIDDEN;
+
+        rose_gui_widget_initialize(&desktop->exit_yes,
+                                   ROSE_GUI_WIDGET_BUTTON, "EXIT");
+        rose_gui_widget_initialize(&desktop->exit_no, ROSE_GUI_WIDGET_BUTTON,
+                                   "CANCEL");
+        rose_gui_widget_set_flex(&desktop->exit_yes, 1U);
+        rose_gui_widget_set_flex(&desktop->exit_no, 1U);
+        desktop->exit_yes.callback = exit_button_action;
+        desktop->exit_no.callback = exit_button_action;
+        desktop->exit_yes.user_data = desktop;
+        desktop->exit_no.user_data = desktop;
+        rose_gui_widget_add(&desktop->exit_dialog, &desktop->exit_yes);
+        rose_gui_widget_add(&desktop->exit_dialog, &desktop->exit_no);
+        rose_gui_widget_add(&desktop->ui_root, &desktop->exit_dialog);
+
+        rose_gui_ui_initialize(&desktop->ui, &desktop->canvas,
+                               &desktop->theme, &desktop->ui_root);
+        rose_gui_ui_layout(&desktop->ui,
+                           (struct rose_gui_rectangle){
+                               0, 0, (int32_t)desktop->graphics.width,
+                               (int32_t)desktop->graphics.height});
+}
+
+static void set_window_keyboard_mode(struct desktop *desktop, uint8_t mode) {
+        desktop->keyboard_window_mode = mode;
+        dirty_add(desktop, (struct rectangle){
+                               0, 0, (int32_t)desktop->graphics.width,
+                               PANEL_HEIGHT});
+}
+
+static bool handle_window_keyboard(struct desktop *desktop,
+                                   const struct user_input_event *event) {
+        if (event->type != USER_INPUT_EVENT_KEY || event->value == 0)
+                return false;
+        if (desktop->keyboard_window_mode != 0U &&
+            event->code == KEY_ESCAPE) {
+                set_window_keyboard_mode(desktop, 0U);
+                return true;
+        }
+        if (desktop->alt && event->code == KEY_TAB &&
+            desktop->window_count > 1U) {
+                focus_window(desktop, 0U);
+                return true;
+        }
+        if (desktop->window_count == 0U) return false;
+        struct desktop_window *window =
+            &desktop->windows[desktop->window_count - 1U];
+        if (desktop->alt && event->code == KEY_F4) {
+                window->surface->close_requested = 1U;
+                (void)rose_event_notify(&window->surface->close_requested);
+                return true;
+        }
+        if (desktop->alt && event->code == KEY_F9) {
+                toggle_window_minimized(desktop, window);
+                return true;
+        }
+        if (desktop->alt && event->code == KEY_F10) {
+                toggle_window_fullscreen(desktop, window);
+                return true;
+        }
+        if (desktop->alt && event->code == KEY_F7) {
+                if (window->minimized || window->fullscreen) return true;
+                set_window_keyboard_mode(desktop, 1U);
+                desktop->ui_keyboard_active = false;
+                return true;
+        }
+        if (desktop->alt && event->code == KEY_F8) {
+                if (window->minimized || window->fullscreen) return true;
+                set_window_keyboard_mode(desktop, 2U);
+                desktop->ui_keyboard_active = false;
+                return true;
+        }
+        if (desktop->keyboard_window_mode == 0U ||
+            (event->code != KEY_LEFT && event->code != KEY_RIGHT &&
+             event->code != KEY_UP && event->code != KEY_DOWN)) {
+                return false;
+        }
+
+        dirty_add(desktop, window_damage_rectangle(window));
+        if (desktop->keyboard_window_mode == 1U) {
+                if (event->code == KEY_LEFT) window->x -= 10;
+                if (event->code == KEY_RIGHT) window->x += 10;
+                if (event->code == KEY_UP) window->y -= 10;
+                if (event->code == KEY_DOWN) window->y += 10;
+                int32_t max_x = (int32_t)desktop->graphics.width -
+                                (int32_t)window->width - WINDOW_BORDER * 2 - 10;
+                int32_t max_y = (int32_t)desktop->graphics.height -
+                                (int32_t)window->height - WINDOW_TITLE_HEIGHT -
+                                WINDOW_BORDER - 10;
+                if (window->x < 6) window->x = 6;
+                if (window->y < PANEL_HEIGHT + 6)
+                        window->y = PANEL_HEIGHT + 6;
+                if (window->x > max_x) window->x = max_x;
+                if (window->y > max_y) window->y = max_y;
+        } else {
+                uint32_t width = window->width;
+                uint32_t height = window->height;
+                if (event->code == KEY_LEFT && width > 180U) width -= 10U;
+                if (event->code == KEY_RIGHT &&
+                    width < window->capacity_width)
+                        width += 10U;
+                if (event->code == KEY_UP && height > 100U) height -= 10U;
+                if (event->code == KEY_DOWN &&
+                    height < window->capacity_height)
+                        height += 10U;
+                if (width > window->capacity_width)
+                        width = window->capacity_width;
+                if (height > window->capacity_height)
+                        height = window->capacity_height;
+                if (width != window->width || height != window->height) {
+                        resize_window(window, width, height);
+                }
+        }
+        dirty_add(desktop, window_damage_rectangle(window));
+        return true;
 }
 
 int rose_desktop_main(int argc, char **argv) {
         static struct desktop desktop;
         zero_bytes(&desktop, sizeof(desktop));
+        desktop.compact_surfaces =
+            argc == 2 && strings_equal(argv[1], "--stress");
         desktop.pointer_x = 512;
         desktop.pointer_y = 384;
         if (!rose_font_load()) {
@@ -849,6 +1268,22 @@ int rose_desktop_main(int argc, char **argv) {
         }
         desktop.pixels = (uint32_t *)desktop.graphics.framebuffer;
         desktop.pixel_stride = desktop.graphics.stride / sizeof(uint32_t);
+        rose_gui_canvas_initialize(&desktop.canvas, desktop.pixels,
+                                   desktop.graphics.width,
+                                   desktop.graphics.height,
+                                   desktop.pixel_stride);
+        if (!rose_gui_theme_load(&desktop.theme, "/share/gui/theme.conf")) {
+                print("desktop: theme resource unavailable\n");
+                return 1;
+        }
+        if (!rose_gui_app_catalog_load(&desktop.catalog,
+                                       "/share/gui/apps.conf")) {
+                print("desktop: application metadata unavailable\n");
+                return 1;
+        }
+        desktop.input_context.width = desktop.graphics.width;
+        desktop.input_context.height = desktop.graphics.height;
+        build_desktop_ui(&desktop);
         dirty_add(&desktop, (struct rectangle){
                                 0, 0, (int32_t)desktop.graphics.width,
                                 (int32_t)desktop.graphics.height});
@@ -863,19 +1298,12 @@ int rose_desktop_main(int argc, char **argv) {
                 print("GUI capacity stress passed\n");
                 return 0;
         }
-
-        bool created =
-            create_window(&desktop, "FILES", "/bin/gui-files", 652, 82, 340,
-                          480) &&
-            create_window(&desktop, "SYSTEM MONITOR", "/bin/gui-monitor", 588,
-                          350, 390, 380) &&
-            create_window(&desktop, "TERMINAL", "/bin/gui-terminal", 28, 104,
-                          570, 390);
-        if (!created) {
-                print("desktop: unable to start graphical applications\n");
-                close_windows(&desktop);
-                return 3;
+        if (argc == 2 && strings_equal(argv[1], "--test-controls")) {
+                if (!run_window_control_test(&desktop)) return 8;
+                print("Window control test passed\n");
+                return 0;
         }
+
         if (!render(&desktop)) {
                 close_windows(&desktop);
                 return 4;
@@ -902,10 +1330,59 @@ int rose_desktop_main(int argc, char **argv) {
                                         desktop.exiting = true;
                                 } else if (event.value == 1U &&
                                            desktop.control && desktop.alt &&
+                                           event.code == KEY_Q) {
+                                        show_exit_dialog(&desktop);
+                                } else if (event.value == 1U &&
+                                           desktop.control && desktop.alt &&
                                            event.code == KEY_T) {
                                         if (!launch_terminal(&desktop)) {
                                                 print("desktop: unable to open "
                                                       "terminal\n");
+                                        }
+                                } else if (event.value == 1U &&
+                                           desktop.control && desktop.alt &&
+                                           event.code == KEY_L) {
+                                        launcher_action(
+                                            &desktop.launcher,
+                                            ROSE_GUI_ACTION_ACTIVATE,
+                                            &desktop);
+                                } else if (event.value == 1U &&
+                                           event.code == KEY_F6) {
+                                        desktop.ui_keyboard_active = true;
+                                        rose_gui_ui_focus(&desktop.ui,
+                                                          &desktop.launcher);
+                                        dirty_add(
+                                            &desktop,
+                                            (struct rectangle){
+                                                0, 0,
+                                                (int32_t)desktop.graphics.width,
+                                                PANEL_HEIGHT});
+                                } else if (
+                                    (desktop.exit_dialog.state &
+                                     ROSE_GUI_STATE_HIDDEN) == 0U) {
+                                        (void)rose_gui_ui_handle_event(
+                                            &desktop.ui,
+                                            &desktop.input_context, &event);
+                                        if (desktop.ui.dirty)
+                                                invalidate_desktop(&desktop);
+                                } else if (handle_window_keyboard(&desktop,
+                                                                  &event)) {
+                                        /* Window management consumed it. */
+                                } else if (desktop.ui_keyboard_active ||
+                                           (desktop.menu.state &
+                                            ROSE_GUI_STATE_HIDDEN) == 0U) {
+                                        bool handled =
+                                            rose_gui_ui_handle_event(
+                                                &desktop.ui,
+                                                &desktop.input_context,
+                                                &event);
+                                        if (desktop.ui.dirty)
+                                                invalidate_desktop(&desktop);
+                                        if (!handled &&
+                                            event.value == 1U &&
+                                            event.code == KEY_ESCAPE) {
+                                                desktop.ui_keyboard_active =
+                                                    false;
                                         }
                                 } else if (desktop.window_count != 0U) {
                                         send_event(
@@ -914,7 +1391,14 @@ int rose_desktop_main(int argc, char **argv) {
                                             &event, false);
                                 }
                         } else if (event.type == USER_INPUT_EVENT_POINTER) {
-                                process_pointer(&desktop, &event);
+                                bool handled = rose_gui_ui_handle_event(
+                                    &desktop.ui, &desktop.input_context,
+                                    &event);
+                                if (handled)
+                                        desktop.ui_keyboard_active = true;
+                                if (desktop.ui.dirty)
+                                        invalidate_desktop(&desktop);
+                                process_pointer(&desktop, &event, !handled);
                         }
                 }
                 if (result < 0 || !render(&desktop)) {

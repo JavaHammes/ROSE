@@ -28,8 +28,11 @@ programs in user mode.
   `/bin/desktop` is a multi-process window server with overlapping surfaces,
   focus and z-order, title-bar dragging, close controls, input routing, and
   damage-tracked composition. Page-backed shared-memory objects carry client
-  pixels and event rings. Separate graphical terminal, Files, and live system
-  monitor processes render through a compact client UI library and expose
+  pixels and event rings. A layered userspace GUI toolkit provides a shared
+  event loop, clipped canvas drawing, alpha compositing, image blits,
+  file-backed themes/icons/application metadata, deterministic retained
+  row/column layout, and standard controls. Separate graphical terminal,
+  Files, and live system monitor processes render through that toolkit and expose
   copy-on-write activity alongside scheduler and memory counters. Shared-word
   notifications let compositor and clients sleep until input, damage, focus,
   close, or PTY state changes, and the monitor updates from monotonic
@@ -41,7 +44,10 @@ programs in user mode.
   PTY geometry follow the window size, changed cell spans are damaged
   incrementally, and a 1,024-line ring supports Page Up/Page Down review while
   live output continues. The compositor and clients load one complete
-  printable-ASCII bitmap font resource from `/share`.
+  printable-ASCII bitmap font and the same visual resources from `/share`.
+  Buttons, fields, lists, menus, dialogs, tabs, scrollbars, checkboxes, labels,
+  and status bars share hover, pressed, disabled, focused, selected, and error
+  states with visible keyboard focus.
 - Generic sector-device interface, modern VirtIO-MMIO block driver, and a
   sixteen-entry write-through cache for 1 KiB filesystem blocks.
 - Writable ext2 root filesystem containing `/sbin/init`, `/bin/sh`, programs,
@@ -193,13 +199,43 @@ make run-gui
 ```
 
 The shell is visible in both the QEMU window and the serial terminal. Run
-`desktop` to enter the userspace desktop. Its Terminal runs the same shell over
-a pseudo-terminal, Files browses directories, and System Monitor reads live
-kernel counters. Click a window to focus it, drag its title bar, use the red
-control to close it, or drag the Terminal's accented lower-right corner to
-resize it. Page Up/Page Down browse terminal history; typing jumps back to live
+`desktop` to enter an empty userspace desktop, then use the ROSE launcher to
+open applications. Terminal runs the same shell over a pseudo-terminal,
+Files browses directories, and System Monitor reads live kernel counters. Click
+a window to focus it, drag its title bar, use the red control to close it, the
+yellow control to collapse or restore it, and the green control to enter or
+leave fullscreen. Drag the Terminal's accented lower-right corner to resize it.
+The matching keyboard paths are Alt+Tab, Alt+F7 plus arrows, Alt+F4, Alt+F9,
+Alt+F10, and Alt+F8 plus arrows. F6 focuses the launcher; Tab/Shift+Tab traverse
+its controls and Enter or Space activates them. The panel's Exit button opens
+a shared dialog (Ctrl+Alt+Q is its shortcut), and Escape dismisses menus and
+dialogs. Page Up/Page Down browse terminal history; typing jumps back to live
 output. Ctrl+Alt+T launches another independent terminal, and Ctrl+Alt+Escape
-returns to the serial shell.
+returns directly to the serial shell.
+
+### Small GUI applications
+
+GUI programs own their widget storage and link it into a retained tree without
+allocation. `rose_gui_application_initialize()` connects the window transport,
+loads `/share/gui/theme.conf` and the shared font, and lays out the tree;
+`rose_gui_application_run()` supplies resize, focus, input, redraw, damage, and
+timer handling. A minimal application therefore only constructs controls:
+
+```c
+static struct rose_gui_widget root, label, button;
+static struct rose_gui_application app;
+
+rose_gui_widget_initialize(&root, ROSE_GUI_WIDGET_ROOT, NULL);
+rose_gui_widget_initialize(&label, ROSE_GUI_WIDGET_LABEL, "HELLO FROM ROSE");
+rose_gui_widget_initialize(&button, ROSE_GUI_WIDGET_BUTTON, "OK");
+rose_gui_widget_add(&root, &label);
+rose_gui_widget_add(&root, &button);
+if (!rose_gui_application_initialize(&app, argv[1], &root)) return 1;
+return rose_gui_application_run(&app);
+```
+
+See `user/gui_files.c` for list activation and `user/gui_monitor.c` for timed
+updates and custom content inside the same layout system.
 
 After `/sbin/init` launches `/bin/sh` and waits for it, the shell starts at
 `rose>`.
@@ -363,10 +399,3 @@ stacks, or realtime queues. Anonymous mappings use a fixed
 thirty-two-entry VMA table and do not yet support file backing, shared mappings,
 or fixed addresses. There are no general-purpose kernel threads, ASIDs,
 networking, users, or permissions enforcement.
-
-## License
-
-Copyright (C) 2026 Alexander Berlin.
-
-ROSE is licensed under the GNU Affero General Public License, version 3 only
-(`AGPL-3.0-only`). See [LICENSE](LICENSE) for the full license text.
