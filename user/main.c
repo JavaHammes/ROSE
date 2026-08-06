@@ -47,6 +47,10 @@ int rose_find_main(int argc, char **argv);
 int rose_kill_main(int argc, char **argv);
 int rose_sleep_main(int argc, char **argv);
 int rose_ps_main(int argc, char **argv);
+int rose_ifconfig_main(int argc);
+int rose_ping_main(int argc, char **argv);
+int rose_nslookup_main(int argc, char **argv);
+int rose_curl_main(int argc, char **argv);
 
 /* Small libc replacements keep the user executable completely freestanding. */
 static size_t string_length(const char *text) {
@@ -2351,6 +2355,18 @@ int user_main(int argc, char **argv,
 
         case USER_PROGRAM_PS:
                 return rose_ps_main(argc, argv);
+
+        case USER_PROGRAM_IFCONFIG:
+                return rose_ifconfig_main(argc);
+
+        case USER_PROGRAM_PING:
+                return rose_ping_main(argc, argv);
+
+        case USER_PROGRAM_NSLOOKUP:
+                return rose_nslookup_main(argc, argv);
+
+        case USER_PROGRAM_CURL:
+                return rose_curl_main(argc, argv);
 
         default:
                 return 2;

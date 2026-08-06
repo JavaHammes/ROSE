@@ -56,7 +56,7 @@ USER_COMMON_OBJECTS := \
 # Each userspace path is a distinct ELF. Demonstrations share a build-time
 # selected source, while /bin/sh adds its own implementation object. The disk
 # receives every image; the diagnostic ramfs retains its programs and shell.
-USER_PROGRAMS := hello fault process_a process_b syscall_test cat console_read init fs_test args_env execve execve_target pipe_test pipe_writer sh ls echo pwd env mkdir rm descriptor_test signal_exec_test desktop gui_terminal gui_files gui_monitor gui_editor cp mv touch head wc find kill sleep ps
+USER_PROGRAMS := hello fault process_a process_b syscall_test cat console_read init fs_test args_env execve execve_target pipe_test pipe_writer sh ls echo pwd env mkdir rm descriptor_test signal_exec_test desktop gui_terminal gui_files gui_monitor gui_editor cp mv touch head wc find kill sleep ps ifconfig ping nslookup curl
 # Use the ABI enum names directly so adding or reordering an enum cannot
 # silently build a program with the wrong implementation.
 USER_PROGRAM_hello := USER_PROGRAM_HELLO
@@ -96,6 +96,10 @@ USER_PROGRAM_find := USER_PROGRAM_FIND
 USER_PROGRAM_kill := USER_PROGRAM_KILL
 USER_PROGRAM_sleep := USER_PROGRAM_SLEEP
 USER_PROGRAM_ps := USER_PROGRAM_PS
+USER_PROGRAM_ifconfig := USER_PROGRAM_IFCONFIG
+USER_PROGRAM_ping := USER_PROGRAM_PING
+USER_PROGRAM_nslookup := USER_PROGRAM_NSLOOKUP
+USER_PROGRAM_curl := USER_PROGRAM_CURL
 USER_ELFS := $(foreach program,$(USER_PROGRAMS),$(BUILD_DIR)/user/$(program)/program.elf)
 USER_LOAD_ELFS := $(USER_ELFS:.elf=.load.elf)
 USER_FALLBACK_PROGRAMS := hello fault process_a process_b syscall_test cat console_read sh ls echo pwd env mkdir rm descriptor_test signal_exec_test
@@ -119,6 +123,11 @@ USER_EXTRA_OBJECTS_find := $(USER_UTILITY_OBJECTS)
 USER_EXTRA_OBJECTS_kill := $(USER_UTILITY_OBJECTS)
 USER_EXTRA_OBJECTS_sleep := $(USER_UTILITY_OBJECTS)
 USER_EXTRA_OBJECTS_ps := $(USER_UTILITY_OBJECTS)
+USER_NETWORK_OBJECTS := $(BUILD_DIR)/user/network.o $(BUILD_DIR)/user/network_apps.o $(BUILD_DIR)/user/runtime.o
+USER_EXTRA_OBJECTS_ifconfig := $(USER_NETWORK_OBJECTS)
+USER_EXTRA_OBJECTS_ping := $(USER_NETWORK_OBJECTS)
+USER_EXTRA_OBJECTS_nslookup := $(USER_NETWORK_OBJECTS)
+USER_EXTRA_OBJECTS_curl := $(BUILD_DIR)/user/curl.o $(BUILD_DIR)/user/network.o $(BUILD_DIR)/user/runtime.o
 
 # Compiler-generated dependency files keep incremental header rebuilds correct.
 DEPS := \
@@ -138,6 +147,9 @@ DEPS := \
 	$(BUILD_DIR)/user/gui_editor.d \
 	$(BUILD_DIR)/user/utilities.d \
 	$(BUILD_DIR)/user/runtime.d \
+	$(BUILD_DIR)/user/network.d \
+	$(BUILD_DIR)/user/network_apps.d \
+	$(BUILD_DIR)/user/curl.d \
 	$(foreach program,$(USER_PROGRAMS),$(BUILD_DIR)/user/$(program)/main.d)
 
 ARCH_FLAGS := \
@@ -202,6 +214,8 @@ QEMU_FLAGS := \
 	-kernel $(KERNEL) \
 	-drive file=$(RUN_ROOT_IMAGE),format=raw,if=none,id=rose-root \
 	-device virtio-blk-device,drive=rose-root \
+	-netdev user,id=rose-net \
+	-device virtio-net-device,netdev=rose-net \
 	-global virtio-mmio.force-legacy=false
 
 QEMU_GUI_FLAGS := \
@@ -212,6 +226,8 @@ QEMU_GUI_FLAGS := \
 	-kernel $(KERNEL) \
 	-drive file=$(RUN_ROOT_IMAGE),format=raw,if=none,id=rose-root \
 	-device virtio-blk-device,drive=rose-root \
+	-netdev user,id=rose-net \
+	-device virtio-net-device,netdev=rose-net \
 	-device virtio-gpu-device,xres=$(DISPLAY_WIDTH),yres=$(DISPLAY_HEIGHT) \
 	-device virtio-keyboard-device \
 	-device virtio-tablet-device \
@@ -263,6 +279,10 @@ $(ROOT_IMAGE): tools/mkrosefs.py assets/font5x7.hex assets/gui-theme.conf assets
 		--file /bin/kill=$(BUILD_DIR)/user/kill/program.load.elf \
 		--file /bin/sleep=$(BUILD_DIR)/user/sleep/program.load.elf \
 		--file /bin/ps=$(BUILD_DIR)/user/ps/program.load.elf \
+		--file /bin/ifconfig=$(BUILD_DIR)/user/ifconfig/program.load.elf \
+		--file /bin/ping=$(BUILD_DIR)/user/ping/program.load.elf \
+		--file /bin/nslookup=$(BUILD_DIR)/user/nslookup/program.load.elf \
+		--file /bin/curl=$(BUILD_DIR)/user/curl/program.load.elf \
 		--file /etc/rose-init.conf=assets/rose-init.conf \
 		--file /etc/roserc=assets/roserc \
 		--file /share/font5x7.hex=assets/font5x7.hex \
@@ -431,6 +451,7 @@ test-host:
 	$(MAKE) test-terminal-model
 	$(MAKE) test-shell-parser
 	$(MAKE) test-gui-toolkit
+	$(MAKE) test-network
 	$(PYTHON) -m unittest discover -s tests -t . -p 'test_*.py'
 	$(PYTHON) -m py_compile tests/qemu_smoke.py tools/mkrosefs.py
 
@@ -462,6 +483,16 @@ test-gui-toolkit:
 		tests/gui_toolkit_test.c \
 		-o $(BUILD_DIR)/tests/gui_toolkit_test
 	$(BUILD_DIR)/tests/gui_toolkit_test
+
+
+.PHONY: test-network
+test-network:
+	@mkdir -p $(BUILD_DIR)/tests
+	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -ffunction-sections \
+		-fdata-sections -Iuser/include -Ikernel/include \
+		user/network.c tests/network_test.c $(HOST_GC_SECTIONS) \
+		-o $(BUILD_DIR)/tests/network_test
+	$(BUILD_DIR)/tests/network_test
 
 
 .PHONY: check

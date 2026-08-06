@@ -2,6 +2,7 @@
 #include "ext2.h"
 #include "graphics_console.h"
 #include "interrupt.h"
+#include "network.h"
 #include "page_allocator.h"
 #include "panic.h"
 #include "platform.h"
@@ -37,6 +38,9 @@ void kernel_main(unsigned long hart_id, const void *dtb) {
         ramfs_init();
         if (virtio_block_init()) {
                 (void)ext2_mount(block_device_primary());
+        }
+        if (network_init()) {
+                uart_puts("ROSE network: 10.0.2.15 online\n");
         }
         if (virtio_gpu_init()) {
                 uart_puts("ROSE graphics: ");

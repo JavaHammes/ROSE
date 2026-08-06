@@ -1,6 +1,7 @@
 #include <stdint.h>
 
 #include "panic.h"
+#include "network.h"
 #include "plic.h"
 #include "scheduler.h"
 #include "timer.h"
@@ -74,12 +75,14 @@ static const char *exception_name(uint64_t code) {
  */
 static void handle_interrupt(struct trap_frame *frame, uint64_t code) {
         switch (code) {
-        case SCAUSE_SUPERVISOR_TIMER:
+        case SCAUSE_SUPERVISOR_TIMER: {
                 timer_schedule_next();
-                (void)scheduler_wake_expired(
-                    timer_monotonic_nanoseconds());
+                uint64_t now = timer_monotonic_nanoseconds();
+                (void)scheduler_wake_expired(now);
+                network_tick(now);
                 user_process_handle_timer(frame);
                 return;
+        }
 
         case SCAUSE_SUPERVISOR_SOFTWARE:
                 panic_trap("Unhandled supervisor software interrupt", frame);

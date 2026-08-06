@@ -8,6 +8,7 @@
 #define VIRTIO_MMIO_QUEUE_CAPACITY 64U
 
 enum virtio_device_id {
+        VIRTIO_DEVICE_NETWORK = 1,
         VIRTIO_DEVICE_BLOCK = 2,
         VIRTIO_DEVICE_GPU = 16,
         VIRTIO_DEVICE_INPUT = 18,

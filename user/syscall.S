@@ -185,6 +185,66 @@ rose_set_descriptor_flags:
     ret
 .size rose_set_descriptor_flags, . - rose_set_descriptor_flags
 
+.section .text.rose_socket,"ax",@progbits
+.align 2
+.globl rose_socket
+.type rose_socket, @function
+rose_socket:
+    li a7, USER_SYSCALL_SOCKET
+    ecall
+    ret
+.size rose_socket, . - rose_socket
+
+.section .text.rose_socket_bind,"ax",@progbits
+.align 2
+.globl rose_socket_bind
+.type rose_socket_bind, @function
+rose_socket_bind:
+    li a7, USER_SYSCALL_SOCKET_BIND
+    ecall
+    ret
+.size rose_socket_bind, . - rose_socket_bind
+
+.section .text.rose_socket_connect,"ax",@progbits
+.align 2
+.globl rose_socket_connect
+.type rose_socket_connect, @function
+rose_socket_connect:
+    li a7, USER_SYSCALL_SOCKET_CONNECT
+    ecall
+    ret
+.size rose_socket_connect, . - rose_socket_connect
+
+.section .text.rose_socket_send_to,"ax",@progbits
+.align 2
+.globl rose_socket_send_to
+.type rose_socket_send_to, @function
+rose_socket_send_to:
+    li a7, USER_SYSCALL_SOCKET_SEND_TO
+    ecall
+    ret
+.size rose_socket_send_to, . - rose_socket_send_to
+
+.section .text.rose_socket_receive_from,"ax",@progbits
+.align 2
+.globl rose_socket_receive_from
+.type rose_socket_receive_from, @function
+rose_socket_receive_from:
+    li a7, USER_SYSCALL_SOCKET_RECEIVE_FROM
+    ecall
+    ret
+.size rose_socket_receive_from, . - rose_socket_receive_from
+
+.section .text.rose_network_information,"ax",@progbits
+.align 2
+.globl rose_network_information
+.type rose_network_information, @function
+rose_network_information:
+    li a7, USER_SYSCALL_NETWORK_INFORMATION
+    ecall
+    ret
+.size rose_network_information, . - rose_network_information
+
 .section .text.rose_execve,"ax",@progbits
 .align 2
 .globl rose_execve

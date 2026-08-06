@@ -60,6 +60,12 @@
 #define USER_SYSCALL_TERMINAL_SET_CONTROLLING 54
 #define USER_SYSCALL_PROCESS_LIST 55
 #define USER_SYSCALL_RENAME 56
+#define USER_SYSCALL_SOCKET 57
+#define USER_SYSCALL_SOCKET_BIND 58
+#define USER_SYSCALL_SOCKET_CONNECT 59
+#define USER_SYSCALL_SOCKET_SEND_TO 60
+#define USER_SYSCALL_SOCKET_RECEIVE_FROM 61
+#define USER_SYSCALL_NETWORK_INFORMATION 62
 
 #else
 
@@ -121,6 +127,12 @@ enum user_syscall_number {
         USER_SYSCALL_TERMINAL_SET_CONTROLLING = 54,
         USER_SYSCALL_PROCESS_LIST = 55,
         USER_SYSCALL_RENAME = 56,
+        USER_SYSCALL_SOCKET = 57,
+        USER_SYSCALL_SOCKET_BIND = 58,
+        USER_SYSCALL_SOCKET_CONNECT = 59,
+        USER_SYSCALL_SOCKET_SEND_TO = 60,
+        USER_SYSCALL_SOCKET_RECEIVE_FROM = 61,
+        USER_SYSCALL_NETWORK_INFORMATION = 62,
 };
 
 /* Stable negative error values returned in a0 by failed system calls. */
@@ -138,6 +150,7 @@ enum user_syscall_error {
         USER_ERROR_PERMISSION = 13,
         USER_ERROR_BAD_ADDRESS = 14,
         USER_ERROR_EXISTS = 17,
+        USER_ERROR_NO_DEVICE = 19,
         USER_ERROR_NOT_DIRECTORY = 20,
         USER_ERROR_IS_DIRECTORY = 21,
         USER_ERROR_INVALID_ARGUMENT = 22,
@@ -150,6 +163,13 @@ enum user_syscall_error {
         USER_ERROR_NAME_TOO_LONG = 36,
         USER_ERROR_NOT_IMPLEMENTED = 38,
         USER_ERROR_NOT_EMPTY = 39,
+        USER_ERROR_OPERATION_NOT_SUPPORTED = 95,
+        USER_ERROR_ADDRESS_IN_USE = 98,
+        USER_ERROR_NETWORK_UNREACHABLE = 101,
+        USER_ERROR_CONNECTION_RESET = 104,
+        USER_ERROR_NOT_CONNECTED = 107,
+        USER_ERROR_TIMED_OUT = 110,
+        USER_ERROR_CONNECTION_REFUSED = 111,
 };
 
 enum user_open_flags {
@@ -180,6 +200,46 @@ struct user_poll_descriptor {
         int32_t descriptor;
         uint32_t events;
         uint32_t returned_events;
+};
+
+/* Internet socket addresses use a host integer whose hexadecimal form follows
+ * dotted decimal (10.0.2.15 is 0x0a00020f). Ports are ordinary host integers;
+ * the kernel performs wire byte-order conversion. */
+#define USER_IPV4_ADDRESS(a, b, c, d)                                         \
+        (((uint32_t)(a) << 24U) | ((uint32_t)(b) << 16U) |                    \
+         ((uint32_t)(c) << 8U) | (uint32_t)(d))
+
+enum user_socket_type {
+        USER_SOCKET_DATAGRAM = 1,
+        USER_SOCKET_RAW = 2,
+        USER_SOCKET_STREAM = 3,
+};
+
+enum user_internet_protocol {
+        USER_INTERNET_PROTOCOL_DEFAULT = 0,
+        USER_INTERNET_PROTOCOL_ICMP = 1,
+        USER_INTERNET_PROTOCOL_TCP = 6,
+        USER_INTERNET_PROTOCOL_UDP = 17,
+};
+
+struct user_socket_address {
+        uint32_t address;
+        uint16_t port;
+        uint16_t reserved;
+};
+
+enum user_network_flag {
+        USER_NETWORK_ONLINE = (1U << 0),
+};
+
+struct user_network_information {
+        uint32_t flags;
+        uint32_t address;
+        uint32_t netmask;
+        uint32_t gateway;
+        uint32_t dns_server;
+        uint8_t hardware_address[6];
+        uint8_t reserved[2];
 };
 
 /* A wait set can combine kernel descriptors with the graphics input queue,
@@ -302,6 +362,7 @@ enum user_file_type {
         USER_FILE_REGULAR,
         USER_FILE_CHARACTER_DEVICE,
         USER_FILE_PIPE,
+        USER_FILE_SOCKET,
 };
 
 enum { USER_DIRECTORY_NAME_MAX = 56 };
@@ -449,6 +510,10 @@ enum user_program {
         USER_PROGRAM_KILL,
         USER_PROGRAM_SLEEP,
         USER_PROGRAM_PS,
+        USER_PROGRAM_IFCONFIG,
+        USER_PROGRAM_PING,
+        USER_PROGRAM_NSLOOKUP,
+        USER_PROGRAM_CURL,
 };
 
 #endif

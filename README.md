@@ -1,5 +1,7 @@
 # ROSE — RISC-V Operating System
 
+**This project is 100% AI-generated. I created it to explore the limits of what I can achieve with AI and to see how far I can push my ideas with these tools.**
+
 ROSE is a compact educational kernel for the 64-bit RISC-V QEMU `virt`
 machine. It boots through OpenSBI, discovers its platform from the flattened
 device tree, enables Sv39 virtual memory, and runs independently linked C
@@ -54,6 +56,15 @@ programs in user mode.
   states with visible keyboard focus.
 - Generic sector-device interface, modern VirtIO-MMIO block driver, and a
   sixteen-entry write-through cache for 1 KiB filesystem blocks.
+- Interrupt-driven modern VirtIO-MMIO networking with Ethernet, ARP, IPv4,
+  ICMP echo, UDP, and outbound TCP streams with retransmission. The IPv4 layer
+  validates lengths, checksums, and destination addresses, and rejects
+  fragments; an ARP cache resolves local peers and the default gateway. Stream,
+  datagram, and raw-ICMP sockets are
+  regular process descriptors, so duplication, inheritance, close-on-exec,
+  nonblocking mode, descriptor polling, and mixed event waits apply to them.
+  The userspace resolver performs bounded DNS A-record queries with
+  compression-aware reply parsing.
 - Writable ext2 root filesystem containing `/sbin/init`, `/bin/sh`, programs,
   and data.
   The supported ext2 profile uses one block group, direct and singly indirect
@@ -83,7 +94,8 @@ programs in user mode.
   and foreground-group control, terminal attributes and window sizing, shared
   memory, pseudo-terminals, system telemetry, `brk`, `mmap`,
   `mprotect`, `munmap`, monotonic time, sleep, descriptor `poll`, mixed event
-  waits, shared-event notification, `exit`, and `yield`
+  waits, shared-event notification, IPv4 socket creation, bind, connect,
+  datagram send/receive, network configuration, `exit`, and `yield`
   system calls. Relative paths resolve from a canonical per-process working
   directory. `brk` provides a private, zero-filled, growable userspace heap
   between the ELF image and stack guard; shrinking or process teardown returns
@@ -137,9 +149,10 @@ programs in user mode.
   compatibility aliases).
   Practical `/bin` utilities include `ls`, `cat`, `echo`, `pwd`, `env`,
   `mkdir`, `rm`, `cp`, `mv`, `touch`, `head`, `wc`, `find`, `ps`, `kill`, and
-  `sleep`. Shared allocation-free string, number, and I/O helpers live in a
-  small userspace runtime. Command syntax and dispatch do not run in supervisor
-  mode.
+  `sleep`, plus the network tools `ifconfig`, `ping`, `nslookup`, and an
+  HTTP-only `curl`. Shared
+  allocation-free string, number, network, DNS, and I/O helpers live in a small
+  userspace runtime. Command syntax and dispatch do not run in supervisor mode.
 - Sixteen-slot round-robin process scheduler with timer preemption, guarded user
   stacks, per-process kernel trap stacks, process creation, termination,
   parent/child ownership, orphan adoption by PID 0, waiting, reaping, typed
@@ -164,7 +177,7 @@ ensure it returns to that baseline.
 kernel/
   arch/riscv64/   boot, trap, context-switch, and embedded-image assembly
   core/           kernel entry, platform parser, traps, ELF, processes
-  drivers/        NS16550A UART, PLIC, and VirtIO block drivers
+  drivers/        NS16550A UART, PLIC, and VirtIO device drivers
   include/        kernel and shared ABI headers
   linker/         kernel memory layout
   memory/         physical and virtual memory managers
@@ -197,6 +210,10 @@ make PREFIX=riscv64-unknown-elf- QEMU=qemu-system-riscv64
 make -j4
 make run
 ```
+
+The standard run targets attach QEMU's user-mode network through a modern
+VirtIO device. ROSE uses that backend's conventional guest address
+`10.0.2.15/24`, gateway `10.0.2.2`, and DNS forwarder `10.0.2.3`.
 
 Interactive boots use `kernel/build/run-root.ext2`, so filesystem changes
 persist between `run`, `run-gui`, and `debug` sessions. The deterministic
@@ -439,5 +456,10 @@ recovery. The VirtIO queue is polled synchronously; it is not yet connected to
 a scheduler completion channel. Signals do not yet have masks, alternate
 stacks, or realtime queues. Anonymous mappings use a fixed
 thirty-two-entry VMA table and do not yet support file backing, shared mappings,
-or fixed addresses. There are no general-purpose kernel threads, ASIDs,
-networking, users, or permissions enforcement.
+or fixed addresses. Networking currently targets QEMU's fixed user-network
+configuration and provides IPv4 UDP/raw-ICMP sockets plus active TCP streams.
+TCP is intentionally client-only, with a single in-flight segment per socket;
+`curl` supports HTTP but not HTTPS because there is no TLS layer. Networking
+does not yet implement DHCP, IPv6, listening sockets, routing, or IP
+reassembly. There are no general-purpose kernel threads, ASIDs, users, or
+permissions enforcement.

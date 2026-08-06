@@ -345,6 +345,10 @@ def run_smoke_test(
         f"file={root_image},format=raw,if=none,id=rose-root",
         "-device",
         "virtio-blk-device,drive=rose-root",
+        "-netdev",
+        "user,id=rose-net",
+        "-device",
+        "virtio-net-device,netdev=rose-net",
         "-global",
         "virtio-mmio.force-legacy=false",
     ]
@@ -375,6 +379,7 @@ def run_smoke_test(
             boot,
             "ROSE init: writable disk root online",
             "ROSE userspace shell",
+            "ROSE network: 10.0.2.15 online",
         )
         if graphics:
             require(
@@ -494,6 +499,7 @@ def run_smoke_test(
         require(
             session.command("ls /bin"),
             "cat",
+            "curl",
             "echo",
             "env",
             "ls",
@@ -501,6 +507,26 @@ def run_smoke_test(
             "pwd",
             "rm",
             "sh",
+        )
+        require(
+            session.command("ifconfig"),
+            "eth0: online",
+            "inet 10.0.2.15",
+            "gateway 10.0.2.2",
+            "dns 10.0.2.3",
+        )
+        require(
+            session.command("ping -c 1 10.0.2.2", timeout=5.0),
+            "1 packets transmitted, 1 received",
+        )
+        require(
+            session.command("nslookup 10.0.2.2"),
+            "Name: 10.0.2.2",
+            "Address: 10.0.2.2",
+        )
+        require(
+            session.command("curl https://example.com"),
+            "HTTPS is not supported",
         )
 
         require(

@@ -25,6 +25,20 @@ long rose_dup2(int old_descriptor, int new_descriptor);
 long rose_pipe(int descriptors[2]);
 long rose_set_descriptor_flags(int descriptor, uint32_t flags);
 
+/* IPv4 UDP, raw-ICMP, and outbound TCP sockets. Connected sockets also support
+ * rose_read and rose_write. Socket descriptors participate in dup, fork,
+ * fstat, close-on-exec, nonblocking mode, poll, and mixed event waits. */
+long rose_socket(uint32_t type, uint32_t protocol);
+long rose_socket_bind(int descriptor,
+                      const struct user_socket_address *address);
+long rose_socket_connect(int descriptor,
+                         const struct user_socket_address *address);
+long rose_socket_send_to(int descriptor, const void *buffer, size_t length,
+                         const struct user_socket_address *destination);
+long rose_socket_receive_from(int descriptor, void *buffer, size_t length,
+                              struct user_socket_address *source);
+long rose_network_information(struct user_network_information *information);
+
 /* Monotonic time and interruptible event-driven waiting. Poll timeouts are
  * milliseconds; wait-set and sleep durations are nanoseconds. A negative poll
  * or wait-set timeout blocks indefinitely. */

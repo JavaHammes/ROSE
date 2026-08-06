@@ -16,6 +16,7 @@ enum scheduler_wait_channel {
         SCHEDULER_WAIT_PIPE_READ,
         SCHEDULER_WAIT_PIPE_WRITE,
         SCHEDULER_WAIT_TIMER,
+        SCHEDULER_WAIT_NETWORK,
         SCHEDULER_WAIT_EVENT,
 };
 

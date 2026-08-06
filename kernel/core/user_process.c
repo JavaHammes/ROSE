@@ -19,6 +19,7 @@
 #include "graphics_console.h"
 #include "input.h"
 #include "interrupt.h"
+#include "network.h"
 #include "page_allocator.h"
 #include "panic.h"
 #include "scheduler.h"
@@ -141,6 +142,7 @@ struct process_open_file {
         struct process_pipe *read_pipe;
         struct process_pipe *write_pipe;
         struct process_terminal *terminal;
+        struct network_socket *socket;
         uint8_t terminal_endpoint;
         struct vfs_file file;
 };
@@ -549,6 +551,7 @@ static void process_descriptor_close(struct process_descriptor *descriptor) {
                                              DESCRIPTOR_WRITE);
                 }
                 process_terminal_open_release(open_file->terminal);
+                network_socket_close(open_file->socket);
                 bytes_zero(open_file, sizeof(*open_file));
         }
 }
@@ -3047,6 +3050,162 @@ static uint64_t syscall_close(uint64_t descriptor) {
         return 0U;
 }
 
+static struct process_open_file *process_socket_descriptor(
+    uint64_t descriptor) {
+        if (descriptor >= PROCESS_DESCRIPTOR_LIMIT) return NULL;
+        struct process_open_file *open_file =
+            active_process->descriptors[(size_t)descriptor].open_file;
+        return open_file != NULL && open_file->socket != NULL ? open_file
+                                                              : NULL;
+}
+
+static uint64_t syscall_socket(uint32_t type, uint32_t protocol) {
+        size_t descriptor = PROCESS_FIRST_OPEN_DESCRIPTOR;
+        while (descriptor < PROCESS_DESCRIPTOR_LIMIT &&
+               active_process->descriptors[descriptor].open_file != NULL) {
+                descriptor++;
+        }
+        if (descriptor == PROCESS_DESCRIPTOR_LIMIT) {
+                return (uint64_t)-(int64_t)USER_ERROR_TOO_MANY_FILES;
+        }
+        struct process_open_file *open_file = process_open_file_allocate();
+        if (open_file == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_FILE_TABLE_OVERFLOW;
+        }
+        int error = 0;
+        open_file->socket = network_socket_create(type, protocol, &error);
+        if (open_file->socket == NULL) {
+                bytes_zero(open_file, sizeof(*open_file));
+                return (uint64_t)(int64_t)error;
+        }
+        open_file->access = DESCRIPTOR_READ | DESCRIPTOR_WRITE;
+        process_descriptor_install(&active_process->descriptors[descriptor],
+                                   open_file);
+        return descriptor;
+}
+
+static uint64_t copy_socket_address(uintptr_t user_address,
+                                    bool address_optional,
+                                    struct user_socket_address *address,
+                                    const struct user_socket_address **result) {
+        *result = NULL;
+        if (user_address == 0U && address_optional) return 0U;
+        if (!user_range_is_valid(user_address, sizeof(*address),
+                                 VM_PAGE_READ)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        user_copy_from((uint8_t *)address, user_address, sizeof(*address));
+        *result = address;
+        return 0U;
+}
+
+static uint64_t syscall_socket_bind(uint64_t descriptor,
+                                    uintptr_t user_address) {
+        struct process_open_file *open_file =
+            process_socket_descriptor(descriptor);
+        if (open_file == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        struct user_socket_address address;
+        const struct user_socket_address *copied;
+        uint64_t result =
+            copy_socket_address(user_address, false, &address, &copied);
+        return result != 0U
+                   ? result
+                   : (uint64_t)(int64_t)network_socket_bind(open_file->socket,
+                                                            copied);
+}
+
+static uint64_t syscall_socket_connect(uint64_t descriptor,
+                                       uintptr_t user_address) {
+        struct process_open_file *open_file =
+            process_socket_descriptor(descriptor);
+        if (open_file == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        struct user_socket_address address;
+        const struct user_socket_address *copied;
+        uint64_t result =
+            copy_socket_address(user_address, false, &address, &copied);
+        return result != 0U
+                   ? result
+                   : (uint64_t)(int64_t)network_socket_connect(
+                         open_file->socket, copied);
+}
+
+static uint64_t syscall_socket_send_to(uint64_t descriptor,
+                                       uintptr_t user_buffer, size_t length,
+                                       uintptr_t user_destination) {
+        struct process_open_file *open_file =
+            process_socket_descriptor(descriptor);
+        if (open_file == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        if (length > USER_IO_MAX) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+        if (!user_range_is_valid(user_buffer, length, VM_PAGE_READ)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        struct user_socket_address destination;
+        const struct user_socket_address *copied;
+        uint64_t result = copy_socket_address(user_destination, true,
+                                              &destination, &copied);
+        if (result != 0U) return result;
+        user_copy_from((uint8_t *)active_process->write_buffer, user_buffer,
+                       length);
+        return (uint64_t)(int64_t)network_socket_send(
+            open_file->socket, active_process->write_buffer, length, copied);
+}
+
+static uint64_t syscall_socket_receive_from(uint64_t descriptor,
+                                            uintptr_t user_buffer,
+                                            size_t length,
+                                            uintptr_t user_source) {
+        struct process_open_file *open_file =
+            process_socket_descriptor(descriptor);
+        if (open_file == NULL) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_FILE_DESCRIPTOR;
+        }
+        if (length > USER_IO_MAX) {
+                return (uint64_t)-(int64_t)USER_ERROR_INVALID_ARGUMENT;
+        }
+        if (!user_range_is_valid(user_buffer, length, VM_PAGE_WRITE) ||
+            (user_source != 0U &&
+             !user_range_is_valid(user_source,
+                                  sizeof(struct user_socket_address),
+                                  VM_PAGE_WRITE))) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        struct user_socket_address source;
+        long result = network_socket_receive(
+            open_file->socket, active_process->write_buffer, length,
+            user_source == 0U ? NULL : &source);
+        if (result >= 0) {
+                user_copy_to(user_buffer,
+                             (const uint8_t *)active_process->write_buffer,
+                             (size_t)result);
+                if (user_source != 0U) {
+                        user_copy_to(user_source, (const uint8_t *)&source,
+                                     sizeof(source));
+                }
+        }
+        return (uint64_t)(int64_t)result;
+}
+
+static uint64_t syscall_network_information(uintptr_t user_information) {
+        if (!user_range_is_valid(user_information,
+                                 sizeof(struct user_network_information),
+                                 VM_PAGE_WRITE)) {
+                return (uint64_t)-(int64_t)USER_ERROR_BAD_ADDRESS;
+        }
+        struct user_network_information information;
+        network_get_information(&information);
+        user_copy_to(user_information, (const uint8_t *)&information,
+                     sizeof(information));
+        return 0U;
+}
+
 static uint64_t syscall_read_begin(uint64_t descriptor, uintptr_t user_buffer,
                                    size_t length) {
         if (descriptor >= PROCESS_DESCRIPTOR_LIMIT) {
@@ -3166,6 +3325,14 @@ static uint64_t syscall_fstat(uint64_t descriptor, uintptr_t user_status) {
                 pipe_status.type = USER_FILE_PIPE;
                 user_copy_to(user_status, (const uint8_t *)&pipe_status,
                              sizeof(pipe_status));
+                return 0U;
+        }
+        if (open_file->socket != NULL) {
+                struct user_file_status socket_status;
+                bytes_zero(&socket_status, sizeof(socket_status));
+                socket_status.type = USER_FILE_SOCKET;
+                user_copy_to(user_status, (const uint8_t *)&socket_status,
+                             sizeof(socket_status));
                 return 0U;
         }
 
@@ -4338,6 +4505,10 @@ static uint32_t descriptor_ready_events(int32_t descriptor,
                 return USER_POLL_INVALID;
         }
 
+        if (open_file->socket != NULL) {
+                return network_socket_ready(open_file->socket, requested);
+        }
+
         uint32_t returned = 0U;
         if (open_file->read_pipe != NULL) {
                 const struct process_pipe *pipe = open_file->read_pipe;
@@ -5469,6 +5640,26 @@ void user_process_handle_syscall(struct trap_frame *frame) {
 
         switch (frame->a7) {
         case USER_SYSCALL_WRITE: {
+                if (process_socket_descriptor(frame->a0) != NULL) {
+                        uint64_t descriptor = frame->a0;
+                        uint64_t result = syscall_socket_send_to(
+                            descriptor, (uintptr_t)frame->a1,
+                            (size_t)frame->a2, 0U);
+                        if ((int64_t)result == -USER_ERROR_TRY_AGAIN &&
+                            !active_process
+                                 ->descriptors[(size_t)descriptor]
+                                 .nonblocking) {
+                                scheduler_block_current_until(
+                                    frame, SCHEDULER_WAIT_NETWORK,
+                                    saturating_add(
+                                        timer_monotonic_nanoseconds(),
+                                        UINT64_C(250000000)));
+                        } else {
+                                frame->a0 = result;
+                                frame->sepc += 4U;
+                        }
+                        return;
+                }
                 if (!active_process->pending_write) {
                         uint64_t result = syscall_write_begin(
                             frame->a0, (uintptr_t)frame->a1, (size_t)frame->a2);
@@ -5485,6 +5676,23 @@ void user_process_handle_syscall(struct trap_frame *frame) {
         }
 
         case USER_SYSCALL_READ: {
+                if (process_socket_descriptor(frame->a0) != NULL) {
+                        uint64_t descriptor = frame->a0;
+                        uint64_t result = syscall_socket_receive_from(
+                            descriptor, (uintptr_t)frame->a1,
+                            (size_t)frame->a2, 0U);
+                        if ((int64_t)result == -USER_ERROR_TRY_AGAIN &&
+                            !active_process
+                                 ->descriptors[(size_t)descriptor]
+                                 .nonblocking) {
+                                scheduler_block_current(frame,
+                                                        SCHEDULER_WAIT_NETWORK);
+                        } else {
+                                frame->a0 = result;
+                                frame->sepc += 4U;
+                        }
+                        return;
+                }
                 if (!active_process->pending_read) {
                         uint64_t result = syscall_read_begin(
                             frame->a0, (uintptr_t)frame->a1, (size_t)frame->a2);
@@ -5511,6 +5719,81 @@ void user_process_handle_syscall(struct trap_frame *frame) {
 
         case USER_SYSCALL_CLOSE:
                 frame->a0 = syscall_close(frame->a0);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_SOCKET:
+                frame->a0 =
+                    syscall_socket((uint32_t)frame->a0, (uint32_t)frame->a1);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_SOCKET_BIND:
+                frame->a0 = syscall_socket_bind(frame->a0,
+                                                (uintptr_t)frame->a1);
+                frame->sepc += 4U;
+                return;
+
+        case USER_SYSCALL_SOCKET_CONNECT: {
+                uint64_t descriptor = frame->a0;
+                uint64_t result = syscall_socket_connect(
+                    descriptor, (uintptr_t)frame->a1);
+                if ((int64_t)result == -USER_ERROR_TRY_AGAIN &&
+                    descriptor < PROCESS_DESCRIPTOR_LIMIT &&
+                    !active_process->descriptors[(size_t)descriptor]
+                         .nonblocking) {
+                        scheduler_block_current_until(
+                            frame, SCHEDULER_WAIT_NETWORK,
+                            saturating_add(timer_monotonic_nanoseconds(),
+                                           UINT64_C(250000000)));
+                } else {
+                        frame->a0 = result;
+                        frame->sepc += 4U;
+                }
+                return;
+        }
+
+        case USER_SYSCALL_SOCKET_SEND_TO: {
+                uint64_t descriptor = frame->a0;
+                uint64_t result = syscall_socket_send_to(
+                    descriptor, (uintptr_t)frame->a1, (size_t)frame->a2,
+                    (uintptr_t)frame->a3);
+                if ((int64_t)result == -USER_ERROR_TRY_AGAIN &&
+                    descriptor < PROCESS_DESCRIPTOR_LIMIT &&
+                    !active_process->descriptors[(size_t)descriptor]
+                         .nonblocking) {
+                        scheduler_block_current_until(
+                            frame, SCHEDULER_WAIT_NETWORK,
+                            saturating_add(timer_monotonic_nanoseconds(),
+                                           UINT64_C(250000000)));
+                } else {
+                        frame->a0 = result;
+                        frame->sepc += 4U;
+                }
+                return;
+        }
+
+        case USER_SYSCALL_SOCKET_RECEIVE_FROM: {
+                uint64_t descriptor = frame->a0;
+                uint64_t result = syscall_socket_receive_from(
+                    descriptor, (uintptr_t)frame->a1, (size_t)frame->a2,
+                    (uintptr_t)frame->a3);
+                if ((int64_t)result == -USER_ERROR_TRY_AGAIN &&
+                    descriptor < PROCESS_DESCRIPTOR_LIMIT &&
+                    !active_process->descriptors[(size_t)descriptor]
+                         .nonblocking) {
+                        scheduler_block_current(frame,
+                                                SCHEDULER_WAIT_NETWORK);
+                } else {
+                        frame->a0 = result;
+                        frame->sepc += 4U;
+                }
+                return;
+        }
+
+        case USER_SYSCALL_NETWORK_INFORMATION:
+                frame->a0 =
+                    syscall_network_information((uintptr_t)frame->a0);
                 frame->sepc += 4U;
                 return;
 

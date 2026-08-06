@@ -1459,7 +1459,7 @@ static void shell_help(void) {
         print("Built-ins: cd pwd echo export unset alias unalias type history "
               "jobs fg bg kill clear help exit\n");
         print("Commands: ls cat echo pwd env mkdir rm cp mv touch head wc find "
-              "ps kill sleep\n");
+              "ps kill sleep ifconfig ping nslookup curl\n");
         print("Syntax: command [ARG...] [< FILE] [> FILE|>> FILE] [2> FILE] "
               "[2>&1] [| command...] [&]\n");
         print("Expansion: $NAME ${NAME} $? $$ (except in single quotes)\n");
