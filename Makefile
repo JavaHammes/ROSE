@@ -21,6 +21,9 @@ HOST_GC_SECTIONS := -Wl,--gc-sections
 endif
 
 QEMU ?= qemu-system-riscv64
+DISPLAY_WIDTH ?= 1920
+DISPLAY_HEIGHT ?= 1080
+GUI_MEMORY ?= 256M
 
 # This is intentionally not caller-overridable: `clean` must always have one
 # narrow, repository-local target.
@@ -204,12 +207,12 @@ QEMU_FLAGS := \
 QEMU_GUI_FLAGS := \
 	-machine virt \
 	-smp 1 \
-	-m 128M \
+	-m $(GUI_MEMORY) \
 	-bios default \
 	-kernel $(KERNEL) \
 	-drive file=$(RUN_ROOT_IMAGE),format=raw,if=none,id=rose-root \
 	-device virtio-blk-device,drive=rose-root \
-	-device virtio-gpu-device \
+	-device virtio-gpu-device,xres=$(DISPLAY_WIDTH),yres=$(DISPLAY_HEIGHT) \
 	-device virtio-keyboard-device \
 	-device virtio-tablet-device \
 	-global virtio-mmio.force-legacy=false \
@@ -418,7 +421,9 @@ test-platform: $(KERNEL) $(ROOT_IMAGE)
 .PHONY: test-graphics
 test-graphics: $(KERNEL) $(ROOT_IMAGE)
 	QEMU=$(QEMU) KERNEL=$(KERNEL) ROOT_IMAGE=$(ROOT_IMAGE) \
-		QEMU_GRAPHICS=1 QEMU_GRAPHICS_ONLY=1 $(PYTHON) tests/qemu_smoke.py
+		QEMU_MEMORY=$(GUI_MEMORY) QEMU_GRAPHICS=1 QEMU_GRAPHICS_ONLY=1 \
+		DISPLAY_WIDTH=$(DISPLAY_WIDTH) DISPLAY_HEIGHT=$(DISPLAY_HEIGHT) \
+		$(PYTHON) tests/qemu_smoke.py
 
 
 .PHONY: test-host

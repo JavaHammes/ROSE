@@ -285,8 +285,11 @@ static void handle_pointer_event(struct input_device *device,
                 return;
         }
 
-        uint32_t width = virtio_gpu_available() ? virtio_gpu_width() : 1024U;
-        uint32_t height = virtio_gpu_available() ? virtio_gpu_height() : 768U;
+        uint32_t width =
+            virtio_gpu_available() ? virtio_gpu_width() : VIRTIO_GPU_MAX_WIDTH;
+        uint32_t height = virtio_gpu_available()
+                              ? virtio_gpu_height()
+                              : VIRTIO_GPU_MAX_HEIGHT;
         device->x = scale_axis(device->raw_x, &device->x_information, width);
         device->y = scale_axis(device->raw_y, &device->y_information, height);
         struct user_input_event user_event = {

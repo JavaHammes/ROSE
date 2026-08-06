@@ -6,9 +6,13 @@
 #include <stdint.h>
 
 enum {
-        VIRTIO_GPU_MAX_WIDTH = 1024,
-        VIRTIO_GPU_MAX_HEIGHT = 768,
+        VIRTIO_GPU_MAX_WIDTH = 1920,
+        VIRTIO_GPU_MAX_HEIGHT = 1080,
 };
+
+#define VIRTIO_GPU_FRAMEBUFFER_SIZE                                            \
+        ((size_t)VIRTIO_GPU_MAX_WIDTH * VIRTIO_GPU_MAX_HEIGHT *                \
+         sizeof(uint32_t))
 
 bool virtio_gpu_init(void);
 bool virtio_gpu_available(void);

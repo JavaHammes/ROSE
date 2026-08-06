@@ -1024,16 +1024,77 @@ static void test_pointer_click(struct desktop *desktop, int32_t x, int32_t y) {
         process_pointer(desktop, &event, true);
 }
 
+static void test_pointer_drag(struct desktop *desktop, int32_t start_x,
+                              int32_t start_y, int32_t end_x, int32_t end_y) {
+        struct user_input_event event;
+        zero_bytes(&event, sizeof(event));
+        event.type = USER_INPUT_EVENT_POINTER;
+        event.x = start_x;
+        event.y = start_y;
+        event.buttons = USER_POINTER_BUTTON_LEFT;
+        process_pointer(desktop, &event, true);
+        event.x = end_x;
+        event.y = end_y;
+        process_pointer(desktop, &event, true);
+        event.buttons = 0U;
+        process_pointer(desktop, &event, true);
+}
+
+static bool test_pointer_edges(struct desktop *desktop) {
+        const int32_t right = (int32_t)desktop->graphics.width - 1;
+        const int32_t bottom = (int32_t)desktop->graphics.height - 1;
+        const int32_t coordinates[4][2] = {
+            {0, 0}, {right, 0}, {0, bottom}, {right, bottom}};
+        struct user_input_event event;
+        zero_bytes(&event, sizeof(event));
+        event.type = USER_INPUT_EVENT_POINTER;
+        for (size_t index = 0U; index < 4U; index++) {
+                event.x = coordinates[index][0];
+                event.y = coordinates[index][1];
+                process_pointer(desktop, &event, false);
+                if (desktop->pointer_x != event.x ||
+                    desktop->pointer_y != event.y) {
+                        return false;
+                }
+        }
+        return true;
+}
+
 static bool run_window_control_test(struct desktop *desktop) {
         const int32_t initial_x = 42;
         const int32_t initial_y = 78;
         const uint32_t initial_width = 500U;
         const uint32_t initial_height = 350U;
-        if (!create_window(desktop, "FILES", "/bin/gui-files", initial_x,
+        if (desktop->panel.bounds.width !=
+                (int32_t)desktop->graphics.width ||
+            desktop->panel_power.bounds.x !=
+                (int32_t)desktop->graphics.width - 70 ||
+            desktop->power_dialog.bounds.x !=
+                ((int32_t)desktop->graphics.width - 330) / 2 ||
+            desktop->power_dialog.bounds.y !=
+                ((int32_t)desktop->graphics.height - 160) / 2 ||
+            !test_pointer_edges(desktop)) {
+                return false;
+        }
+        if (!create_window(desktop, "TERMINAL", "/bin/gui-terminal", initial_x,
                            initial_y, initial_width, initial_height, NULL)) {
                 return false;
         }
         struct desktop_window *window = &desktop->windows[0];
+
+        test_pointer_drag(
+            desktop, initial_x + WINDOW_BORDER + (int32_t)initial_width - 1,
+            initial_y + WINDOW_TITLE_HEIGHT + (int32_t)initial_height - 1,
+            (int32_t)desktop->graphics.width - WINDOW_BORDER - 1,
+            (int32_t)desktop->graphics.height - WINDOW_BORDER - 1);
+        if (window->width != desktop->graphics.width - initial_x -
+                                 WINDOW_BORDER * 2U ||
+            window->height != desktop->graphics.height - initial_y -
+                                  WINDOW_TITLE_HEIGHT - WINDOW_BORDER) {
+                close_windows(desktop);
+                return false;
+        }
+        resize_window(window, initial_width, initial_height);
 
         test_pointer_click(desktop, initial_x + 35, initial_y + 15);
         if (!window->minimized ||
@@ -1383,8 +1444,6 @@ int rose_desktop_main(int argc, char **argv) {
         zero_bytes(&desktop, sizeof(desktop));
         desktop.compact_surfaces =
             argc == 2 && strings_equal(argv[1], "--stress");
-        desktop.pointer_x = 512;
-        desktop.pointer_y = 384;
         if (!rose_font_load()) {
                 print("desktop: font resource unavailable\n");
                 return 1;
@@ -1397,6 +1456,8 @@ int rose_desktop_main(int argc, char **argv) {
         }
         desktop.pixels = (uint32_t *)desktop.graphics.framebuffer;
         desktop.pixel_stride = desktop.graphics.stride / sizeof(uint32_t);
+        desktop.pointer_x = (int32_t)desktop.graphics.width / 2;
+        desktop.pointer_y = (int32_t)desktop.graphics.height / 2;
         rose_gui_canvas_initialize(&desktop.canvas, desktop.pixels,
                                    desktop.graphics.width,
                                    desktop.graphics.height,

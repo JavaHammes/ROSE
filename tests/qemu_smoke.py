@@ -322,6 +322,8 @@ def run_smoke_test(
     memory: str,
     graphics: bool,
     graphics_only: bool,
+    display_width: int,
+    display_height: int,
 ) -> int:
     initial_free_counts = ext2_free_counts(root_image)
     base_command = [
@@ -350,7 +352,10 @@ def run_smoke_test(
     if graphics:
         command += [
             "-device",
-            "virtio-gpu-device",
+            (
+                "virtio-gpu-device,"
+                f"xres={display_width},yres={display_height}"
+            ),
             "-device",
             "virtio-keyboard-device",
             "-device",
@@ -374,7 +379,10 @@ def run_smoke_test(
         if graphics:
             require(
                 boot,
-                "ROSE graphics: 1024x768",
+                (
+                    "ROSE graphics: "
+                    f"{min(display_width, 1920)}x{min(display_height, 1080)}"
+                ),
                 "ROSE input: VirtIO keyboard/tablet online",
                 "ROSE init: boot override selected text target",
             )
@@ -795,19 +803,30 @@ def main() -> int:
     source_root_image = Path(
         os.environ.get("ROOT_IMAGE", repository / "kernel/build/root.ext2")
     )
-    memory = os.environ.get("QEMU_MEMORY", "128M")
     graphics = os.environ.get("QEMU_GRAPHICS") == "1"
     graphics_only = os.environ.get("QEMU_GRAPHICS_ONLY") == "1"
+    memory = os.environ.get("QEMU_MEMORY", "256M" if graphics else "128M")
+    display_width = int(os.environ.get("DISPLAY_WIDTH", "1920"))
+    display_height = int(os.environ.get("DISPLAY_HEIGHT", "1080"))
+    if display_width <= 0 or display_height <= 0:
+        raise ValueError("graphical display dimensions must be positive")
 
     with temporary_root_image(source_root_image) as root_image:
         return run_smoke_test(
-            qemu, kernel, root_image, memory, graphics, graphics_only
+            qemu,
+            kernel,
+            root_image,
+            memory,
+            graphics,
+            graphics_only,
+            display_width,
+            display_height,
         )
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (AssertionError, OSError, RuntimeError) as error:
+    except (AssertionError, OSError, RuntimeError, ValueError) as error:
         print(error, file=sys.stderr)
         raise SystemExit(1)

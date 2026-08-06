@@ -24,6 +24,16 @@ enum {
         GPU_DISPLAY_COUNT = 16,
 };
 
+_Static_assert((size_t)VIRTIO_GPU_MAX_WIDTH <=
+                   SIZE_MAX / (size_t)VIRTIO_GPU_MAX_HEIGHT,
+               "GPU dimensions overflow the pixel count");
+_Static_assert((size_t)VIRTIO_GPU_MAX_WIDTH *
+                       (size_t)VIRTIO_GPU_MAX_HEIGHT <=
+                   SIZE_MAX / sizeof(uint32_t),
+               "GPU dimensions overflow the framebuffer size");
+_Static_assert(VIRTIO_GPU_FRAMEBUFFER_SIZE <= UINT32_MAX,
+               "VirtIO GPU backing length exceeds the protocol field");
+
 struct gpu_control_header {
         uint32_t type;
         uint32_t flags;
@@ -95,7 +105,8 @@ struct gpu_resource_flush {
 
 static struct virtio_mmio_device transport;
 static struct virtio_queue control_queue;
-static uint32_t framebuffer[VIRTIO_GPU_MAX_WIDTH * VIRTIO_GPU_MAX_HEIGHT]
+static uint32_t framebuffer[(size_t)VIRTIO_GPU_MAX_WIDTH *
+                            VIRTIO_GPU_MAX_HEIGHT]
     __attribute__((aligned(PAGE_SIZE)));
 static uint32_t scanout_width;
 static uint32_t scanout_height;
@@ -208,13 +219,18 @@ static bool select_display_mode(void) {
 
                 scanout_width = response.modes[index].rectangle.width;
                 scanout_height = response.modes[index].rectangle.height;
+                /* ROSE intentionally clamps a larger host-provided mode to the
+                 * statically backed maximum instead of overrunning it. */
                 if (scanout_width > VIRTIO_GPU_MAX_WIDTH) {
                         scanout_width = VIRTIO_GPU_MAX_WIDTH;
                 }
                 if (scanout_height > VIRTIO_GPU_MAX_HEIGHT) {
                         scanout_height = VIRTIO_GPU_MAX_HEIGHT;
                 }
-                return true;
+                return scanout_width != 0U && scanout_height != 0U &&
+                       (size_t)scanout_width <= SIZE_MAX / scanout_height &&
+                       (size_t)scanout_width * scanout_height <=
+                           SIZE_MAX / sizeof(uint32_t);
         }
         return false;
 }
@@ -283,8 +299,7 @@ uint32_t virtio_gpu_stride(void) { return scanout_width * sizeof(uint32_t); }
 uint32_t *virtio_gpu_framebuffer(void) { return framebuffer; }
 
 size_t virtio_gpu_framebuffer_size(void) {
-        return (size_t)VIRTIO_GPU_MAX_WIDTH * VIRTIO_GPU_MAX_HEIGHT *
-               sizeof(uint32_t);
+        return VIRTIO_GPU_FRAMEBUFFER_SIZE;
 }
 
 bool virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t width, uint32_t height) {

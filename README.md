@@ -209,6 +209,18 @@ For the graphical machine, launch QEMU with the GPU, keyboard, and tablet:
 make run-gui
 ```
 
+The graphical launch defaults to a 1920×1080 scanout and 256 MiB of guest
+memory. The width, height, and memory allocation can be overridden without
+editing the Makefile, for example:
+
+```sh
+make run-gui DISPLAY_WIDTH=1280 DISPLAY_HEIGHT=720 GUI_MEMORY=192M
+```
+
+The display mode is selected at boot; ROSE does not currently switch modes at
+runtime. The maximum supported resolution is 1920×1080. If QEMU advertises a
+larger mode, the driver deliberately clamps it to that maximum.
+
 The installed `/etc/rose-init.conf` selects the graphical target. A graphical
 startup screen transitions into a clean desktop without opening applications,
 while startup failures remain visible even if normal desktop resources cannot

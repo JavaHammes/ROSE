@@ -47,7 +47,7 @@ enum {
         PROCESS_ENVIRONMENT_LIMIT = 16,
         SHARED_MEMORY_OBJECT_LIMIT = 32,
         SHARED_MEMORY_PROCESS_LIMIT = 16,
-        SHARED_MEMORY_PAGE_LIMIT = 768,
+        SHARED_MEMORY_PAGE_LIMIT = 2048,
         PROCESS_ANONYMOUS_MAPPING_LIMIT = 32,
         USER_WAIT_ITEM_LIMIT = PROCESS_LIMIT + 4,
 };
@@ -92,9 +92,9 @@ _Static_assert((uint32_t)USER_OPEN_READ == (uint32_t)VFS_OPEN_READ &&
  *   first page after ELF ..     growable userspace heap
  *   0x007ff000                 unmapped stack guard
  *   0x00800000                 one-page user stack
- *   0x01000000 ..              owned graphical framebuffer
- *   0x02000000 .. 0x04ffffff   sixteen 3 MiB shared-memory mapping slots
- *   0x05000000 .. 0x0fffffff   private anonymous mappings
+ *   0x01000000 .. 0x017e8fff   owned graphical framebuffer (maximum)
+ *   0x02000000 .. 0x09ffffff   sixteen 8 MiB shared-memory mapping slots
+ *   0x0a000000 .. 0x0fffffff   private anonymous mappings
  *
  * The stack pointer begins just above the mapped stack page and grows down.
  */
@@ -104,9 +104,25 @@ _Static_assert((uint32_t)USER_OPEN_READ == (uint32_t)VFS_OPEN_READ &&
 #define USER_STACK_TOP (USER_STACK_ADDRESS + PAGE_SIZE)
 #define USER_GRAPHICS_ADDRESS UINT64_C(0x01000000)
 #define USER_SHARED_MEMORY_BASE UINT64_C(0x02000000)
-#define USER_SHARED_MEMORY_STRIDE (SHARED_MEMORY_PAGE_LIMIT * PAGE_SIZE)
-#define USER_MMAP_BASE UINT64_C(0x05000000)
+#define USER_SHARED_MEMORY_STRIDE                                              \
+        ((uint64_t)SHARED_MEMORY_PAGE_LIMIT * PAGE_SIZE)
+#define USER_SHARED_MEMORY_END                                                 \
+        (USER_SHARED_MEMORY_BASE +                                             \
+         (uint64_t)SHARED_MEMORY_PROCESS_LIMIT * USER_SHARED_MEMORY_STRIDE)
+#define USER_MMAP_BASE USER_SHARED_MEMORY_END
 #define USER_MMAP_END UINT64_C(0x10000000)
+
+_Static_assert(VIRTIO_GPU_FRAMEBUFFER_SIZE <=
+                   USER_SHARED_MEMORY_BASE - USER_GRAPHICS_ADDRESS,
+               "Maximum framebuffer overlaps shared memory");
+_Static_assert(USER_SHARED_MEMORY_STRIDE <=
+                   (UINT64_MAX - USER_SHARED_MEMORY_BASE) /
+                       SHARED_MEMORY_PROCESS_LIMIT,
+               "Shared-memory slot layout overflows");
+_Static_assert(USER_SHARED_MEMORY_END <= USER_MMAP_BASE,
+               "Shared-memory slots overlap private mappings");
+_Static_assert(USER_MMAP_BASE < USER_MMAP_END,
+               "Shared-memory slots leave no private mapping range");
 
 extern char text_start[];
 
